@@ -1,0 +1,20 @@
+// Zig package metadata for lsp_zitron
+.{
+    .name = .lsp_zitron,
+
+    .version = "0.0.1",
+
+    .minimum_zig_version = "0.15.1",
+
+    .fingerprint = 0x5d6ef00f25fd9fe1,
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
