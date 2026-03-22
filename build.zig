@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
     lsp_zitron_mod.addOptions("build_options", options);
     lsp_zitron_mod.addImport("tree-sitter", tree_sitter_dep.module("tree_sitter"));
     lsp_zitron_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
+    lsp_zitron_mod.addAnonymousImport("zitron-tags-query", .{
+        .root_source_file = tree_sitter_zitron_dep.path("queries/tags.scm"),
+    });
     lsp_zitron_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
 
     const exe_mod = b.createModule(.{
