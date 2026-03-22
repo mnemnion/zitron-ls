@@ -2,6 +2,13 @@
 const std = @import("std");
 const zitron = @import("lsp_zitron");
 const offset_encoding: zitron.lsp.offsets.Encoding = .@"utf-8";
+const OOM = std.mem.Allocator.Error;
+const JsonParseError = std.json.ParseFromValueError || error{
+    BufferUnderrun,
+    SyntaxError,
+    UnexpectedEndOfInput,
+    ValueTooLong,
+};
 
 const error_set = error{
     UnexpectedResponse,
@@ -9,8 +16,22 @@ const error_set = error{
     MissingServerInfo,
     ChildProcessFailed,
 };
+const Error = error_set ||
+    zitron.FixtureError ||
+    std.process.Child.SpawnError ||
+    std.process.Child.WaitError ||
+    zitron.lsp.Transport.ReadError ||
+    zitron.lsp.Transport.WriteError ||
+    JsonParseError ||
+    OOM ||
+    error{
+        NeedleNotFound,
+        Overflow,
+        TestExpectedEqual,
+        TestUnexpectedResult,
+    };
 
-pub fn main() !void {
+pub fn main() Error!void {
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -168,7 +189,7 @@ pub fn main() !void {
 fn expectInitializeResponse(
     allocator: std.mem.Allocator,
     transport: *zitron.lsp.Transport,
-) !void {
+) Error!void {
     const json_message = try transport.readJsonMessage(allocator);
     defer allocator.free(json_message);
 
@@ -205,7 +226,7 @@ fn expectInitializeResponse(
 fn expectHoverResponse(
     allocator: std.mem.Allocator,
     transport: *zitron.lsp.Transport,
-) !void {
+) Error!void {
     const json_message = try transport.readJsonMessage(allocator);
     defer allocator.free(json_message);
 
@@ -244,7 +265,7 @@ fn expectHoverResponse(
 fn expectDefinitionResponse(
     allocator: std.mem.Allocator,
     transport: *zitron.lsp.Transport,
-) !void {
+) Error!void {
     const json_message = try transport.readJsonMessage(allocator);
     defer allocator.free(json_message);
 
@@ -292,7 +313,7 @@ fn expectNullResponse(
     allocator: std.mem.Allocator,
     transport: *zitron.lsp.Transport,
     id: i64,
-) !void {
+) Error!void {
     const json_message = try transport.readJsonMessage(allocator);
     defer allocator.free(json_message);
 
@@ -322,7 +343,7 @@ fn expectNullResponse(
 fn expectShutdownResponse(
     allocator: std.mem.Allocator,
     transport: *zitron.lsp.Transport,
-) !void {
+) Error!void {
     const json_message = try transport.readJsonMessage(allocator);
     defer allocator.free(json_message);
 
@@ -341,21 +362,21 @@ fn expectShutdownResponse(
     }
 }
 
-fn byteIndexOf(haystack: []const u8, needle: []const u8) !usize {
+fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {
     return std.mem.indexOf(u8, haystack, needle) orelse error.NeedleNotFound;
 }
 
-fn byteIndexOfAfter(haystack: []const u8, start_index: usize, needle: []const u8) !usize {
+fn byteIndexOfAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!usize {
     const relative = std.mem.indexOf(u8, haystack[start_index..], needle) orelse return error.NeedleNotFound;
     return start_index + relative;
 }
 
-fn positionOfText(haystack: []const u8, needle: []const u8) !zitron.types.Position {
+fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!zitron.types.Position {
     const index = try byteIndexOf(haystack, needle);
     return zitron.lsp.offsets.indexToPosition(haystack, index, offset_encoding);
 }
 
-fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) !zitron.types.Position {
+fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!zitron.types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return zitron.lsp.offsets.indexToPosition(haystack, index, offset_encoding);
 }

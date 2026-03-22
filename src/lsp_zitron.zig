@@ -7,6 +7,14 @@ const ts = @import("tree-sitter");
 const zitron_grammar = @import("tree_sitter_zitron");
 const tags_query_source = @embedFile("zitron-tags-query");
 const offset_encoding: lsp.offsets.Encoding = .@"utf-8";
+const OOM = std.mem.Allocator.Error;
+pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
+pub const Error = OOM || ts.Query.Error || error{
+    IncompatibleLanguage,
+    InvalidParams,
+    NeedleNotFound,
+    ParseFailed,
+};
 
 pub const server_name = "lsp_zitron";
 pub const server_version = "0.0.1";
@@ -58,17 +66,17 @@ pub fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
 }
 
-pub fn loadFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
+pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
     return std.fs.cwd().readFileAlloc(allocator, fixturePath(), 64 * 1024);
 }
 
-pub fn parseSource(source: []const u8) !ParseSummary {
+pub fn parseSource(source: []const u8) Error!ParseSummary {
     const parsed = try parseDocument(source);
     defer parsed.tree.destroy();
     return parsed.summary;
 }
 
-fn parseDocument(source: []const u8) !ParsedDocument {
+fn parseDocument(source: []const u8) Error!ParsedDocument {
     const parser = ts.Parser.create();
     defer parser.destroy();
 
@@ -100,40 +108,48 @@ pub fn serverCapabilities() types.ServerCapabilities {
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
+    scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(DocumentState),
     tags_query: *ts.Query,
 
-    pub fn init(allocator: std.mem.Allocator) !Server {
+    pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
         var query_error_offset: u32 = 0;
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
         errdefer tags_query.destroy();
 
         return .{
             .allocator = allocator,
+            .scratch_arena = std.heap.ArenaAllocator.init(allocator),
             .documents = .empty,
             .tags_query = tags_query,
         };
     }
 
-    pub fn deinit(self: *Server) void {
-        var it = self.documents.iterator();
+    pub fn deinit(server: *Server) void {
+        var it = server.documents.iterator();
         while (it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.source);
+            server.allocator.free(entry.key_ptr.*);
+            server.allocator.free(entry.value_ptr.source);
             entry.value_ptr.tree.destroy();
         }
-        self.documents.deinit(self.allocator);
-        self.tags_query.destroy();
+        server.documents.deinit(server.allocator);
+        server.scratch_arena.deinit();
+        server.tags_query.destroy();
     }
 
-    fn putDocument(self: *Server, uri: []const u8, version: i32, text: []const u8) !void {
-        const parsed = try parseDocument(text);
-        const text_copy = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(text_copy);
+    fn scratchAllocator(server: *Server) std.mem.Allocator {
+        _ = server.scratch_arena.reset(.retain_capacity);
+        return server.scratch_arena.allocator();
+    }
 
-        const gop = try self.documents.getOrPut(self.allocator, uri);
+    fn putDocument(server: *Server, uri: []const u8, version: i32, text: []const u8) Error!void {
+        const parsed = try parseDocument(text);
+        const text_copy = try server.allocator.dupe(u8, text);
+        errdefer server.allocator.free(text_copy);
+
+        const gop = try server.documents.getOrPut(server.allocator, uri);
         if (gop.found_existing) {
-            self.allocator.free(gop.value_ptr.source);
+            server.allocator.free(gop.value_ptr.source);
             gop.value_ptr.tree.destroy();
             gop.value_ptr.* = .{
                 .source = text_copy,
@@ -142,7 +158,7 @@ pub const Server = struct {
                 .tree = parsed.tree,
             };
         } else {
-            gop.key_ptr.* = try self.allocator.dupe(u8, uri);
+            gop.key_ptr.* = try server.allocator.dupe(u8, uri);
             gop.value_ptr.* = .{
                 .source = text_copy,
                 .version = version,
@@ -152,22 +168,22 @@ pub const Server = struct {
         }
     }
 
-    fn removeDocument(self: *Server, uri: []const u8) void {
-        const removed = self.documents.fetchRemove(uri) orelse return;
-        self.allocator.free(removed.key);
-        self.allocator.free(removed.value.source);
+    fn removeDocument(server: *Server, uri: []const u8) void {
+        const removed = server.documents.fetchRemove(uri) orelse return;
+        server.allocator.free(removed.key);
+        server.allocator.free(removed.value.source);
         removed.value.tree.destroy();
     }
 
-    fn getDocument(self: *Server, uri: []const u8) ?*DocumentState {
-        return self.documents.getPtr(uri);
+    fn getDocument(server: *Server, uri: []const u8) ?*DocumentState {
+        return server.documents.getPtr(uri);
     }
 
     fn resolveAtPosition(
-        self: *Server,
+        server: *Server,
         doc: *const DocumentState,
         position: types.Position,
-    ) !Resolution {
+    ) Resolution {
         const source_index = lsp.offsets.positionToIndex(doc.source, position, offset_encoding);
         const point = tsPointFromIndex(doc.source, source_index);
         const root = doc.tree.rootNode();
@@ -182,11 +198,11 @@ pub const Server = struct {
 
         const cursor = ts.QueryCursor.create();
         defer cursor.destroy();
-        cursor.exec(self.tags_query, root);
+        cursor.exec(server.tags_query, root);
 
         var best: ?SemanticSymbol = null;
         while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(self.tags_query, doc.source, source_index, match) orelse continue;
+            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, source_index, match) orelse continue;
             if (best == null or isBetterMatch(candidate, best.?, source_index)) {
                 best = candidate;
             }
@@ -212,11 +228,12 @@ pub const Server = struct {
     pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {}
 
     pub fn @"textDocument/didOpen"(
-        self: *Server,
+        server: *Server,
         _: std.mem.Allocator,
         params: types.DidOpenTextDocumentParams,
-    ) !void {
-        try self.putDocument(
+    ) Error!void {
+        _ = server.scratchAllocator();
+        try server.putDocument(
             params.textDocument.uri,
             params.textDocument.version,
             params.textDocument.text,
@@ -224,10 +241,11 @@ pub const Server = struct {
     }
 
     pub fn @"textDocument/didChange"(
-        self: *Server,
+        server: *Server,
         _: std.mem.Allocator,
         params: types.DidChangeTextDocumentParams,
-    ) !void {
+    ) Error!void {
+        _ = server.scratchAllocator();
         var latest_text: ?[]const u8 = null;
         for (params.contentChanges) |change| {
             switch (change) {
@@ -237,28 +255,30 @@ pub const Server = struct {
         }
 
         const text = latest_text orelse return error.InvalidParams;
-        try self.putDocument(params.textDocument.uri, params.textDocument.version, text);
+        try server.putDocument(params.textDocument.uri, params.textDocument.version, text);
     }
 
     pub fn @"textDocument/didClose"(
-        self: *Server,
+        server: *Server,
         _: std.mem.Allocator,
         params: types.DidCloseTextDocumentParams,
     ) void {
-        self.removeDocument(params.textDocument.uri);
+        _ = server.scratchAllocator();
+        server.removeDocument(params.textDocument.uri);
     }
 
     pub fn @"textDocument/hover"(
-        self: *Server,
-        arena: std.mem.Allocator,
+        server: *Server,
+        _: std.mem.Allocator,
         params: types.HoverParams,
-    ) !?types.Hover {
-        const doc = self.getDocument(params.textDocument.uri) orelse return null;
+    ) OOM!?types.Hover {
+        const scratch = server.scratchAllocator();
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
-        const value = switch (try self.resolveAtPosition(doc, params.position)) {
+        const value = switch (server.resolveAtPosition(doc, params.position)) {
             .no_match => return null,
             .unsupported_zig_code => return null,
-            .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol),
+            .symbol => |symbol| try hoverMarkdownForSymbol(scratch, symbol),
         };
 
         return .{
@@ -272,13 +292,14 @@ pub const Server = struct {
     }
 
     pub fn @"textDocument/definition"(
-        self: *Server,
+        server: *Server,
         _: std.mem.Allocator,
         params: types.DefinitionParams,
-    ) !lsp.ResultType("textDocument/definition") {
-        const doc = self.getDocument(params.textDocument.uri) orelse return null;
+    ) lsp.ResultType("textDocument/definition") {
+        _ = server.scratchAllocator();
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
-        return switch (try self.resolveAtPosition(doc, params.position)) {
+        return switch (server.resolveAtPosition(doc, params.position)) {
             .no_match => null,
             .unsupported_zig_code => null,
             .symbol => |symbol| switch (symbol.kind) {
@@ -288,7 +309,7 @@ pub const Server = struct {
                     },
                 },
                 .rule_reference => blk: {
-                    const definition = self.findRuleDefinition(doc, symbol.symbol_name) orelse break :blk null;
+                    const definition = server.findRuleDefinition(doc, symbol.symbol_name) orelse break :blk null;
                     break :blk .{
                         .Definition = .{
                             .Location = locationFromNode(params.textDocument.uri, definition.name_node),
@@ -310,13 +331,13 @@ pub const Server = struct {
 
     pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
 
-    fn findRuleDefinition(self: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
+    fn findRuleDefinition(server: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
         const cursor = ts.QueryCursor.create();
         defer cursor.destroy();
-        cursor.exec(self.tags_query, doc.tree.rootNode());
+        cursor.exec(server.tags_query, doc.tree.rootNode());
 
         while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(self.tags_query, doc.source, null, match) orelse continue;
+            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
             if (candidate.kind != .rule_definition) continue;
             if (std.mem.eql(u8, candidate.symbol_name, symbol_name)) return candidate;
         }
@@ -446,7 +467,7 @@ fn locationFromNode(uri: []const u8, node: ts.Node) types.Location {
     };
 }
 
-fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) ![]const u8 {
+fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) OOM![]const u8 {
     return switch (symbol.kind) {
         .rule_definition => std.fmt.allocPrint(
             arena,
@@ -471,21 +492,21 @@ fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) ![]c
     };
 }
 
-fn byteIndexOf(haystack: []const u8, needle: []const u8) !usize {
+fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {
     return std.mem.indexOf(u8, haystack, needle) orelse error.NeedleNotFound;
 }
 
-fn byteIndexOfAfter(haystack: []const u8, start_index: usize, needle: []const u8) !usize {
+fn byteIndexOfAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!usize {
     const relative = std.mem.indexOf(u8, haystack[start_index..], needle) orelse return error.NeedleNotFound;
     return start_index + relative;
 }
 
-fn positionOfText(haystack: []const u8, needle: []const u8) !types.Position {
+fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOf(haystack, needle);
     return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
 }
 
-fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) !types.Position {
+fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
 }
@@ -545,7 +566,7 @@ test "query resolution finds rule definitions and references in calc" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const calc_resolution = try server.resolveAtPosition(doc, try positionOfText(sample, "calc ::= expr"));
+    const calc_resolution = server.resolveAtPosition(doc, try positionOfText(sample, "calc ::= expr"));
     switch (calc_resolution) {
         .symbol => |symbol| {
             try std.testing.expectEqual(SemanticKind.rule_definition, symbol.kind);
@@ -555,7 +576,7 @@ test "query resolution finds rule definitions and references in calc" {
     }
 
     const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
-    const expr_reference_resolution = try server.resolveAtPosition(doc, try positionOfTextAfter(sample, calc_rule_index + 1, "expr"));
+    const expr_reference_resolution = server.resolveAtPosition(doc, try positionOfTextAfter(sample, calc_rule_index + 1, "expr"));
     switch (expr_reference_resolution) {
         .symbol => |symbol| {
             try std.testing.expectEqual(SemanticKind.rule_reference, symbol.kind);
@@ -575,7 +596,7 @@ test "query resolution returns no match on punctuation" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const resolution = try server.resolveAtPosition(doc, try positionOfText(sample, "%token_type"));
+    const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "%token_type"));
     try std.testing.expectEqual(Resolution.no_match, resolution);
 }
 
@@ -589,7 +610,7 @@ test "query resolution returns unsupported inside zig code" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const resolution = try server.resolveAtPosition(doc, try positionOfText(sample, "answer = A"));
+    const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "answer = A"));
     try std.testing.expectEqual(Resolution.unsupported_zig_code, resolution);
 }
 
@@ -623,7 +644,7 @@ test "hover and definition operate on stored live document state" {
     }
 
     const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
-    const definition = (try server.@"textDocument/definition"(std.testing.allocator, .{
+    const definition = (server.@"textDocument/definition"(std.testing.allocator, .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
     })) orelse return error.UnexpectedDefinitionTarget;

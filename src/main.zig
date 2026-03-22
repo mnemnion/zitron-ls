@@ -1,6 +1,7 @@
 //! Main executable of lsp_zitron.
 const std = @import("std");
 const zitron = @import("lsp_zitron");
+const Error = zitron.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
 
 test "exe mentioned" {
     var server = try zitron.Server.init(std.testing.allocator);
@@ -13,7 +14,7 @@ test "exe mentioned" {
     try std.testing.expectEqualStrings(zitron.server_name, result.serverInfo.?.name);
 }
 
-pub fn main() !void {
+pub fn main() Error!void {
     var server = try zitron.Server.init(std.heap.page_allocator);
     defer server.deinit();
 
