@@ -8,11 +8,25 @@
 
     .fingerprint = 0x5d6ef00f25fd9fe1,
 
-    .dependencies = .{},
+    .dependencies = .{
+        .lsp_kit = .{
+            .url = "git+https://github.com/zigtools/lsp-kit.git?ref=0.15.x#421ae644f53bd788e3699b5fc22b3e07b161e2b6",
+            .hash = "lsp_kit-0.1.0-bi_PL5wxCgB1_jRIZtcodh-x-_nteVzuOrul2ken-ZLE",
+        },
+        .tree_sitter = .{
+            .url = "git+https://github.com/tree-sitter/zig-tree-sitter.git#128f8b43701e1d55ee4f42ec37d98c6d19c80dc7",
+            .hash = "tree_sitter-0.25.0-8heIf6eZAQAwTv-nfxXiQnbvcvuneMvmmWaiW1Z22Ddk",
+        },
+        .tree_sitter_zitron = .{
+            .url = "git+https://github.com/mnemnion/tree-sitter-zitron.git?ref=trunk#1e836c667e75bd230892bb43ebedf5816fd284f2",
+            .hash = "tree_sitter_zitron-0.1.1-EA3PTNM1AwBAp-FV9f3B4J6bVwpysIBx2q2RP6rB2w_n",
+        },
+    },
 
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "samples",
         "src",
         "LICENSE",
         "README.md",

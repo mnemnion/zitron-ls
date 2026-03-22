@@ -5,12 +5,33 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
+    const options = b.addOptions();
+    options.addOption([]const u8, "fixture_path", "samples/calc.zy");
+
+    const lsp_module = b.dependency("lsp_kit", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("lsp");
+    const tree_sitter_dep = b.dependency("tree_sitter", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tree_sitter_zitron_dep = b.dependency("tree_sitter_zitron", .{
+        .target = target,
+        .optimize = optimize,
+        .@"build-shared" = false,
+    });
 
     const lsp_zitron_mod = b.addModule("lsp_zitron", .{
         .root_source_file = b.path("src/lsp_zitron.zig"),
         .target = target,
         .optimize = optimize,
     });
+    lsp_zitron_mod.addImport("lsp", lsp_module);
+    lsp_zitron_mod.addOptions("build_options", options);
+    lsp_zitron_mod.addImport("tree-sitter", tree_sitter_dep.module("tree_sitter"));
+    lsp_zitron_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
+    lsp_zitron_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -61,6 +82,9 @@ pub fn build(b: *std.Build) void {
 
     const run_test_client = b.step("run-client", "run the lsp_zitron test client");
     run_test_client.dependOn(&run_client_cmd.step);
+
+    const smoke_step = b.step("smoke", "run the end-to-end stdio smoke test");
+    smoke_step.dependOn(&run_client_cmd.step);
 
     const test_filters = b.option(
         []const []const u8,

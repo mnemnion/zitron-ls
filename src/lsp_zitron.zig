@@ -1,88 +1,146 @@
-//! Shared helpers for the lsp_zitron smoke-test server and client.
+//! Shared language-server state and configuration.
 const std = @import("std");
+const build_options = @import("build_options");
+pub const lsp = @import("lsp");
+pub const types = lsp.types;
+const ts = @import("tree-sitter");
+const zitron_grammar = @import("tree_sitter_zitron");
 
-pub const ServerInfo = struct {
-    name: []const u8 = "lsp_zitron",
-    version: []const u8 = "0.0.1",
+pub const server_name = "lsp_zitron";
+pub const server_version = "0.0.1";
+
+pub const ParseSummary = struct {
+    root_kind: []const u8,
+    has_error: bool,
 };
 
-pub const LspError = error{
-    MissingContentLength,
-    InvalidContentLength,
-    InvalidRequestId,
+pub fn fixturePath() []const u8 {
+    return build_options.fixture_path;
+}
+
+pub fn zitronLanguage() *const ts.Language {
+    return ts.Language.fromRaw(zitron_grammar.language());
+}
+
+pub fn loadFixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
+    return std.fs.cwd().readFileAlloc(allocator, fixturePath(), 64 * 1024);
+}
+
+pub fn parseSource(source: []const u8) !ParseSummary {
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+
+    try parser.setLanguage(zitronLanguage());
+
+    const tree = parser.parseString(source, null) orelse return error.ParseFailed;
+    defer tree.destroy();
+
+    const root = tree.rootNode();
+    return .{
+        .root_kind = root.kind(),
+        .has_error = root.hasError(),
+    };
+}
+
+pub fn serverCapabilities() types.ServerCapabilities {
+    return .{
+        .textDocumentSync = .{ .TextDocumentSyncKind = .None },
+        .hoverProvider = .{ .bool = true },
+        .definitionProvider = .{ .bool = false },
+    };
+}
+
+pub const Server = struct {
+    allocator: std.mem.Allocator,
+    fixture_source: []u8,
+    startup_parse: ParseSummary,
+
+    pub fn init(allocator: std.mem.Allocator) !Server {
+        const fixture_source = try loadFixtureAlloc(allocator);
+        errdefer allocator.free(fixture_source);
+
+        return .{
+            .allocator = allocator,
+            .fixture_source = fixture_source,
+            .startup_parse = try parseSource(fixture_source),
+        };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.allocator.free(self.fixture_source);
+    }
+
+    fn refreshFixtureParse(self: *Server) !ParseSummary {
+        self.startup_parse = try parseSource(self.fixture_source);
+        return self.startup_parse;
+    }
+
+    pub fn initialize(
+        self: *Server,
+        _: std.mem.Allocator,
+        _: types.InitializeParams,
+    ) types.InitializeResult {
+        _ = self;
+        return .{
+            .capabilities = serverCapabilities(),
+            .serverInfo = .{
+                .name = server_name,
+                .version = server_version,
+            },
+        };
+    }
+
+    pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {}
+
+    pub fn @"textDocument/hover"(
+        self: *Server,
+        arena: std.mem.Allocator,
+        _: types.HoverParams,
+    ) !?types.Hover {
+        const parsed = try self.refreshFixtureParse();
+        const value = try std.fmt.allocPrint(
+            arena,
+            "fixture `{s}` parsed as `{s}` (has_error={})",
+            .{ fixturePath(), parsed.root_kind, parsed.has_error },
+        );
+
+        return .{
+            .contents = .{
+                .MarkupContent = .{
+                    .kind = .markdown,
+                    .value = value,
+                },
+            },
+        };
+    }
+
+    pub fn shutdown(_: *Server, _: std.mem.Allocator, _: void) ?void {
+        return null;
+    }
+
+    pub fn exit(_: *Server, _: std.mem.Allocator, _: void) void {}
+
+    pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
 };
 
-pub fn readMessageAlloc(allocator: std.mem.Allocator, file: std.fs.File) ![]u8 {
-    var reader = file.deprecatedReader();
-    var content_length: ?usize = null;
-
-    while (true) {
-        const maybe_line = try reader.readUntilDelimiterOrEofAlloc(allocator, '\n', 1024);
-        const line = maybe_line orelse return error.EndOfStream;
-        defer allocator.free(line);
-
-        const trimmed = std.mem.trimRight(u8, line, "\r");
-        if (trimmed.len == 0) break;
-
-        if (std.mem.startsWith(u8, trimmed, "Content-Length:")) {
-            const value = std.mem.trim(u8, trimmed["Content-Length:".len..], " \t");
-            content_length = std.fmt.parseInt(usize, value, 10) catch {
-                return LspError.InvalidContentLength;
-            };
-        }
-    }
-
-    const body_len = content_length orelse return LspError.MissingContentLength;
-    const body = try allocator.alloc(u8, body_len);
-    errdefer allocator.free(body);
-    try reader.readNoEof(body);
-    return body;
+test "server capabilities match the implemented handlers" {
+    lsp.basic_server.validateServerCapabilities(Server, serverCapabilities());
 }
 
-pub fn writeMessage(file: std.fs.File, json_payload: []const u8) !void {
-    var writer = file.deprecatedWriter();
-    try writer.print("Content-Length: {d}\r\n\r\n", .{json_payload.len});
-    try writer.writeAll(json_payload);
+test "tree-sitter zitron parses the configured fixture" {
+    const sample = try loadFixtureAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(sample);
+
+    const parsed = try parseSource(sample);
+
+    try std.testing.expectEqualStrings("source_file", parsed.root_kind);
+    try std.testing.expect(!parsed.has_error);
 }
 
-pub fn parseRequestId(json_payload: []const u8) !i64 {
-    const id_key_index = std.mem.indexOf(u8, json_payload, "\"id\"") orelse return LspError.InvalidRequestId;
-    const colon_index = std.mem.indexOfScalarPos(u8, json_payload, id_key_index, ':') orelse return LspError.InvalidRequestId;
-    const trimmed = std.mem.trimLeft(u8, json_payload[colon_index + 1 ..], " \t\r\n");
-    if (trimmed.len == 0) return LspError.InvalidRequestId;
+test "server init eagerly parses the configured fixture" {
+    var server = try Server.init(std.testing.allocator);
+    defer server.deinit();
 
-    var end_index: usize = 0;
-    if (trimmed[0] == '-') end_index = 1;
-    while (end_index < trimmed.len and std.ascii.isDigit(trimmed[end_index])) : (end_index += 1) {}
-
-    if (end_index == 0 or (end_index == 1 and trimmed[0] == '-')) {
-        return LspError.InvalidRequestId;
-    }
-
-    return std.fmt.parseInt(i64, trimmed[0..end_index], 10);
-}
-
-pub fn buildInitializeResponseAlloc(allocator: std.mem.Allocator, request_id: i64) ![]u8 {
-    const server_info = ServerInfo{};
-    return std.fmt.allocPrint(
-        allocator,
-        \\{{"jsonrpc":"2.0","id":{d},"result":{{"capabilities":{{"textDocumentSync":1,"hoverProvider":false,"definitionProvider":false}},"serverInfo":{{"name":"{s}","version":"{s}"}}}}}}
-    ,
-        .{ request_id, server_info.name, server_info.version },
-    );
-}
-
-test "round-trips an initialize response" {
-    const allocator = std.testing.allocator;
-    const response = try buildInitializeResponseAlloc(allocator, 7);
-    defer allocator.free(response);
-
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"id\":7") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"serverInfo\"") != null);
-}
-
-test "parses integer request ids" {
-    try std.testing.expectEqual(@as(i64, 42), try parseRequestId(
-        \\{"jsonrpc":"2.0","id":42,"method":"initialize"}
-    ));
+    try std.testing.expectEqualStrings("source_file", server.startup_parse.root_kind);
+    try std.testing.expect(!server.startup_parse.has_error);
 }

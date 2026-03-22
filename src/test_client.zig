@@ -1,6 +1,13 @@
-//! Tiny subprocess client for the smoke-test server.
+//! Tiny subprocess client for the lsp-kit-backed smoke server.
 const std = @import("std");
-const module = @import("lsp_zitron");
+const zitron = @import("lsp_zitron");
+
+const error_set = error{
+    UnexpectedResponse,
+    MissingResult,
+    MissingServerInfo,
+    ChildProcessFailed,
+};
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -8,9 +15,6 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const server_path = if (args.len > 1) args[1] else "zig-out/bin/lsp_zitron";
-    const initialize_payload =
-        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"lsp_zitron_test_client"}}}
-    ;
 
     var child = std.process.Child.init(&.{server_path}, allocator);
     child.stdin_behavior = .Pipe;
@@ -20,22 +24,172 @@ pub fn main() !void {
     try child.spawn();
     errdefer _ = child.kill() catch {};
 
-    try module.writeMessage(child.stdin.?, initialize_payload);
+    var read_buffer: [4096]u8 = undefined;
+    var transport = zitron.lsp.Transport.Stdio.init(
+        &read_buffer,
+        child.stdout.?,
+        child.stdin.?,
+    );
+
+    try transport.transport.writeRequest(
+        allocator,
+        .{ .number = 1 },
+        "initialize",
+        zitron.lsp.ParamsType("initialize"),
+        .{
+            .processId = null,
+            .clientInfo = .{ .name = "lsp_zitron_test_client" },
+            .capabilities = .{},
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+
+    try expectInitializeResponse(allocator, &transport.transport);
+
+    try transport.transport.writeNotification(
+        allocator,
+        "initialized",
+        zitron.lsp.ParamsType("initialized"),
+        .{},
+        .{ .emit_null_optional_fields = false },
+    );
+
+    try transport.transport.writeRequest(
+        allocator,
+        .{ .number = 3 },
+        "textDocument/hover",
+        zitron.lsp.ParamsType("textDocument/hover"),
+        .{
+            .textDocument = .{ .uri = "file:///calc.zy" },
+            .position = .{ .line = 0, .character = 0 },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+
+    try expectHoverResponse(allocator, &transport.transport);
+
+    try transport.transport.writeRequest(
+        allocator,
+        .{ .number = 2 },
+        "shutdown",
+        zitron.lsp.ParamsType("shutdown"),
+        {},
+        .{ .emit_null_optional_fields = false },
+    );
+
+    try expectShutdownResponse(allocator, &transport.transport);
+
+    try transport.transport.writeNotification(
+        allocator,
+        "exit",
+        zitron.lsp.ParamsType("exit"),
+        {},
+        .{ .emit_null_optional_fields = false },
+    );
     child.stdin.?.close();
     child.stdin = null;
-
-    const response = try module.readMessageAlloc(allocator, child.stdout.?);
-    defer allocator.free(response);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("{s}\n", .{response});
-
-    try std.testing.expectEqual(@as(i64, 1), try module.parseRequestId(response));
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"capabilities\"") != null);
 
     const term = try child.wait();
     switch (term) {
         .Exited => |code| if (code != 0) return error.ChildProcessFailed,
         else => return error.ChildProcessFailed,
+    }
+}
+
+fn expectInitializeResponse(
+    allocator: std.mem.Allocator,
+    transport: *zitron.lsp.Transport,
+) !void {
+    const json_message = try transport.readJsonMessage(allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(zitron.lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const initialize_result = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = 1 })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const result = try std.json.parseFromValue(zitron.types.InitializeResult, allocator, initialize_result, .{
+        .ignore_unknown_fields = true,
+    });
+    defer result.deinit();
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("{s} {s}\n", .{
+        (result.value.serverInfo orelse return error_set.MissingServerInfo).name,
+        json_message,
+    });
+}
+
+fn expectHoverResponse(
+    allocator: std.mem.Allocator,
+    transport: *zitron.lsp.Transport,
+) !void {
+    const json_message = try transport.readJsonMessage(allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(zitron.lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const hover_value = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = 3 })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const hover = try std.json.parseFromValue(zitron.types.Hover, allocator, hover_value, .{
+        .ignore_unknown_fields = true,
+    });
+    defer hover.deinit();
+
+    switch (hover.value.contents) {
+        .MarkupContent => |content| {
+            try std.testing.expect(std.mem.indexOf(u8, content.value, "calc.zy") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content.value, "source_file") != null);
+        },
+        else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn expectShutdownResponse(
+    allocator: std.mem.Allocator,
+    transport: *zitron.lsp.Transport,
+) !void {
+    const json_message = try transport.readJsonMessage(allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(zitron.lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .response => |response| {
+            if (response.id == null or !response.id.?.eql(.{ .number = 2 })) {
+                return error_set.UnexpectedResponse;
+            }
+        },
+        else => return error_set.UnexpectedResponse,
     }
 }
