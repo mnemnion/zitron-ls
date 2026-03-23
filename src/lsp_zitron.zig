@@ -681,10 +681,8 @@ test "hover and definition operate on stored live document state" {
 
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
-/// Re-exported `lsp-kit` API used by companion executables in this package.
-pub const lsp = @import("lsp");
-/// Re-exported LSP protocol types used by companion executables in this package.
-pub const types = lsp.types;
+const lsp = @import("lsp");
+const types = lsp.types;
 const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");

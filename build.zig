@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe_mod.addImport("lsp", lsp_module);
     exe_mod.addImport("lsp_zitron", lsp_zitron_mod);
 
     const exe = b.addExecutable(.{
@@ -54,6 +55,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_client_mod.addImport("lsp", lsp_module);
     test_client_mod.addImport("lsp_zitron", lsp_zitron_mod);
 
     const test_client = b.addExecutable(.{

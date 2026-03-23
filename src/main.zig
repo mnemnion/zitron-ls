@@ -5,13 +5,13 @@ pub fn main() Error!void {
     defer server.deinit();
 
     var read_buffer: [4096]u8 = undefined;
-    var transport = zitron.lsp.Transport.Stdio.init(
+    var transport = lsp.Transport.Stdio.init(
         &read_buffer,
         std.fs.File.stdin(),
         std.fs.File.stdout(),
     );
 
-    try zitron.lsp.basic_server.run(
+    try lsp.basic_server.run(
         std.heap.page_allocator,
         &transport.transport,
         &server,
@@ -31,7 +31,8 @@ test "exe mentioned" {
 }
 
 const std = @import("std");
-const Error = zitron.Server.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
+const Error = zitron.Server.Error || lsp.Transport.ReadError || lsp.Transport.WriteError;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
+const lsp = @import("lsp");
 const zitron = @import("lsp_zitron");
