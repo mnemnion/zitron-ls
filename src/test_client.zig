@@ -1,15 +1,4 @@
 //! Tiny subprocess client for the lsp-kit-backed smoke server.
-const std = @import("std");
-const zitron = @import("lsp_zitron");
-const offset_encoding: zitron.lsp.offsets.Encoding = .@"utf-8";
-const OOM = std.mem.Allocator.Error;
-const JsonParseError = std.json.ParseFromValueError || error{
-    BufferUnderrun,
-    SyntaxError,
-    UnexpectedEndOfInput,
-    ValueTooLong,
-};
-
 const error_set = error{
     UnexpectedResponse,
     MissingResult,
@@ -255,8 +244,8 @@ fn expectHoverResponse(
 
     switch (hover.value.contents) {
         .MarkupContent => |content| {
-            try std.testing.expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
-            try std.testing.expect(std.mem.indexOf(u8, content.value, "definition.class") != null);
+            try expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
+            try expect(std.mem.indexOf(u8, content.value, "definition.class") != null);
         },
         else => return error_set.UnexpectedResponse,
     }
@@ -299,9 +288,9 @@ fn expectDefinitionResponse(
     switch (resolved) {
         .Definition => |target| switch (target) {
             .Location => |location| {
-                try std.testing.expectEqualStrings("file:///samples/calc.zy", location.uri);
-                try std.testing.expectEqual(@as(u32, 48), location.range.start.line);
-                try std.testing.expectEqual(@as(u32, 0), location.range.start.character);
+                try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                try expectEqual(@as(u32, 48), location.range.start.line);
+                try expectEqual(@as(u32, 0), location.range.start.character);
             },
             else => return error_set.UnexpectedResponse,
         },
@@ -380,3 +369,17 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return zitron.lsp.offsets.indexToPosition(haystack, index, offset_encoding);
 }
+
+const std = @import("std");
+const JsonParseError = std.json.ParseFromValueError || error{
+    BufferUnderrun,
+    SyntaxError,
+    UnexpectedEndOfInput,
+    ValueTooLong,
+};
+const OOM = std.mem.Allocator.Error;
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const zitron = @import("lsp_zitron");
+const offset_encoding: zitron.lsp.offsets.Encoding = .@"utf-8";

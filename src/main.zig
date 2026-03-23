@@ -1,18 +1,4 @@
 //! Main executable of lsp_zitron.
-const std = @import("std");
-const zitron = @import("lsp_zitron");
-const Error = zitron.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
-
-test "exe mentioned" {
-    var server = try zitron.Server.init(std.testing.allocator);
-    defer server.deinit();
-
-    const result = server.initialize(std.testing.allocator, .{
-        .capabilities = .{},
-    });
-
-    try std.testing.expectEqualStrings(zitron.server_name, result.serverInfo.?.name);
-}
 
 pub fn main() Error!void {
     var server = try zitron.Server.init(std.heap.page_allocator);
@@ -32,3 +18,20 @@ pub fn main() Error!void {
         std.log.err,
     );
 }
+
+test "exe mentioned" {
+    var server = try zitron.Server.init(testing_allocator);
+    defer server.deinit();
+
+    const result = server.initialize(testing_allocator, .{
+        .capabilities = .{},
+    });
+
+    try expectEqualStrings(zitron.server_name, result.serverInfo.?.name);
+}
+
+const std = @import("std");
+const Error = zitron.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const testing_allocator = std.testing.allocator;
+const zitron = @import("lsp_zitron");

@@ -1,5 +1,4 @@
-// Build script for lsp_zitron
-const std = @import("std");
+//! Build script for lsp_zitron.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -146,3 +145,5 @@ pub fn build(b: *std.Build) void {
     const coverage_step = b.step("coverage", "Generate coverage (kcov must be installed)");
     coverage_step.dependOn(&install_coverage.step);
 }
+
+const std = @import("std");

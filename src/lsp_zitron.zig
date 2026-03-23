@@ -1,13 +1,4 @@
 //! Shared language-server state and configuration.
-const std = @import("std");
-const build_options = @import("build_options");
-pub const lsp = @import("lsp");
-pub const types = lsp.types;
-const ts = @import("tree-sitter");
-const zitron_grammar = @import("tree_sitter_zitron");
-const tags_query_source = @embedFile("zitron-tags-query");
-const offset_encoding: lsp.offsets.Encoding = .@"utf-8";
-const OOM = std.mem.Allocator.Error;
 pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
 pub const Error = OOM || ts.Query.Error || error{
     IncompatibleLanguage,
@@ -520,28 +511,28 @@ test "embedded tags query compiles for the zitron grammar" {
     const query = try ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
     defer query.destroy();
 
-    try std.testing.expectEqual(@as(u32, 6), query.patternCount());
-    try std.testing.expect(query.captureCount() >= 3);
+    try expectEqual(@as(u32, 6), query.patternCount());
+    try expect(query.captureCount() >= 3);
 }
 
 test "tree-sitter zitron parses the configured fixture" {
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
     const parsed = try parseSource(sample);
 
-    try std.testing.expectEqualStrings("source_file", parsed.root_kind);
-    try std.testing.expect(!parsed.has_error);
+    try expectEqualStrings("source_file", parsed.root_kind);
+    try expect(!parsed.has_error);
 }
 
 test "server tracks open documents" {
-    var server = try Server.init(std.testing.allocator);
+    var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
-    try server.@"textDocument/didOpen"(std.testing.allocator, .{
+    try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/calc.zy",
             .languageId = "zitron",
@@ -551,17 +542,17 @@ test "server tracks open documents" {
     });
 
     const doc = server.getDocument("file:///samples/calc.zy").?;
-    try std.testing.expectEqual(@as(i32, 1), doc.version);
-    try std.testing.expectEqualStrings("source_file", doc.parsed.root_kind);
-    try std.testing.expect(!doc.parsed.has_error);
+    try expectEqual(@as(i32, 1), doc.version);
+    try expectEqualStrings("source_file", doc.parsed.root_kind);
+    try expect(!doc.parsed.has_error);
 }
 
 test "query resolution finds rule definitions and references in calc" {
-    var server = try Server.init(std.testing.allocator);
+    var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
@@ -569,8 +560,8 @@ test "query resolution finds rule definitions and references in calc" {
     const calc_resolution = server.resolveAtPosition(doc, try positionOfText(sample, "calc ::= expr"));
     switch (calc_resolution) {
         .symbol => |symbol| {
-            try std.testing.expectEqual(SemanticKind.rule_definition, symbol.kind);
-            try std.testing.expectEqualStrings("calc", symbol.symbol_name);
+            try expectEqual(SemanticKind.rule_definition, symbol.kind);
+            try expectEqualStrings("calc", symbol.symbol_name);
         },
         else => return error.UnexpectedResolution,
     }
@@ -579,51 +570,51 @@ test "query resolution finds rule definitions and references in calc" {
     const expr_reference_resolution = server.resolveAtPosition(doc, try positionOfTextAfter(sample, calc_rule_index + 1, "expr"));
     switch (expr_reference_resolution) {
         .symbol => |symbol| {
-            try std.testing.expectEqual(SemanticKind.rule_reference, symbol.kind);
-            try std.testing.expectEqualStrings("expr", symbol.symbol_name);
+            try expectEqual(SemanticKind.rule_reference, symbol.kind);
+            try expectEqualStrings("expr", symbol.symbol_name);
         },
         else => return error.UnexpectedResolution,
     }
 }
 
 test "query resolution returns no match on punctuation" {
-    var server = try Server.init(std.testing.allocator);
+    var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
     const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "%token_type"));
-    try std.testing.expectEqual(Resolution.no_match, resolution);
+    try expectEqual(Resolution.no_match, resolution);
 }
 
 test "query resolution returns unsupported inside zig code" {
-    var server = try Server.init(std.testing.allocator);
+    var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
     const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "answer = A"));
-    try std.testing.expectEqual(Resolution.unsupported_zig_code, resolution);
+    try expectEqual(Resolution.unsupported_zig_code, resolution);
 }
 
 test "hover and definition operate on stored live document state" {
-    var server = try Server.init(std.testing.allocator);
+    var server = try Server.init(testing_allocator);
     defer server.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    const sample = try loadFixtureAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(sample);
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
 
-    try server.@"textDocument/didOpen"(std.testing.allocator, .{
+    try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/calc.zy",
             .languageId = "zitron",
@@ -638,25 +629,39 @@ test "hover and definition operate on stored live document state" {
     })).?;
     switch (hover.contents) {
         .MarkupContent => |content| {
-            try std.testing.expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
+            try expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
         },
         else => return error.UnexpectedHoverContents,
     }
 
     const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
-    const definition = (server.@"textDocument/definition"(std.testing.allocator, .{
+    const definition = (server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
     })) orelse return error.UnexpectedDefinitionTarget;
     switch (definition) {
         .Definition => |target| switch (target) {
             .Location => |location| {
-                try std.testing.expectEqualStrings("file:///samples/calc.zy", location.uri);
-                try std.testing.expectEqual(@as(u32, 48), location.range.start.line);
-                try std.testing.expectEqual(@as(u32, 0), location.range.start.character);
+                try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                try expectEqual(@as(u32, 48), location.range.start.line);
+                try expectEqual(@as(u32, 0), location.range.start.character);
             },
             else => return error.UnexpectedDefinitionTarget,
         },
         else => return error.UnexpectedDefinitionTarget,
     }
 }
+
+const std = @import("std");
+const OOM = std.mem.Allocator.Error;
+pub const lsp = @import("lsp");
+pub const types = lsp.types;
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const testing_allocator = std.testing.allocator;
+const build_options = @import("build_options");
+const ts = @import("tree-sitter");
+const tags_query_source = @embedFile("zitron-tags-query");
+const zitron_grammar = @import("tree_sitter_zitron");
+const offset_encoding: lsp.offsets.Encoding = .@"utf-8";
