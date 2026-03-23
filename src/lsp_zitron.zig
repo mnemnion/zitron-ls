@@ -312,9 +312,19 @@ pub const Server = struct {
                         },
                     };
                 },
-                .action_definition, .action_implementation =>
-                // TODO: Bridge named-action references through generated Zig and ZLS.
-                null,
+                .action_definition => .{
+                    .Definition = .{
+                        .Location = locationFromNode(params.textDocument.uri, symbol.name_node),
+                    },
+                },
+                .action_implementation => blk: {
+                    const definition = server.findActionDefinition(doc, symbol.symbol_name) orelse break :blk null;
+                    break :blk .{
+                        .Definition = .{
+                            .Location = locationFromNode(params.textDocument.uri, definition.name_node),
+                        },
+                    };
+                },
             },
         };
     }
@@ -365,6 +375,20 @@ pub const Server = struct {
         return null;
     }
 
+    fn findActionDefinition(server: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
+        const cursor = ts.QueryCursor.create();
+        defer cursor.destroy();
+        cursor.exec(server.tags_query, doc.tree.rootNode());
+
+        while (cursor.nextMatch()) |match| {
+            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
+            if (candidate.kind != .action_definition) continue;
+            if (std.mem.eql(u8, candidate.symbol_name, symbol_name)) return candidate;
+        }
+
+        return null;
+    }
+
     fn findReferences(
         server: *Server,
         arena: std.mem.Allocator,
@@ -373,22 +397,6 @@ pub const Server = struct {
         symbol: SemanticSymbol,
         include_declaration: bool,
     ) OOM!lsp.ResultType("textDocument/references") {
-        const Kinds = struct {
-            definition: SemanticKind,
-            reference: SemanticKind,
-        };
-
-        const kinds = switch (symbol.kind) {
-            .rule_definition, .rule_reference => Kinds{
-                .definition = SemanticKind.rule_definition,
-                .reference = SemanticKind.rule_reference,
-            },
-            .action_definition, .action_implementation => Kinds{
-                .definition = SemanticKind.action_definition,
-                .reference = SemanticKind.action_implementation,
-            },
-        };
-
         var references: std.ArrayList(types.Location) = .empty;
 
         const cursor = ts.QueryCursor.create();
@@ -399,13 +407,22 @@ pub const Server = struct {
             const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
             if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
 
-            if (candidate.kind == kinds.reference) {
-                try references.append(arena, locationFromNode(uri, candidate.name_node));
-                continue;
-            }
+            switch (symbol.kind) {
+                .rule_definition, .rule_reference => {
+                    if (candidate.kind == .rule_reference) {
+                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                        continue;
+                    }
 
-            if (include_declaration and candidate.kind == kinds.definition) {
-                try references.append(arena, locationFromNode(uri, candidate.name_node));
+                    if (include_declaration and candidate.kind == .rule_definition) {
+                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                    }
+                },
+                .action_definition, .action_implementation => {
+                    if (candidate.kind == .action_definition or candidate.kind == .action_implementation) {
+                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                    }
+                },
             }
         }
 
@@ -781,6 +798,66 @@ test "hover definition and references operate on stored live document state" {
 
     const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
     try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
+}
+
+test "named action definitions resolve in the same document" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample =
+        \\vector(F) ::= SQL v_forms(V) SQR. @vector_form(F;V)
+        \\%impl @vector_form(F;V) { _ = .{F, V}; }
+        \\%impl @vector_form(F;V) { _ = .{V, F}; }
+    ;
+
+    try server.putDocument("file:///samples/named_actions.zy", 1, sample);
+
+    const definition_target = try positionOfText(sample, "@vector_form(F;V)");
+    const definition_position = try positionOfText(sample, "vector_form(F;V)");
+    const definition = (server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/named_actions.zy" },
+        .position = definition_position,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (definition) {
+        .Definition => |target| switch (target) {
+            .Location => |location| {
+                try expectEqualStrings("file:///samples/named_actions.zy", location.uri);
+                try expectEqual(definition_target, location.range.start);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
+    const implementation_anchor = try byteIndexOf(sample, "%impl @vector_form(F;V)");
+    const implementation_position = try positionOfTextAfter(sample, implementation_anchor + 1, "vector_form(F;V)");
+    const implementation_definition = (server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/named_actions.zy" },
+        .position = implementation_position,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (implementation_definition) {
+        .Definition => |target| switch (target) {
+            .Location => |location| {
+                try expectEqualStrings("file:///samples/named_actions.zy", location.uri);
+                try expectEqual(definition_target, location.range.start);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
+    const missing_definition_sample =
+        \\rule ::= TOKEN. @missing_action()
+        \\%impl @other_action() { _ = .{}; }
+    ;
+    try server.putDocument("file:///samples/missing_named_action.zy", 1, missing_definition_sample);
+    const missing_anchor = try byteIndexOf(missing_definition_sample, "%impl @other_action()");
+    const missing_position = try positionOfTextAfter(missing_definition_sample, missing_anchor + 1, "other_action()");
+    const missing_result = server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/missing_named_action.zy" },
+        .position = missing_position,
+    });
+    try expect(missing_result == null);
 }
 
 const std = @import("std");
