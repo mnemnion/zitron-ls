@@ -71,8 +71,17 @@ fn parseDocument(source: []const u8) Server.Error!ParsedDocument {
     };
 }
 
-fn serverCapabilities() types.ServerCapabilities {
+fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKind {
+    return switch (encoding) {
+        .@"utf-8" => .@"utf-8",
+        .@"utf-16" => .@"utf-16",
+        .@"utf-32" => .@"utf-32",
+    };
+}
+
+fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabilities {
     return .{
+        .positionEncoding = positionEncodingKind(offset_encoding),
         .textDocumentSync = .{
             .TextDocumentSyncOptions = .{
                 .openClose = true,
@@ -98,6 +107,7 @@ pub const Server = struct {
     scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(DocumentState),
     tags_query: *ts.Query,
+    offset_encoding: lsp.offsets.Encoding,
 
     /// Creates a server instance and compiles the grammar tag query.
     pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
@@ -110,6 +120,7 @@ pub const Server = struct {
             .scratch_arena = std.heap.ArenaAllocator.init(allocator),
             .documents = .empty,
             .tags_query = tags_query,
+            .offset_encoding = .@"utf-16",
         };
     }
 
@@ -147,6 +158,7 @@ pub const Server = struct {
                 .tree = parsed.tree,
             };
         } else {
+            errdefer server.documents.removeByPtr(gop.key_ptr);
             gop.key_ptr.* = try server.allocator.dupe(u8, uri);
             gop.value_ptr.* = .{
                 .source = text_copy,
@@ -173,7 +185,7 @@ pub const Server = struct {
         doc: *const DocumentState,
         position: types.Position,
     ) Resolution {
-        const source_index = lsp.offsets.positionToIndex(doc.source, position, offset_encoding);
+        const source_index = lsp.offsets.positionToIndex(doc.source, position, server.offset_encoding);
         const point = tsPointFromIndex(doc.source, source_index);
         const root = doc.tree.rootNode();
         const raw_node = root.descendantForPointRange(point, point) orelse return .no_match;
@@ -202,12 +214,24 @@ pub const Server = struct {
 
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
-        _: *Server,
+        server: *Server,
         _: std.mem.Allocator,
-        _: types.InitializeParams,
+        params: types.InitializeParams,
     ) types.InitializeResult {
+        if (params.capabilities.general) |general| {
+            for (general.positionEncodings orelse &.{}) |encoding| {
+                server.offset_encoding = switch (encoding) {
+                    .@"utf-8" => .@"utf-8",
+                    .@"utf-16" => .@"utf-16",
+                    .@"utf-32" => .@"utf-32",
+                    .custom_value => continue,
+                };
+                break;
+            }
+        }
+
         return .{
-            .capabilities = serverCapabilities(),
+            .capabilities = serverCapabilities(server.offset_encoding),
             .serverInfo = .{
                 .name = server_name,
                 .version = server_version,
@@ -301,27 +325,47 @@ pub const Server = struct {
             .symbol => |symbol| switch (symbol.kind) {
                 .rule_definition => .{
                     .Definition = .{
-                        .Location = locationFromNode(params.textDocument.uri, symbol.name_node),
+                        .Location = locationFromNode(
+                            params.textDocument.uri,
+                            doc.source,
+                            symbol.name_node,
+                            server.offset_encoding,
+                        ),
                     },
                 },
                 .rule_reference => blk: {
                     const definition = server.findRuleDefinition(doc, symbol.symbol_name) orelse break :blk null;
                     break :blk .{
                         .Definition = .{
-                            .Location = locationFromNode(params.textDocument.uri, definition.name_node),
+                            .Location = locationFromNode(
+                                params.textDocument.uri,
+                                doc.source,
+                                definition.name_node,
+                                server.offset_encoding,
+                            ),
                         },
                     };
                 },
                 .action_definition => .{
                     .Definition = .{
-                        .Location = locationFromNode(params.textDocument.uri, symbol.name_node),
+                        .Location = locationFromNode(
+                            params.textDocument.uri,
+                            doc.source,
+                            symbol.name_node,
+                            server.offset_encoding,
+                        ),
                     },
                 },
                 .action_implementation => blk: {
                     const definition = server.findActionDefinition(doc, symbol.symbol_name) orelse break :blk null;
                     break :blk .{
                         .Definition = .{
-                            .Location = locationFromNode(params.textDocument.uri, definition.name_node),
+                            .Location = locationFromNode(
+                                params.textDocument.uri,
+                                doc.source,
+                                definition.name_node,
+                                server.offset_encoding,
+                            ),
                         },
                     };
                 },
@@ -410,17 +454,32 @@ pub const Server = struct {
             switch (symbol.kind) {
                 .rule_definition, .rule_reference => {
                     if (candidate.kind == .rule_reference) {
-                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                        try references.append(arena, locationFromNode(
+                            uri,
+                            doc.source,
+                            candidate.name_node,
+                            server.offset_encoding,
+                        ));
                         continue;
                     }
 
                     if (include_declaration and candidate.kind == .rule_definition) {
-                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                        try references.append(arena, locationFromNode(
+                            uri,
+                            doc.source,
+                            candidate.name_node,
+                            server.offset_encoding,
+                        ));
                     }
                 },
                 .action_definition, .action_implementation => {
                     if (candidate.kind == .action_definition or candidate.kind == .action_implementation) {
-                        try references.append(arena, locationFromNode(uri, candidate.name_node));
+                        try references.append(arena, locationFromNode(
+                            uri,
+                            doc.source,
+                            candidate.name_node,
+                            server.offset_encoding,
+                        ));
                     }
                 },
             }
@@ -530,24 +589,22 @@ fn tsPointFromIndex(source: []const u8, index: usize) ts.Point {
     };
 }
 
-fn positionFromPoint(point: ts.Point) types.Position {
-    return .{
-        .line = point.row,
-        .character = point.column,
-    };
+fn rangeFromNode(source: []const u8, node: ts.Node, offset_encoding: lsp.offsets.Encoding) types.Range {
+    return lsp.offsets.locToRange(source, .{
+        .start = node.startByte(),
+        .end = node.endByte(),
+    }, offset_encoding);
 }
 
-fn rangeFromNode(node: ts.Node) types.Range {
-    return .{
-        .start = positionFromPoint(node.startPoint()),
-        .end = positionFromPoint(node.endPoint()),
-    };
-}
-
-fn locationFromNode(uri: []const u8, node: ts.Node) types.Location {
+fn locationFromNode(
+    uri: []const u8,
+    source: []const u8,
+    node: ts.Node,
+    offset_encoding: lsp.offsets.Encoding,
+) types.Location {
     return .{
         .uri = uri,
-        .range = rangeFromNode(node),
+        .range = rangeFromNode(source, node, offset_encoding),
     };
 }
 
@@ -609,12 +666,12 @@ fn byteIndexOfAfter(haystack: []const u8, start_index: usize, needle: []const u8
 
 fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOf(haystack, needle);
-    return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
+    return lsp.offsets.indexToPosition(haystack, index, test_offset_encoding);
 }
 
 fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
-    return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
+    return lsp.offsets.indexToPosition(haystack, index, test_offset_encoding);
 }
 
 //| Tests
@@ -625,7 +682,7 @@ pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
 }
 
 test "server capabilities match the implemented handlers" {
-    lsp.basic_server.validateServerCapabilities(Server, serverCapabilities());
+    lsp.basic_server.validateServerCapabilities(Server, serverCapabilities(.@"utf-16"));
 }
 
 test "embedded tags query compiles for the zitron grammar" {
@@ -860,6 +917,22 @@ test "named action definitions resolve in the same document" {
     try expect(missing_result == null);
 }
 
+test "initialize negotiates position encoding" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const result = server.initialize(testing_allocator, .{
+        .capabilities = .{
+            .general = .{
+                .positionEncodings = &.{ .@"utf-8", .@"utf-16" },
+            },
+        },
+    });
+
+    try expectEqual(lsp.offsets.Encoding.@"utf-8", server.offset_encoding);
+    try expectEqual(types.PositionEncodingKind.@"utf-8", result.capabilities.positionEncoding.?);
+}
+
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
 const lsp = @import("lsp");
@@ -868,4 +941,4 @@ const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
 const zitron_grammar = @import("tree_sitter_zitron");
-const offset_encoding: lsp.offsets.Encoding = .@"utf-8";
+const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";

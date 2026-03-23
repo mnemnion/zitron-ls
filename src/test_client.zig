@@ -52,7 +52,11 @@ pub fn main() Error!void {
         .{
             .processId = null,
             .clientInfo = .{ .name = "lsp_zitron_test_client" },
-            .capabilities = .{},
+            .capabilities = .{
+                .general = .{
+                    .positionEncodings = &.{ .@"utf-8", .@"utf-16" },
+                },
+            },
         },
         .{ .emit_null_optional_fields = false },
     );
@@ -218,6 +222,8 @@ fn expectInitializeResponse(
         .ignore_unknown_fields = true,
     });
     defer result.deinit();
+
+    try expectEqual(lsp.types.PositionEncodingKind.@"utf-8", result.value.capabilities.positionEncoding.?);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("{s} {s}\n", .{
