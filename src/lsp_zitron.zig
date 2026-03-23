@@ -1,16 +1,14 @@
-//! Shared language-server state and configuration.
-pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
-pub const Error = OOM || ts.Query.Error || error{
-    IncompatibleLanguage,
-    InvalidParams,
-    NeedleNotFound,
-    ParseFailed,
-};
+//! Zitron Language Server
+//!
+//! Implementation of a language server for Zitron, an LALR(1) parser
+//! generator based on a port of D. Richard Hipp's Lemon.
 
+/// The language-server name reported during LSP initialization.
 pub const server_name = "lsp_zitron";
-pub const server_version = "0.0.1";
 
-pub const ParseSummary = struct {
+const server_version = "0.0.1";
+
+const ParseSummary = struct {
     root_kind: []const u8,
     has_error: bool,
 };
@@ -49,25 +47,14 @@ const Resolution = union(enum) {
     symbol: SemanticSymbol,
 };
 
-pub fn fixturePath() []const u8 {
-    return build_options.fixture_path;
-}
-
-pub fn zitronLanguage() *const ts.Language {
+fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
 }
 
-pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
-    return std.fs.cwd().readFileAlloc(allocator, fixturePath(), 64 * 1024);
-}
+/// Errors that can occur while loading the configured fixture source.
+pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
 
-pub fn parseSource(source: []const u8) Error!ParseSummary {
-    const parsed = try parseDocument(source);
-    defer parsed.tree.destroy();
-    return parsed.summary;
-}
-
-fn parseDocument(source: []const u8) Error!ParsedDocument {
+fn parseDocument(source: []const u8) Server.Error!ParsedDocument {
     const parser = ts.Parser.create();
     defer parser.destroy();
 
@@ -84,7 +71,7 @@ fn parseDocument(source: []const u8) Error!ParsedDocument {
     };
 }
 
-pub fn serverCapabilities() types.ServerCapabilities {
+fn serverCapabilities() types.ServerCapabilities {
     return .{
         .textDocumentSync = .{
             .TextDocumentSyncOptions = .{
@@ -97,12 +84,21 @@ pub fn serverCapabilities() types.ServerCapabilities {
     };
 }
 
+/// LSP server state and handlers for Zitron grammars.
 pub const Server = struct {
+    /// Errors produced while parsing or updating server-managed documents.
+    pub const Error = OOM || ts.Query.Error || error{
+        IncompatibleLanguage,
+        InvalidParams,
+        ParseFailed,
+    };
+
     allocator: std.mem.Allocator,
     scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(DocumentState),
     tags_query: *ts.Query,
 
+    /// Creates a server instance and compiles the grammar tag query.
     pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
         var query_error_offset: u32 = 0;
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
@@ -116,6 +112,7 @@ pub const Server = struct {
         };
     }
 
+    /// Releases all document state and query resources owned by the server.
     pub fn deinit(server: *Server) void {
         var it = server.documents.iterator();
         while (it.next()) |entry| {
@@ -202,6 +199,7 @@ pub const Server = struct {
         return if (best) |symbol| .{ .symbol = symbol } else .no_match;
     }
 
+    /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         _: *Server,
         _: std.mem.Allocator,
@@ -216,8 +214,10 @@ pub const Server = struct {
         };
     }
 
+    /// LSP `initialized` handler required by `lsp-kit`.
     pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {}
 
+    /// LSP `textDocument/didOpen` handler that stores the full document text.
     pub fn @"textDocument/didOpen"(
         server: *Server,
         _: std.mem.Allocator,
@@ -231,6 +231,7 @@ pub const Server = struct {
         );
     }
 
+    /// LSP `textDocument/didChange` handler that replaces stored document contents.
     pub fn @"textDocument/didChange"(
         server: *Server,
         _: std.mem.Allocator,
@@ -249,6 +250,7 @@ pub const Server = struct {
         try server.putDocument(params.textDocument.uri, params.textDocument.version, text);
     }
 
+    /// LSP `textDocument/didClose` handler that drops cached document state.
     pub fn @"textDocument/didClose"(
         server: *Server,
         _: std.mem.Allocator,
@@ -258,6 +260,7 @@ pub const Server = struct {
         server.removeDocument(params.textDocument.uri);
     }
 
+    /// LSP `textDocument/hover` handler for Zitron grammar symbols.
     pub fn @"textDocument/hover"(
         server: *Server,
         _: std.mem.Allocator,
@@ -282,6 +285,7 @@ pub const Server = struct {
         };
     }
 
+    /// LSP `textDocument/definition` handler for grammar symbol lookups.
     pub fn @"textDocument/definition"(
         server: *Server,
         _: std.mem.Allocator,
@@ -314,12 +318,15 @@ pub const Server = struct {
         };
     }
 
+    /// LSP `shutdown` handler required by `lsp-kit`.
     pub fn shutdown(_: *Server, _: std.mem.Allocator, _: void) ?void {
         return null;
     }
 
+    /// LSP `exit` handler required by `lsp-kit`.
     pub fn exit(_: *Server, _: std.mem.Allocator, _: void) void {}
 
+    /// LSP response hook; ignored because this server does not initiate requests yet.
     pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
 
     fn findRuleDefinition(server: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
@@ -483,6 +490,19 @@ fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) OOM!
     };
 }
 
+// Tests
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const testing_allocator = std.testing.allocator;
+
+fn parseSource(source: []const u8) Server.Error!ParseSummary {
+    const parsed = try parseDocument(source);
+    defer parsed.tree.destroy();
+    return parsed.summary;
+}
+
 fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {
     return std.mem.indexOf(u8, haystack, needle) orelse error.NeedleNotFound;
 }
@@ -500,6 +520,13 @@ fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound
 fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
+}
+
+//| Tests
+
+/// Loads the configured fixture source into memory for smoke tests and helpers.
+pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
+    return std.fs.cwd().readFileAlloc(allocator, build_options.fixture_path, 64 * 1024);
 }
 
 test "server capabilities match the implemented handlers" {
@@ -654,12 +681,10 @@ test "hover and definition operate on stored live document state" {
 
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
+/// Re-exported `lsp-kit` API used by companion executables in this package.
 pub const lsp = @import("lsp");
+/// Re-exported LSP protocol types used by companion executables in this package.
 pub const types = lsp.types;
-const expect = std.testing.expect;
-const expectEqual = std.testing.expectEqual;
-const expectEqualStrings = std.testing.expectEqualStrings;
-const testing_allocator = std.testing.allocator;
 const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");

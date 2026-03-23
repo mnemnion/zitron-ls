@@ -31,7 +31,7 @@ test "exe mentioned" {
 }
 
 const std = @import("std");
-const Error = zitron.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
+const Error = zitron.Server.Error || zitron.lsp.Transport.ReadError || zitron.lsp.Transport.WriteError;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
 const zitron = @import("lsp_zitron");
