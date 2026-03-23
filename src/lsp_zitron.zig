@@ -81,6 +81,7 @@ fn serverCapabilities() types.ServerCapabilities {
         },
         .hoverProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
+        .referencesProvider = .{ .bool = true },
     };
 }
 
@@ -318,6 +319,27 @@ pub const Server = struct {
         };
     }
 
+    /// LSP `textDocument/references` handler for same-document grammar symbol lookups.
+    pub fn @"textDocument/references"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.ReferenceParams,
+    ) OOM!lsp.ResultType("textDocument/references") {
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+
+        return switch (server.resolveAtPosition(doc, params.position)) {
+            .no_match => null,
+            .unsupported_zig_code => null,
+            .symbol => |symbol| try server.findReferences(
+                arena,
+                doc,
+                params.textDocument.uri,
+                symbol,
+                params.context.includeDeclaration,
+            ),
+        };
+    }
+
     /// LSP `shutdown` handler required by `lsp-kit`.
     pub fn shutdown(_: *Server, _: std.mem.Allocator, _: void) ?void {
         return null;
@@ -341,6 +363,53 @@ pub const Server = struct {
         }
 
         return null;
+    }
+
+    fn findReferences(
+        server: *Server,
+        arena: std.mem.Allocator,
+        doc: *const DocumentState,
+        uri: []const u8,
+        symbol: SemanticSymbol,
+        include_declaration: bool,
+    ) OOM!lsp.ResultType("textDocument/references") {
+        const Kinds = struct {
+            definition: SemanticKind,
+            reference: SemanticKind,
+        };
+
+        const kinds = switch (symbol.kind) {
+            .rule_definition, .rule_reference => Kinds{
+                .definition = SemanticKind.rule_definition,
+                .reference = SemanticKind.rule_reference,
+            },
+            .action_definition, .action_implementation => Kinds{
+                .definition = SemanticKind.action_definition,
+                .reference = SemanticKind.action_implementation,
+            },
+        };
+
+        var references: std.ArrayList(types.Location) = .empty;
+
+        const cursor = ts.QueryCursor.create();
+        defer cursor.destroy();
+        cursor.exec(server.tags_query, doc.tree.rootNode());
+
+        while (cursor.nextMatch()) |match| {
+            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
+            if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
+
+            if (candidate.kind == kinds.reference) {
+                try references.append(arena, locationFromNode(uri, candidate.name_node));
+                continue;
+            }
+
+            if (include_declaration and candidate.kind == kinds.definition) {
+                try references.append(arena, locationFromNode(uri, candidate.name_node));
+            }
+        }
+
+        return if (references.items.len == 0) null else try references.toOwnedSlice(arena);
     }
 };
 
@@ -463,6 +532,15 @@ fn locationFromNode(uri: []const u8, node: ts.Node) types.Location {
         .uri = uri,
         .range = rangeFromNode(node),
     };
+}
+
+fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: types.Position) bool {
+    for (locations) |location| {
+        if (!std.mem.eql(u8, location.uri, uri)) continue;
+        if (std.meta.eql(location.range.start, position)) return true;
+    }
+
+    return false;
 }
 
 fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) OOM![]const u8 {
@@ -632,7 +710,7 @@ test "query resolution returns unsupported inside zig code" {
     try expectEqual(Resolution.unsupported_zig_code, resolution);
 }
 
-test "hover and definition operate on stored live document state" {
+test "hover definition and references operate on stored live document state" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
@@ -677,6 +755,32 @@ test "hover and definition operate on stored live document state" {
         },
         else => return error.UnexpectedDefinitionTarget,
     }
+
+    const references = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
+        .context = .{ .includeDeclaration = false },
+    })) orelse return error.UnexpectedDefinitionTarget;
+    try expectEqual(@as(usize, 3), references.len);
+    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
+
+    const first_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) PLUS|FOO(O) term(C).");
+    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index + 1, "expr")));
+
+    const second_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) MINUS term(C).");
+    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, second_expr_rhs_rule_index + 1, "expr")));
+
+    const references_with_declaration = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
+        .context = .{ .includeDeclaration = true },
+    })) orelse return error.UnexpectedDefinitionTarget;
+    try expectEqual(@as(usize, 6), references_with_declaration.len);
+    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
+    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
+
+    const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
+    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
 }
 
 const std = @import("std");

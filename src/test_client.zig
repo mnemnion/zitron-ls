@@ -138,6 +138,20 @@ pub fn main() Error!void {
     );
     try expectNullResponse(allocator, &transport.transport, 5);
 
+    try transport.transport.writeRequest(
+        allocator,
+        .{ .number = 6 },
+        "textDocument/references",
+        lsp.ParamsType("textDocument/references"),
+        .{
+            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .position = try positionOfTextAfter(fixture_text, calc_rule_index + 1, "expr"),
+            .context = .{ .includeDeclaration = false },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectReferencesResponse(allocator, &transport.transport);
+
     try transport.transport.writeNotification(
         allocator,
         "textDocument/didClose",
@@ -326,6 +340,46 @@ fn expectNullResponse(
             }
         },
         else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn expectReferencesResponse(
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+) Error!void {
+    const json_message = try transport.readJsonMessage(allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const references_value = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = 6 })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const references = try std.json.parseFromValue(
+        lsp.ResultType("textDocument/references"),
+        allocator,
+        references_value,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer references.deinit();
+
+    const resolved = references.value orelse return error_set.UnexpectedResponse;
+    try expectEqual(@as(usize, 3), resolved.len);
+    for (resolved) |location| {
+        try expectEqualStrings("file:///samples/calc.zy", location.uri);
     }
 }
 
