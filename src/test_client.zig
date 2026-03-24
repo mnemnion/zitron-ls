@@ -164,6 +164,20 @@ pub fn main() Error!void {
     );
     try expectReferencesResponse(allocator, &transport.transport);
 
+    const token_type_anchor = try byteIndexOf(fixture_text, "%token_type");
+    try transport.transport.writeRequest(
+        allocator,
+        .{ .number = 7 },
+        "textDocument/completion",
+        lsp.ParamsType("textDocument/completion"),
+        .{
+            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .position = lsp.offsets.indexToPosition(fixture_text, token_type_anchor + 2, offset_encoding),
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectCompletionResponse(allocator, &transport.transport);
+
     try transport.transport.writeNotification(
         allocator,
         "textDocument/didClose",
@@ -397,6 +411,51 @@ fn expectReferencesResponse(
     }
 }
 
+fn expectCompletionResponse(
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+) Error!void {
+    const json_message = try transport.readJsonMessage(allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const completion_value = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = 7 })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const completion = try std.json.parseFromValue(
+        lsp.ResultType("textDocument/completion"),
+        allocator,
+        completion_value,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer completion.deinit();
+
+    const resolved = completion.value orelse return error_set.UnexpectedResponse;
+    const items = switch (resolved) {
+        .array_of_CompletionItem => |items| items,
+        .CompletionList => |list| list.items,
+    };
+
+    try expect(items.len >= 2);
+    try expect(hasCompletionLabel(items, "%token_type"));
+    try expect(hasCompletionLabel(items, "%type"));
+    try expect(!hasCompletionLabel(items, "%ifdef"));
+}
+
 fn expectShutdownResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
@@ -436,6 +495,13 @@ fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound
 fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!lsp.types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, offset_encoding);
+}
+
+fn hasCompletionLabel(items: []const lsp.types.CompletionItem, label: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, label)) return true;
+    }
+    return false;
 }
 
 const std = @import("std");
