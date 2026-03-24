@@ -8,72 +8,12 @@ pub const server_name = "lsp_zitron";
 
 const server_version = "0.0.1";
 
-const ParseSummary = struct {
-    root_kind: []const u8,
-    has_error: bool,
-};
-
-const DocumentState = struct {
-    source: []u8,
-    version: i32,
-    parsed: ParseSummary,
-    tree: *ts.Tree,
-};
-
-const ParsedDocument = struct {
-    summary: ParseSummary,
-    tree: *ts.Tree,
-};
-
-const SemanticKind = enum {
-    rule_definition,
-    rule_reference,
-    action_definition,
-    action_implementation,
-};
-
-const SemanticSymbol = struct {
-    kind: SemanticKind,
-    capture_name: []const u8,
-    symbol_name: []const u8,
-    name_node: ts.Node,
-    semantic_node: ts.Node,
-    enclosing_kind: []const u8,
-};
-
-const Resolution = union(enum) {
-    no_match,
-    unsupported_zig_code,
-    symbol: SemanticSymbol,
-};
-
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
 }
 
 /// Errors that can occur while loading the configured fixture source.
 pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
-
-fn parseDocument(source: []const u8) Server.Error!ParsedDocument {
-    return parseDocumentIncremental(source, null);
-}
-
-fn parseDocumentIncremental(source: []const u8, old_tree: ?*const ts.Tree) Server.Error!ParsedDocument {
-    const parser = ts.Parser.create();
-    defer parser.destroy();
-
-    try parser.setLanguage(zitronLanguage());
-
-    const tree = parser.parseString(source, old_tree) orelse return error.ParseFailed;
-    const root = tree.rootNode();
-    return .{
-        .summary = .{
-            .root_kind = root.kind(),
-            .has_error = root.hasError(),
-        },
-        .tree = tree,
-    };
-}
 
 fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKind {
     return switch (encoding) {
@@ -104,15 +44,11 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
 /// LSP server state and handlers for Zitron grammars.
 pub const Server = struct {
     /// Errors produced while parsing or updating server-managed documents.
-    pub const Error = OOM || ts.Query.Error || error{
-        IncompatibleLanguage,
-        InvalidParams,
-        ParseFailed,
-    };
+    pub const Error = Document.Error;
 
     allocator: std.mem.Allocator,
     scratch_arena: std.heap.ArenaAllocator,
-    documents: std.StringHashMapUnmanaged(DocumentState),
+    documents: std.StringHashMapUnmanaged(Document),
     tags_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
 
@@ -136,8 +72,7 @@ pub const Server = struct {
         var it = server.documents.iterator();
         while (it.next()) |entry| {
             server.allocator.free(entry.key_ptr.*);
-            server.allocator.free(entry.value_ptr.source);
-            entry.value_ptr.tree.destroy();
+            entry.value_ptr.deinit(server.allocator);
         }
         server.documents.deinit(server.allocator);
         server.scratch_arena.deinit();
@@ -150,109 +85,29 @@ pub const Server = struct {
     }
 
     fn putDocument(server: *Server, uri: []const u8, version: i32, text: []const u8) Error!void {
-        const parsed = try parseDocument(text);
-        const text_copy = try server.allocator.dupe(u8, text);
-        errdefer server.allocator.free(text_copy);
+        var document = try Document.init(server.allocator, version, text);
+        errdefer document.deinit(server.allocator);
 
         const gop = try server.documents.getOrPut(server.allocator, uri);
         if (gop.found_existing) {
-            server.allocator.free(gop.value_ptr.source);
-            gop.value_ptr.tree.destroy();
-            gop.value_ptr.* = .{
-                .source = text_copy,
-                .version = version,
-                .parsed = parsed.summary,
-                .tree = parsed.tree,
-            };
+            gop.value_ptr.deinit(server.allocator);
+            gop.value_ptr.* = document;
         } else {
             errdefer server.documents.removeByPtr(gop.key_ptr);
             gop.key_ptr.* = try server.allocator.dupe(u8, uri);
-            gop.value_ptr.* = .{
-                .source = text_copy,
-                .version = version,
-                .parsed = parsed.summary,
-                .tree = parsed.tree,
-            };
+            gop.value_ptr.* = document;
         }
     }
 
     fn removeDocument(server: *Server, uri: []const u8) void {
         const removed = server.documents.fetchRemove(uri) orelse return;
         server.allocator.free(removed.key);
-        server.allocator.free(removed.value.source);
-        removed.value.tree.destroy();
+        var document = removed.value;
+        document.deinit(server.allocator);
     }
 
-    fn getDocument(server: *Server, uri: []const u8) ?*DocumentState {
+    fn getDocument(server: *Server, uri: []const u8) ?*Document {
         return server.documents.getPtr(uri);
-    }
-
-    fn updateDocumentIncremental(
-        server: *Server,
-        doc: *DocumentState,
-        version: i32,
-        content_changes: []const types.TextDocumentContentChangeEvent,
-    ) Error!void {
-        var applied_change = try diff.applyContentChangesWithEdits(
-            server.allocator,
-            doc.source,
-            content_changes,
-            server.offset_encoding,
-        );
-        defer applied_change.deinit(server.allocator);
-
-        const edited_old_tree = doc.tree.dupe();
-        defer edited_old_tree.destroy();
-        for (applied_change.input_edits.items) |input_edit| {
-            edited_old_tree.edit(input_edit);
-        }
-
-        const parsed = try parseDocumentIncremental(applied_change.text, edited_old_tree);
-        errdefer parsed.tree.destroy();
-
-        const text_copy = try server.allocator.dupe(u8, applied_change.text);
-        errdefer server.allocator.free(text_copy);
-
-        server.allocator.free(doc.source);
-        doc.tree.destroy();
-        doc.* = .{
-            .source = text_copy,
-            .version = version,
-            .parsed = parsed.summary,
-            .tree = parsed.tree,
-        };
-    }
-
-    fn resolveAtPosition(
-        server: *Server,
-        doc: *const DocumentState,
-        position: types.Position,
-    ) Resolution {
-        const source_index = lsp.offsets.positionToIndex(doc.source, position, server.offset_encoding);
-        const point = tsPointFromIndex(doc.source, source_index);
-        const root = doc.tree.rootNode();
-        const raw_node = root.descendantForPointRange(point, point) orelse return .no_match;
-        if (containsUnsupportedCode(raw_node)) {
-            return .unsupported_zig_code;
-        }
-        const node = root.namedDescendantForPointRange(point, point) orelse return .no_match;
-        if (containsUnsupportedCode(node)) {
-            return .unsupported_zig_code;
-        }
-
-        const cursor = ts.QueryCursor.create();
-        defer cursor.destroy();
-        cursor.exec(server.tags_query, root);
-
-        var best: ?SemanticSymbol = null;
-        while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, source_index, match) orelse continue;
-            if (best == null or isBetterMatch(candidate, best.?, source_index)) {
-                best = candidate;
-            }
-        }
-
-        return if (best) |symbol| .{ .symbol = symbol } else .no_match;
     }
 
     /// LSP `initialize` handler required by `lsp-kit`.
@@ -291,7 +146,6 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidOpenTextDocumentParams,
     ) Error!void {
-        _ = server.scratchAllocator();
         try server.putDocument(
             params.textDocument.uri,
             params.textDocument.version,
@@ -305,9 +159,13 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidChangeTextDocumentParams,
     ) Error!void {
-        _ = server.scratchAllocator();
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
-        try server.updateDocumentIncremental(doc, params.textDocument.version, params.contentChanges);
+        try doc.updateIncremental(
+            server.allocator,
+            params.textDocument.version,
+            params.contentChanges,
+            server.offset_encoding,
+        );
     }
 
     /// LSP `textDocument/didClose` handler that drops cached document state.
@@ -316,7 +174,6 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidCloseTextDocumentParams,
     ) void {
-        _ = server.scratchAllocator();
         server.removeDocument(params.textDocument.uri);
     }
 
@@ -346,7 +203,7 @@ pub const Server = struct {
         const scratch = server.scratchAllocator();
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
-        const value = switch (server.resolveAtPosition(doc, params.position)) {
+        const value = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => return null,
             .unsupported_zig_code => return null,
             .symbol => |symbol| try hoverMarkdownForSymbol(scratch, symbol),
@@ -371,27 +228,25 @@ pub const Server = struct {
         _ = server.scratchAllocator();
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
-        return switch (server.resolveAtPosition(doc, params.position)) {
+        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => null,
             .symbol => |symbol| switch (symbol.kind) {
                 .rule_definition => .{
                     .Definition = .{
-                        .Location = locationFromNode(
+                        .Location = doc.locationForNode(
                             params.textDocument.uri,
-                            doc.source,
                             symbol.name_node,
                             server.offset_encoding,
                         ),
                     },
                 },
                 .rule_reference => blk: {
-                    const definition = server.findRuleDefinition(doc, symbol.symbol_name) orelse break :blk null;
+                    const definition = doc.findRuleDefinition(server.tags_query, symbol.symbol_name) orelse break :blk null;
                     break :blk .{
                         .Definition = .{
-                            .Location = locationFromNode(
+                            .Location = doc.locationForNode(
                                 params.textDocument.uri,
-                                doc.source,
                                 definition.name_node,
                                 server.offset_encoding,
                             ),
@@ -400,21 +255,19 @@ pub const Server = struct {
                 },
                 .action_definition => .{
                     .Definition = .{
-                        .Location = locationFromNode(
+                        .Location = doc.locationForNode(
                             params.textDocument.uri,
-                            doc.source,
                             symbol.name_node,
                             server.offset_encoding,
                         ),
                     },
                 },
                 .action_implementation => blk: {
-                    const definition = server.findActionDefinition(doc, symbol.symbol_name) orelse break :blk null;
+                    const definition = doc.findActionDefinition(server.tags_query, symbol.symbol_name) orelse break :blk null;
                     break :blk .{
                         .Definition = .{
-                            .Location = locationFromNode(
+                            .Location = doc.locationForNode(
                                 params.textDocument.uri,
-                                doc.source,
                                 definition.name_node,
                                 server.offset_encoding,
                             ),
@@ -433,15 +286,16 @@ pub const Server = struct {
     ) OOM!lsp.ResultType("textDocument/references") {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
-        return switch (server.resolveAtPosition(doc, params.position)) {
+        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => null,
-            .symbol => |symbol| try server.findReferences(
+            .symbol => |symbol| try doc.findReferences(
+                server.tags_query,
                 arena,
-                doc,
                 params.textDocument.uri,
                 symbol,
                 params.context.includeDeclaration,
+                server.offset_encoding,
             ),
         };
     }
@@ -456,209 +310,7 @@ pub const Server = struct {
 
     /// LSP response hook; ignored because this server does not initiate requests yet.
     pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
-
-    fn findRuleDefinition(server: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
-        const cursor = ts.QueryCursor.create();
-        defer cursor.destroy();
-        cursor.exec(server.tags_query, doc.tree.rootNode());
-
-        while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
-            if (candidate.kind != .rule_definition) continue;
-            if (std.mem.eql(u8, candidate.symbol_name, symbol_name)) return candidate;
-        }
-
-        return null;
-    }
-
-    fn findActionDefinition(server: *Server, doc: *const DocumentState, symbol_name: []const u8) ?SemanticSymbol {
-        const cursor = ts.QueryCursor.create();
-        defer cursor.destroy();
-        cursor.exec(server.tags_query, doc.tree.rootNode());
-
-        while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
-            if (candidate.kind != .action_definition) continue;
-            if (std.mem.eql(u8, candidate.symbol_name, symbol_name)) return candidate;
-        }
-
-        return null;
-    }
-
-    fn findReferences(
-        server: *Server,
-        arena: std.mem.Allocator,
-        doc: *const DocumentState,
-        uri: []const u8,
-        symbol: SemanticSymbol,
-        include_declaration: bool,
-    ) OOM!lsp.ResultType("textDocument/references") {
-        var references: std.ArrayList(types.Location) = .empty;
-
-        const cursor = ts.QueryCursor.create();
-        defer cursor.destroy();
-        cursor.exec(server.tags_query, doc.tree.rootNode());
-
-        while (cursor.nextMatch()) |match| {
-            const candidate = semanticSymbolForMatch(server.tags_query, doc.source, null, match) orelse continue;
-            if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
-
-            switch (symbol.kind) {
-                .rule_definition, .rule_reference => {
-                    if (candidate.kind == .rule_reference) {
-                        try references.append(arena, locationFromNode(
-                            uri,
-                            doc.source,
-                            candidate.name_node,
-                            server.offset_encoding,
-                        ));
-                        continue;
-                    }
-
-                    if (include_declaration and candidate.kind == .rule_definition) {
-                        try references.append(arena, locationFromNode(
-                            uri,
-                            doc.source,
-                            candidate.name_node,
-                            server.offset_encoding,
-                        ));
-                    }
-                },
-                .action_definition, .action_implementation => {
-                    if (candidate.kind == .action_definition or candidate.kind == .action_implementation) {
-                        try references.append(arena, locationFromNode(
-                            uri,
-                            doc.source,
-                            candidate.name_node,
-                            server.offset_encoding,
-                        ));
-                    }
-                },
-            }
-        }
-
-        return if (references.items.len == 0) null else try references.toOwnedSlice(arena);
-    }
 };
-
-fn semanticSymbolForMatch(
-    query: *const ts.Query,
-    source: []const u8,
-    source_index: ?usize,
-    match: ts.Query.Match,
-) ?SemanticSymbol {
-    var semantic_capture_name: ?[]const u8 = null;
-    var semantic_node: ?ts.Node = null;
-    var name_node: ?ts.Node = null;
-
-    for (match.captures) |capture| {
-        const capture_name = query.captureNameForId(capture.index) orelse continue;
-        if (std.mem.eql(u8, capture_name, "name")) {
-            name_node = capture.node;
-            continue;
-        }
-
-        if (semanticKindForCaptureName(capture_name)) |_| {
-            semantic_capture_name = capture_name;
-            semantic_node = capture.node;
-        }
-    }
-
-    const resolved_name_node = name_node orelse return null;
-    const resolved_semantic_name = semantic_capture_name orelse return null;
-    const resolved_semantic_node = semantic_node orelse return null;
-
-    if (source_index) |index| {
-        if (!nodeContainsIndex(resolved_name_node, index) and !nodeContainsIndex(resolved_semantic_node, index)) {
-            return null;
-        }
-    }
-
-    return .{
-        .kind = semanticKindForCaptureName(resolved_semantic_name).?,
-        .capture_name = resolved_semantic_name,
-        .symbol_name = normalizeSymbolName(sliceForNode(source, resolved_name_node)),
-        .name_node = resolved_name_node,
-        .semantic_node = resolved_semantic_node,
-        .enclosing_kind = resolved_semantic_node.kind(),
-    };
-}
-
-fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
-    if (std.mem.eql(u8, capture_name, "definition.class")) return .rule_definition;
-    if (std.mem.eql(u8, capture_name, "reference.class")) return .rule_reference;
-    if (std.mem.eql(u8, capture_name, "definition.interface")) return .action_definition;
-    if (std.mem.eql(u8, capture_name, "reference.implementation")) return .action_implementation;
-    return null;
-}
-
-fn nodeContainsIndex(node: ts.Node, index: usize) bool {
-    const start: usize = node.startByte();
-    const end: usize = node.endByte();
-    return start <= index and index < end;
-}
-
-fn isBetterMatch(candidate: SemanticSymbol, current: SemanticSymbol, source_index: usize) bool {
-    const candidate_hits_name = nodeContainsIndex(candidate.name_node, source_index);
-    const current_hits_name = nodeContainsIndex(current.name_node, source_index);
-    if (candidate_hits_name != current_hits_name) return candidate_hits_name;
-
-    const candidate_len = candidate.name_node.endByte() - candidate.name_node.startByte();
-    const current_len = current.name_node.endByte() - current.name_node.startByte();
-    if (candidate_len != current_len) return candidate_len < current_len;
-
-    const candidate_span = candidate.semantic_node.endByte() - candidate.semantic_node.startByte();
-    const current_span = current.semantic_node.endByte() - current.semantic_node.startByte();
-    return candidate_span < current_span;
-}
-
-fn containsUnsupportedCode(node: ts.Node) bool {
-    var cursor = node;
-    while (true) {
-        const kind = cursor.kind();
-        if (std.mem.eql(u8, kind, "zig_code") or std.mem.eql(u8, kind, "code_block")) {
-            // TODO: Once Zitron-to-Zig source maps exist, hand these spans off to Zig/ZLS.
-            return true;
-        }
-        cursor = cursor.parent() orelse return false;
-    }
-}
-
-fn sliceForNode(source: []const u8, node: ts.Node) []const u8 {
-    return source[node.startByte()..node.endByte()];
-}
-
-fn normalizeSymbolName(symbol_name: []const u8) []const u8 {
-    const open_paren = std.mem.indexOfScalar(u8, symbol_name, '(') orelse return symbol_name;
-    return std.mem.trimRight(u8, symbol_name[0..open_paren], " \t");
-}
-
-fn tsPointFromIndex(source: []const u8, index: usize) ts.Point {
-    const position = lsp.offsets.indexToPosition(source, index, .@"utf-8");
-    return .{
-        .row = position.line,
-        .column = position.character,
-    };
-}
-
-fn rangeFromNode(source: []const u8, node: ts.Node, offset_encoding: lsp.offsets.Encoding) types.Range {
-    return lsp.offsets.locToRange(source, .{
-        .start = node.startByte(),
-        .end = node.endByte(),
-    }, offset_encoding);
-}
-
-fn locationFromNode(
-    uri: []const u8,
-    source: []const u8,
-    node: ts.Node,
-    offset_encoding: lsp.offsets.Encoding,
-) types.Location {
-    return .{
-        .uri = uri,
-        .range = rangeFromNode(source, node, offset_encoding),
-    };
-}
 
 fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: types.Position) bool {
     for (locations) |location| {
@@ -669,7 +321,7 @@ fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: t
     return false;
 }
 
-fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) OOM![]const u8 {
+fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
     return switch (symbol.kind) {
         .rule_definition => std.fmt.allocPrint(
             arena,
@@ -694,17 +346,17 @@ fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: SemanticSymbol) OOM!
     };
 }
 
-// Tests
+//| Tests
 
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
 
-fn parseSource(source: []const u8) Server.Error!ParseSummary {
-    const parsed = try parseDocument(source);
-    defer parsed.tree.destroy();
-    return parsed.summary;
+fn parseSource(source: []const u8) Server.Error!Document.ParseSummary {
+    var document = try Document.init(testing_allocator, 1, source);
+    defer document.deinit(testing_allocator);
+    return document.parsed;
 }
 
 fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {
@@ -725,8 +377,6 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, test_offset_encoding);
 }
-
-//| Tests
 
 /// Loads the configured fixture source into memory for smoke tests and helpers.
 pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
@@ -859,23 +509,13 @@ test "server returns directive completions from stored live document state" {
 }
 
 test "incremental tree-sitter reparse matches fresh parse" {
-    var server = try Server.init(testing_allocator);
-    defer server.deinit();
-
     const sample = try loadFixtureAlloc(testing_allocator);
     defer testing_allocator.free(sample);
 
-    try server.@"textDocument/didOpen"(testing_allocator, .{
-        .textDocument = .{
-            .uri = "file:///samples/calc.zy",
-            .languageId = "zitron",
-            .version = 1,
-            .text = sample,
-        },
-    });
+    var incremental = try Document.init(testing_allocator, 1, sample);
+    defer incremental.deinit(testing_allocator);
 
-    const doc = server.getDocument("file:///samples/calc.zy").?;
-    var applied_change = try diff.applyContentChangesWithEdits(testing_allocator, sample, &.{
+    try incremental.updateIncremental(testing_allocator, 2, &.{
         .{ .literal_0 = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
@@ -885,21 +525,12 @@ test "incremental tree-sitter reparse matches fresh parse" {
             .text = "start",
         } },
     }, .@"utf-8");
-    defer applied_change.deinit(testing_allocator);
 
-    const edited_old_tree = doc.tree.dupe();
-    defer edited_old_tree.destroy();
-    for (applied_change.input_edits.items) |input_edit| {
-        edited_old_tree.edit(input_edit);
-    }
+    var fresh = try Document.init(testing_allocator, 2, incremental.source);
+    defer fresh.deinit(testing_allocator);
 
-    const incremental = try parseDocumentIncremental(applied_change.text, edited_old_tree);
-    defer incremental.tree.destroy();
-    const fresh = try parseDocument(applied_change.text);
-    defer fresh.tree.destroy();
-
-    try expectEqualStrings(fresh.summary.root_kind, incremental.summary.root_kind);
-    try expectEqual(fresh.summary.has_error, incremental.summary.has_error);
+    try expectEqualStrings(fresh.parsed.root_kind, incremental.parsed.root_kind);
+    try expectEqual(fresh.parsed.has_error, incremental.parsed.has_error);
 }
 
 test "query resolution finds rule definitions and references in calc" {
@@ -912,20 +543,20 @@ test "query resolution finds rule definitions and references in calc" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const calc_resolution = server.resolveAtPosition(doc, try positionOfText(sample, "calc ::= expr"));
+    const calc_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfText(sample, "calc ::= expr"));
     switch (calc_resolution) {
         .symbol => |symbol| {
-            try expectEqual(SemanticKind.rule_definition, symbol.kind);
+            try expectEqual(Document.SemanticKind.rule_definition, symbol.kind);
             try expectEqualStrings("calc", symbol.symbol_name);
         },
         else => return error.UnexpectedResolution,
     }
 
     const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
-    const expr_reference_resolution = server.resolveAtPosition(doc, try positionOfTextAfter(sample, calc_rule_index + 1, "expr"));
+    const expr_reference_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfTextAfter(sample, calc_rule_index + 1, "expr"));
     switch (expr_reference_resolution) {
         .symbol => |symbol| {
-            try expectEqual(SemanticKind.rule_reference, symbol.kind);
+            try expectEqual(Document.SemanticKind.rule_reference, symbol.kind);
             try expectEqualStrings("expr", symbol.symbol_name);
         },
         else => return error.UnexpectedResolution,
@@ -942,8 +573,8 @@ test "query resolution returns no match on punctuation" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "%token_type"));
-    try expectEqual(Resolution.no_match, resolution);
+    const resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfText(sample, "%token_type"));
+    try expectEqual(Document.Resolution.no_match, resolution);
 }
 
 test "query resolution returns unsupported inside zig code" {
@@ -956,8 +587,8 @@ test "query resolution returns unsupported inside zig code" {
     try server.putDocument("file:///samples/calc.zy", 1, sample);
     const doc = server.getDocument("file:///samples/calc.zy").?;
 
-    const resolution = server.resolveAtPosition(doc, try positionOfText(sample, "answer = A"));
-    try expectEqual(Resolution.unsupported_zig_code, resolution);
+    const resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfText(sample, "answer = A"));
+    try expectEqual(Document.Resolution.unsupported_zig_code, resolution);
 }
 
 test "hover definition and references operate on stored live document state" {
@@ -1011,7 +642,7 @@ test "hover definition and references operate on stored live document state" {
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = false },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 3), references.len);
+    try expectEqual(@as(usize, 4), references.len);
     try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
 
     const first_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) PLUS|FOO(O) term(C).");
@@ -1020,12 +651,15 @@ test "hover definition and references operate on stored live document state" {
     const second_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) MINUS term(C).");
     try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, second_expr_rhs_rule_index + 1, "expr")));
 
+    const factor_rule_index = try byteIndexOf(sample, "factor(A) ::= LPAREN expr(E) RPAREN.");
+    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, factor_rule_index + 1, "expr")));
+
     const references_with_declaration = (try server.@"textDocument/references"(arena_state.allocator(), .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = true },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 6), references_with_declaration.len);
+    try expectEqual(@as(usize, 7), references_with_declaration.len);
     try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
     try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
 
@@ -1093,6 +727,45 @@ test "named action definitions resolve in the same document" {
     try expect(missing_result == null);
 }
 
+test "definition on discard resolves that rule instead of a neighbor" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample =
+        \\pair(P) ::= m_form(K) discard m_form(V).  @on_pair2(P; K, V)
+        \\m_form(A) ::= FORM(A).
+        \\discard ::= .
+    ;
+
+    try server.putDocument("file:///samples/discard.zy", 1, sample);
+
+    const definition_anchor = try byteIndexOf(sample, "\ndiscard");
+    const definition_target = try positionOfTextAfter(sample, definition_anchor + 1, "discard");
+    const reference_anchor = try byteIndexOf(sample, "m_form(K) discard");
+    const reference_position = try positionOfTextAfter(sample, reference_anchor + 1, "discard");
+
+    const doc = server.getDocument("file:///samples/discard.zy").?;
+    switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, reference_position)) {
+        .symbol => |symbol| try expectEqualStrings("discard", symbol.symbol_name),
+        else => return error.UnexpectedResolution,
+    }
+
+    const definition = (server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/discard.zy" },
+        .position = reference_position,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (definition) {
+        .Definition => |target| switch (target) {
+            .Location => |location| {
+                try expectEqualStrings("file:///samples/discard.zy", location.uri);
+                try expectEqual(definition_target, location.range.start);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+}
+
 test "initialize negotiates position encoding" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1111,8 +784,8 @@ test "initialize negotiates position encoding" {
 
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
+const Document = @import("Document.zig");
 const completion = @import("completion.zig");
-const diff = @import("diff.zig");
 const lsp = @import("lsp");
 const types = lsp.types;
 const build_options = @import("build_options");
