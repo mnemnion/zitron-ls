@@ -28,6 +28,7 @@ pub fn main() Error!void {
     const server_path = if (args.len > 1) args[1] else "zig-out/bin/lsp_zitron";
     const fixture_text = try zitron.loadFixtureAlloc(allocator);
     defer allocator.free(fixture_text);
+    const fixture_end_position = lsp.offsets.indexToPosition(fixture_text, fixture_text.len, offset_encoding);
 
     var child = std.process.Child.init(&.{server_path}, allocator);
     child.stdin_behavior = .Pipe;
@@ -95,7 +96,14 @@ pub fn main() Error!void {
                 .version = 2,
             },
             .contentChanges = &.{
-                .{ .literal_1 = .{ .text = fixture_text } },
+                .{ .literal_0 = .{
+                    .range = .{
+                        .start = fixture_end_position,
+                        .end = fixture_end_position,
+                    },
+                    .rangeLength = 0,
+                    .text = "\n",
+                } },
             },
         },
         .{ .emit_null_optional_fields = false },

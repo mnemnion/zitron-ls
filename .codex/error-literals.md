@@ -32,3 +32,10 @@
 - `byteIndexOfAfter -> error{NeedleNotFound}`
 - `positionOfText -> error{NeedleNotFound}`
 - `positionOfTextAfter -> error{NeedleNotFound}`
+
+## src/diff.zig
+
+- `edits -> OOM`
+- `applyContentChanges -> OOM`
+- `applyContentChangesWithEdits -> OOM`
+- `applyTextEdits -> OOM`
