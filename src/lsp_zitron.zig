@@ -92,6 +92,9 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
                 .change = .Incremental,
             },
         },
+        .completionProvider = .{
+            .triggerCharacters = &.{"%"},
+        },
         .hoverProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
@@ -315,6 +318,23 @@ pub const Server = struct {
     ) void {
         _ = server.scratchAllocator();
         server.removeDocument(params.textDocument.uri);
+    }
+
+    /// LSP `textDocument/completion` handler for directive completions.
+    pub fn @"textDocument/completion"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.CompletionParams,
+    ) OOM!lsp.ResultType("textDocument/completion") {
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const items = try completion.completeDirectives(
+            arena,
+            doc.source,
+            params.position,
+            server.offset_encoding,
+        ) orelse return null;
+
+        return .{ .array_of_CompletionItem = items };
     }
 
     /// LSP `textDocument/hover` handler for Zitron grammar symbols.
@@ -713,6 +733,13 @@ pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
     return std.fs.cwd().readFileAlloc(allocator, build_options.fixture_path, 64 * 1024);
 }
 
+fn completionItemsContainLabel(items: []const types.CompletionItem, label: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, label)) return true;
+    }
+    return false;
+}
+
 test "server capabilities match the implemented handlers" {
     lsp.basic_server.validateServerCapabilities(Server, serverCapabilities(.@"utf-16"));
 }
@@ -797,6 +824,38 @@ test "server applies incremental didChange updates" {
     try expectEqualStrings("\n", doc.source[doc.source.len - 1 ..]);
     try expectEqualStrings("source_file", doc.parsed.root_kind);
     try expect(!doc.parsed.has_error);
+}
+
+test "server returns directive completions from stored live document state" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/directive_completion.zy",
+            .languageId = "zitron",
+            .version = 1,
+            .text =
+            \\%t
+            \\rule ::= TOKEN.
+            ,
+        },
+    });
+
+    const result = (try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/directive_completion.zy" },
+        .position = .{ .line = 0, .character = 2 },
+    })) orelse return error.UnexpectedCompletionResult;
+    switch (result) {
+        .array_of_CompletionItem => |items| {
+            try expect(items.len >= 2);
+            try expect(completionItemsContainLabel(items, "%type"));
+            try expect(completionItemsContainLabel(items, "%token_type"));
+        },
+        else => return error.UnexpectedCompletionResult,
+    }
 }
 
 test "incremental tree-sitter reparse matches fresh parse" {
@@ -1052,6 +1111,7 @@ test "initialize negotiates position encoding" {
 
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
+const completion = @import("completion.zig");
 const diff = @import("diff.zig");
 const lsp = @import("lsp");
 const types = lsp.types;
