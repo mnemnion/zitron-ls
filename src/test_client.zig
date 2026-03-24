@@ -20,6 +20,7 @@ const Error = error_set ||
         TestUnexpectedResult,
     };
 
+/// Runs the end-to-end stdio smoke client against the built server binary.
 pub fn main() Error!void {
     const allocator = std.heap.page_allocator;
     const args = try std.process.argsAlloc(allocator);
@@ -405,7 +406,7 @@ fn expectReferencesResponse(
     defer references.deinit();
 
     const resolved = references.value orelse return error_set.UnexpectedResponse;
-    try expectEqual(@as(usize, 3), resolved.len);
+    try expectEqual(@as(usize, 4), resolved.len);
     for (resolved) |location| {
         try expectEqualStrings("file:///samples/calc.zy", location.uri);
     }

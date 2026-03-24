@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
     lsp_zitron_mod.addImport("tree-sitter", tree_sitter_dep.module("tree_sitter"));
     lsp_zitron_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
     lsp_zitron_mod.addAnonymousImport("zitron-tags-query", .{
-        .root_source_file = tree_sitter_zitron_dep.path("queries/tags.scm"),
+        .root_source_file = b.path("src/zitron-tags-query.scm"),
     });
     lsp_zitron_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
 
@@ -129,6 +129,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
 
     test_step.dependOn(&run_client_unit_tests.step);
+
+    test_step.dependOn(&run_client_cmd.step);
 
     const run_kcov = b.addSystemCommand(&.{
         "kcov",
