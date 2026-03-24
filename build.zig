@@ -20,6 +20,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .@"build-shared" = false,
     });
+    const muad_diff_dep = b.dependency("muad_diff", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const lsp_zitron_mod = b.addModule("lsp_zitron", .{
         .root_source_file = b.path("src/lsp_zitron.zig"),
@@ -28,6 +32,7 @@ pub fn build(b: *std.Build) void {
     });
     lsp_zitron_mod.addImport("lsp", lsp_module);
     lsp_zitron_mod.addOptions("build_options", options);
+    lsp_zitron_mod.addImport("dmp", muad_diff_dep.module("dmp"));
     lsp_zitron_mod.addImport("tree-sitter", tree_sitter_dep.module("tree_sitter"));
     lsp_zitron_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
     lsp_zitron_mod.addAnonymousImport("zitron-tags-query", .{

@@ -21,6 +21,10 @@
             .url = "git+https://github.com/mnemnion/tree-sitter-zitron.git?ref=trunk#1e836c667e75bd230892bb43ebedf5816fd284f2",
             .hash = "tree_sitter_zitron-0.1.1-EA3PTNM1AwBAp-FV9f3B4J6bVwpysIBx2q2RP6rB2w_n",
         },
+        .muad_diff = .{
+            .url = "https://api.github.com/repos/mnemnion/muad-diff/tarball/refs/tags/ohsnap-prerelease-02",
+            .hash = "muad_diff-0.0.1-p0-XoRGIAwBmN7XLmC4Z6Sj7mqeiUaZvwoisN1hXF81b",
+        },
     },
 
     .paths = .{

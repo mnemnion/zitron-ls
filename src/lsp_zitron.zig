@@ -55,12 +55,16 @@ fn zitronLanguage() *const ts.Language {
 pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
 
 fn parseDocument(source: []const u8) Server.Error!ParsedDocument {
+    return parseDocumentIncremental(source, null);
+}
+
+fn parseDocumentIncremental(source: []const u8, old_tree: ?*const ts.Tree) Server.Error!ParsedDocument {
     const parser = ts.Parser.create();
     defer parser.destroy();
 
     try parser.setLanguage(zitronLanguage());
 
-    const tree = parser.parseString(source, null) orelse return error.ParseFailed;
+    const tree = parser.parseString(source, old_tree) orelse return error.ParseFailed;
     const root = tree.rootNode();
     return .{
         .summary = .{
@@ -85,7 +89,7 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
         .textDocumentSync = .{
             .TextDocumentSyncOptions = .{
                 .openClose = true,
-                .change = .Full,
+                .change = .Incremental,
             },
         },
         .hoverProvider = .{ .bool = true },
@@ -180,6 +184,42 @@ pub const Server = struct {
         return server.documents.getPtr(uri);
     }
 
+    fn updateDocumentIncremental(
+        server: *Server,
+        doc: *DocumentState,
+        version: i32,
+        content_changes: []const types.TextDocumentContentChangeEvent,
+    ) Error!void {
+        var applied_change = try diff.applyContentChangesWithEdits(
+            server.allocator,
+            doc.source,
+            content_changes,
+            server.offset_encoding,
+        );
+        defer applied_change.deinit(server.allocator);
+
+        const edited_old_tree = doc.tree.dupe();
+        defer edited_old_tree.destroy();
+        for (applied_change.input_edits.items) |input_edit| {
+            edited_old_tree.edit(input_edit);
+        }
+
+        const parsed = try parseDocumentIncremental(applied_change.text, edited_old_tree);
+        errdefer parsed.tree.destroy();
+
+        const text_copy = try server.allocator.dupe(u8, applied_change.text);
+        errdefer server.allocator.free(text_copy);
+
+        server.allocator.free(doc.source);
+        doc.tree.destroy();
+        doc.* = .{
+            .source = text_copy,
+            .version = version,
+            .parsed = parsed.summary,
+            .tree = parsed.tree,
+        };
+    }
+
     fn resolveAtPosition(
         server: *Server,
         doc: *const DocumentState,
@@ -256,23 +296,15 @@ pub const Server = struct {
         );
     }
 
-    /// LSP `textDocument/didChange` handler that replaces stored document contents.
+    /// LSP `textDocument/didChange` handler that applies incremental document changes.
     pub fn @"textDocument/didChange"(
         server: *Server,
         _: std.mem.Allocator,
         params: types.DidChangeTextDocumentParams,
     ) Error!void {
         _ = server.scratchAllocator();
-        var latest_text: ?[]const u8 = null;
-        for (params.contentChanges) |change| {
-            switch (change) {
-                .literal_1 => |whole| latest_text = whole.text,
-                .literal_0 => return error.InvalidParams,
-            }
-        }
-
-        const text = latest_text orelse return error.InvalidParams;
-        try server.putDocument(params.textDocument.uri, params.textDocument.version, text);
+        const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
+        try server.updateDocumentIncremental(doc, params.textDocument.version, params.contentChanges);
     }
 
     /// LSP `textDocument/didClose` handler that drops cached document state.
@@ -726,6 +758,91 @@ test "server tracks open documents" {
     try expect(!doc.parsed.has_error);
 }
 
+test "server applies incremental didChange updates" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/calc.zy",
+            .languageId = "zitron",
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const end_position = lsp.offsets.indexToPosition(sample, sample.len, .@"utf-8");
+    try server.@"textDocument/didChange"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/calc.zy",
+            .version = 2,
+        },
+        .contentChanges = &.{
+            .{ .literal_0 = .{
+                .range = .{
+                    .start = end_position,
+                    .end = end_position,
+                },
+                .rangeLength = 0,
+                .text = "\n",
+            } },
+        },
+    });
+
+    const doc = server.getDocument("file:///samples/calc.zy").?;
+    try expectEqual(@as(i32, 2), doc.version);
+    try expectEqualStrings("\n", doc.source[doc.source.len - 1 ..]);
+    try expectEqualStrings("source_file", doc.parsed.root_kind);
+    try expect(!doc.parsed.has_error);
+}
+
+test "incremental tree-sitter reparse matches fresh parse" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample = try loadFixtureAlloc(testing_allocator);
+    defer testing_allocator.free(sample);
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/calc.zy",
+            .languageId = "zitron",
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const doc = server.getDocument("file:///samples/calc.zy").?;
+    var applied_change = try diff.applyContentChangesWithEdits(testing_allocator, sample, &.{
+        .{ .literal_0 = .{
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = .{ .line = 0, .character = 4 },
+            },
+            .rangeLength = 4,
+            .text = "start",
+        } },
+    }, .@"utf-8");
+    defer applied_change.deinit(testing_allocator);
+
+    const edited_old_tree = doc.tree.dupe();
+    defer edited_old_tree.destroy();
+    for (applied_change.input_edits.items) |input_edit| {
+        edited_old_tree.edit(input_edit);
+    }
+
+    const incremental = try parseDocumentIncremental(applied_change.text, edited_old_tree);
+    defer incremental.tree.destroy();
+    const fresh = try parseDocument(applied_change.text);
+    defer fresh.tree.destroy();
+
+    try expectEqualStrings(fresh.summary.root_kind, incremental.summary.root_kind);
+    try expectEqual(fresh.summary.has_error, incremental.summary.has_error);
+}
+
 test "query resolution finds rule definitions and references in calc" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -935,6 +1052,7 @@ test "initialize negotiates position encoding" {
 
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
+const diff = @import("diff.zig");
 const lsp = @import("lsp");
 const types = lsp.types;
 const build_options = @import("build_options");
