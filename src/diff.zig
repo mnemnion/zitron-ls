@@ -6,12 +6,12 @@ fn edits(
     after: []const u8,
     encoding: lsp.offsets.Encoding,
 ) OOM!ArrayList(types.TextEdit) {
-    const dmp = DiffMatchPatch.default;
-    var diffs = try dmp.diff(allocator, before, after, true);
-    defer DiffMatchPatch.deinitDiffList(allocator, &diffs);
+    var dmp = DiffMatchPatch.Diff.init(.default);
+    defer dmp.deinit(allocator);
+    _ = try dmp.diff(allocator, before, after);
 
     var edit_count: usize = 0;
-    for (diffs.items) |item| {
+    for (dmp.edits.items) |item| {
         switch (item.operation) {
             .equal => {},
             .insert, .delete => edit_count += 1,
@@ -22,7 +22,7 @@ fn edits(
     errdefer deinitTextEdits(allocator, &text_edits);
 
     var offset: usize = 0;
-    for (diffs.items) |item| {
+    for (dmp.edits.items) |item| {
         const start = offset;
         switch (item.operation) {
             .equal => offset += item.text.len,

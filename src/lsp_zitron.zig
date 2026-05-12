@@ -79,37 +79,6 @@ pub const Server = struct {
         server.tags_query.destroy();
     }
 
-    fn scratchAllocator(server: *Server) std.mem.Allocator {
-        _ = server.scratch_arena.reset(.retain_capacity);
-        return server.scratch_arena.allocator();
-    }
-
-    fn putDocument(server: *Server, uri: []const u8, version: i32, text: []const u8) Error!void {
-        var document = try Document.init(server.allocator, version, text);
-        errdefer document.deinit(server.allocator);
-
-        const gop = try server.documents.getOrPut(server.allocator, uri);
-        if (gop.found_existing) {
-            gop.value_ptr.deinit(server.allocator);
-            gop.value_ptr.* = document;
-        } else {
-            errdefer server.documents.removeByPtr(gop.key_ptr);
-            gop.key_ptr.* = try server.allocator.dupe(u8, uri);
-            gop.value_ptr.* = document;
-        }
-    }
-
-    fn removeDocument(server: *Server, uri: []const u8) void {
-        const removed = server.documents.fetchRemove(uri) orelse return;
-        server.allocator.free(removed.key);
-        var document = removed.value;
-        document.deinit(server.allocator);
-    }
-
-    fn getDocument(server: *Server, uri: []const u8) ?*Document {
-        return server.documents.getPtr(uri);
-    }
-
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         server: *Server,
@@ -139,6 +108,11 @@ pub const Server = struct {
 
     /// LSP `initialized` handler required by `lsp-kit`.
     pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {}
+
+    //| Handlers
+    //|
+    //| `lsp-kit` passes in a per-message arena on requests.  Sometimes we use it,
+    //| sometimes we don't.
 
     /// LSP `textDocument/didOpen` handler that stores the full document text.
     pub fn @"textDocument/didOpen"(
@@ -197,16 +171,15 @@ pub const Server = struct {
     /// LSP `textDocument/hover` handler for Zitron grammar symbols.
     pub fn @"textDocument/hover"(
         server: *Server,
-        _: std.mem.Allocator,
+        arena: std.mem.Allocator,
         params: types.HoverParams,
     ) OOM!?types.Hover {
-        const scratch = server.scratchAllocator();
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
         const value = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => return null,
             .unsupported_zig_code => return null,
-            .symbol => |symbol| try hoverMarkdownForSymbol(scratch, symbol),
+            .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol),
         };
 
         return .{
@@ -225,14 +198,13 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DefinitionParams,
     ) lsp.ResultType("textDocument/definition") {
-        _ = server.scratchAllocator();
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
 
         return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => null,
             .symbol => |symbol| switch (symbol.kind) {
-                .rule_definition => .{
+                .rule_definition, .action_definition => .{
                     .Definition = .{
                         .Location = doc.locationForNode(
                             params.textDocument.uri,
@@ -241,39 +213,27 @@ pub const Server = struct {
                         ),
                     },
                 },
-                .rule_reference => blk: {
-                    const definition = doc.findRuleDefinition(server.tags_query, symbol.symbol_name) orelse break :blk null;
-                    break :blk .{
-                        .Definition = .{
-                            .Location = doc.locationForNode(
-                                params.textDocument.uri,
-                                definition.name_node,
-                                server.offset_encoding,
-                            ),
-                        },
-                    };
-                },
-                .action_definition => .{
+                .rule_reference => if (doc.findRuleDefinition(
+                    server.tags_query,
+                    symbol.symbol_name,
+                )) |definition| .{
                     .Definition = .{
                         .Location = doc.locationForNode(
                             params.textDocument.uri,
-                            symbol.name_node,
+                            definition.name_node,
                             server.offset_encoding,
                         ),
                     },
-                },
-                .action_implementation => blk: {
-                    const definition = doc.findActionDefinition(server.tags_query, symbol.symbol_name) orelse break :blk null;
-                    break :blk .{
-                        .Definition = .{
-                            .Location = doc.locationForNode(
-                                params.textDocument.uri,
-                                definition.name_node,
-                                server.offset_encoding,
-                            ),
-                        },
-                    };
-                },
+                } else null,
+                .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
+                    .Definition = .{
+                        .Location = doc.locationForNode(
+                            params.textDocument.uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
             },
         };
     }
@@ -310,41 +270,69 @@ pub const Server = struct {
 
     /// LSP response hook; ignored because this server does not initiate requests yet.
     pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
-};
 
-fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: types.Position) bool {
-    for (locations) |location| {
-        if (!std.mem.eql(u8, location.uri, uri)) continue;
-        if (std.meta.eql(location.range.start, position)) return true;
+    //| Internal
+
+    fn putDocument(server: *Server, uri: []const u8, version: i32, text: []const u8) Error!void {
+        var document = try Document.init(server.allocator, version, text);
+        errdefer document.deinit(server.allocator);
+
+        const gop = try server.documents.getOrPut(server.allocator, uri);
+        if (gop.found_existing) {
+            gop.value_ptr.deinit(server.allocator);
+            gop.value_ptr.* = document;
+        } else {
+            errdefer server.documents.removeByPtr(gop.key_ptr);
+            gop.key_ptr.* = try server.allocator.dupe(u8, uri);
+            gop.value_ptr.* = document;
+        }
     }
 
-    return false;
-}
+    fn removeDocument(server: *Server, uri: []const u8) void {
+        const removed = server.documents.fetchRemove(uri) orelse return;
+        server.allocator.free(removed.key);
+        var document = removed.value;
+        document.deinit(server.allocator);
+    }
 
-fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
-    return switch (symbol.kind) {
-        .rule_definition => std.fmt.allocPrint(
-            arena,
-            "rule definition `{s}`\n\ncapture `{s}` on `{s}`",
-            .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-        ),
-        .rule_reference => std.fmt.allocPrint(
-            arena,
-            "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
-            .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-        ),
-        .action_definition => std.fmt.allocPrint(
-            arena,
-            "named action definition `{s}`\n\ncapture `{s}` on `{s}`",
-            .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-        ),
-        .action_implementation => std.fmt.allocPrint(
-            arena,
-            "named action implementation `{s}`\n\ncapture `{s}` on `{s}`",
-            .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-        ),
-    };
-}
+    fn getDocument(server: *Server, uri: []const u8) ?*Document {
+        return server.documents.getPtr(uri);
+    }
+
+    fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: types.Position) bool {
+        for (locations) |location| {
+            if (!std.mem.eql(u8, location.uri, uri)) continue;
+            if (std.meta.eql(location.range.start, position)) return true;
+        }
+
+        return false;
+    }
+
+    fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
+        return switch (symbol.kind) {
+            .rule_definition => std.fmt.allocPrint(
+                arena,
+                "rule definition `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+            .rule_reference => std.fmt.allocPrint(
+                arena,
+                "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+            .action_definition => std.fmt.allocPrint(
+                arena,
+                "named action definition `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+            .action_implementation => std.fmt.allocPrint(
+                arena,
+                "named action implementation `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+        };
+    }
+};
 
 //| Tests
 
@@ -643,16 +631,16 @@ test "hover definition and references operate on stored live document state" {
         .context = .{ .includeDeclaration = false },
     })) orelse return error.UnexpectedDefinitionTarget;
     try expectEqual(@as(usize, 4), references.len);
-    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
 
     const first_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) PLUS|FOO(O) term(C).");
-    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index + 1, "expr")));
 
     const second_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) MINUS term(C).");
-    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, second_expr_rhs_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, second_expr_rhs_rule_index + 1, "expr")));
 
     const factor_rule_index = try byteIndexOf(sample, "factor(A) ::= LPAREN expr(E) RPAREN.");
-    try expect(hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, factor_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, factor_rule_index + 1, "expr")));
 
     const references_with_declaration = (try server.@"textDocument/references"(arena_state.allocator(), .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
@@ -660,11 +648,11 @@ test "hover definition and references operate on stored live document state" {
         .context = .{ .includeDeclaration = true },
     })) orelse return error.UnexpectedDefinitionTarget;
     try expectEqual(@as(usize, 7), references_with_declaration.len);
-    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
-    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
+    try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
+    try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
 
     const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
-    try expect(hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
+    try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
 }
 
 test "named action definitions resolve in the same document" {
