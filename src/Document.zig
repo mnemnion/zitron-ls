@@ -353,7 +353,7 @@ fn sliceForNode(source: []const u8, node: ts.Node) []const u8 {
 
 fn normalizeSymbolName(symbol_name: []const u8) []const u8 {
     const open_paren = std.mem.indexOfScalar(u8, symbol_name, '(') orelse return symbol_name;
-    return std.mem.trimRight(u8, symbol_name[0..open_paren], " \t");
+    return std.mem.trimEnd(u8, symbol_name[0..open_paren], " \t");
 }
 
 fn tsPointFromIndex(source: []const u8, index: usize) ts.Point {
@@ -419,7 +419,7 @@ test "updateIncremental preserves parse correctness" {
         testing_allocator,
         2,
         &.{
-            .{ .literal_0 = .{
+            .{ .text_document_content_change_partial = .{
                 .range = .{
                     .start = end_position,
                     .end = end_position,
@@ -522,7 +522,7 @@ const std = @import("std");
 const OOM = std.mem.Allocator.Error;
 const diff = @import("diff.zig");
 const lsp = @import("lsp");
-const types = lsp.types;
+const types = lsp.types.flat;
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
 const zitron_grammar = @import("tree_sitter_zitron");

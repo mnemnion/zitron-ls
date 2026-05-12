@@ -59,7 +59,7 @@ pub fn completeDirectives(
         items[next] = .{
             .label = directive,
             .kind = .Keyword,
-            .textEdit = .{ .TextEdit = .{
+            .textEdit = .{ .text_edit = .{
                 .range = context.replace_range,
                 .newText = directive,
             } },
@@ -220,4 +220,4 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const OOM = Allocator.Error;
 const lsp = @import("lsp");
-const types = lsp.types;
+const types = lsp.types.flat;

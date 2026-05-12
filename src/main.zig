@@ -1,18 +1,19 @@
 //! Main executable of lsp_zitron.
 
-pub fn main() Error!void {
-    var server = try zitron.Server.init(std.heap.page_allocator);
+pub fn main(init: std.process.Init) Error!void {
+    var server = try zitron.Server.init(init.gpa);
     defer server.deinit();
 
     var read_buffer: [4096]u8 = undefined;
     var transport = lsp.Transport.Stdio.init(
         &read_buffer,
-        std.fs.File.stdin(),
-        std.fs.File.stdout(),
+        std.Io.File.stdin(),
+        std.Io.File.stdout(),
     );
 
     try lsp.basic_server.run(
-        std.heap.page_allocator,
+        init.io,
+        init.gpa,
         &transport.transport,
         &server,
         std.log.err,

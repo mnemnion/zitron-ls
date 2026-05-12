@@ -85,9 +85,9 @@ pub fn applyContentChangesWithEdits(
         while (index != 0) {
             index -= 1;
             switch (content_changes[index]) {
-                // literal_1 is the whole-document form; literal_0 is ranged change form.
-                .literal_1 => |whole| break :blk .{ index, whole.text },
-                .literal_0 => continue,
+                // Whole-document changes replace prior ranged edits.
+                .text_document_content_change_whole_document => |whole| break :blk .{ index, whole.text },
+                .text_document_content_change_partial => continue,
             }
         }
         break :blk .{ null, text };
@@ -103,8 +103,8 @@ pub fn applyContentChangesWithEdits(
     const changes = content_changes[if (last_full_text_index) |index| index + 1 else 0..];
     for (changes) |item| {
         const partial = switch (item) {
-            .literal_0 => |change| change,
-            .literal_1 => unreachable,
+            .text_document_content_change_partial => |change| change,
+            .text_document_content_change_whole_document => unreachable,
         };
         const input_edit = inputEditForPartialChange(
             text_array.items,
@@ -262,7 +262,7 @@ test "edits preserve utf-16 positions" {
 
 test "apply content changes handles whole document replacement" {
     const updated = try applyContentChanges(testing.allocator, "old", &.{
-        .{ .literal_1 = .{ .text = "new" } },
+        .{ .text_document_content_change_whole_document = .{ .text = "new" } },
     }, .@"utf-8");
     defer testing.allocator.free(updated);
 
@@ -271,7 +271,7 @@ test "apply content changes handles whole document replacement" {
 
 test "apply content changes handles ordered partial edits" {
     const updated = try applyContentChanges(testing.allocator, "calc ::= expr\n", &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = 0, .character = 4 },
@@ -279,7 +279,7 @@ test "apply content changes handles ordered partial edits" {
             .rangeLength = 4,
             .text = "start",
         } },
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 10 },
                 .end = .{ .line = 0, .character = 14 },
@@ -295,7 +295,7 @@ test "apply content changes handles ordered partial edits" {
 
 test "apply content changes uses last full text before trailing partial edits" {
     const updated = try applyContentChanges(testing.allocator, "ignored", &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = 0, .character = 7 },
@@ -303,8 +303,8 @@ test "apply content changes uses last full text before trailing partial edits" {
             .rangeLength = 7,
             .text = "discard",
         } },
-        .{ .literal_1 = .{ .text = "calc ::= expr" } },
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_whole_document = .{ .text = "calc ::= expr" } },
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 9 },
                 .end = .{ .line = 0, .character = 13 },
@@ -320,7 +320,7 @@ test "apply content changes uses last full text before trailing partial edits" {
 
 test "apply content changes handles utf-16 ranges" {
     const updated = try applyContentChanges(testing.allocator, "a¶↉🠁", &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 2 },
                 .end = .{ .line = 0, .character = 3 },
@@ -335,7 +335,7 @@ test "apply content changes handles utf-16 ranges" {
 }
 
 test "input edit handles single-line replacement" {
-    const partial = types.TextDocumentContentChangeEvent{ .literal_0 = .{
+    const partial = types.TextDocumentContentChangeEvent{ .text_document_content_change_partial = .{
         .range = .{
             .start = .{ .line = 0, .character = 0 },
             .end = .{ .line = 0, .character = 4 },
@@ -343,7 +343,7 @@ test "input edit handles single-line replacement" {
         .rangeLength = 4,
         .text = "start",
     } };
-    const input_edit = inputEditForPartialChange("calc ::= expr\n", partial.literal_0, .@"utf-8");
+    const input_edit = inputEditForPartialChange("calc ::= expr\n", partial.text_document_content_change_partial, .@"utf-8");
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 0,
@@ -356,7 +356,7 @@ test "input edit handles single-line replacement" {
 }
 
 test "input edit handles insertion at end of file" {
-    const partial = types.TextDocumentContentChangeEvent{ .literal_0 = .{
+    const partial = types.TextDocumentContentChangeEvent{ .text_document_content_change_partial = .{
         .range = .{
             .start = .{ .line = 0, .character = 4 },
             .end = .{ .line = 0, .character = 4 },
@@ -364,7 +364,7 @@ test "input edit handles insertion at end of file" {
         .rangeLength = 0,
         .text = "\n",
     } };
-    const input_edit = inputEditForPartialChange("calc", partial.literal_0, .@"utf-8");
+    const input_edit = inputEditForPartialChange("calc", partial.text_document_content_change_partial, .@"utf-8");
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 4,
@@ -377,7 +377,7 @@ test "input edit handles insertion at end of file" {
 }
 
 test "input edit handles utf-16 positions over multibyte text" {
-    const partial = types.TextDocumentContentChangeEvent{ .literal_0 = .{
+    const partial = types.TextDocumentContentChangeEvent{ .text_document_content_change_partial = .{
         .range = .{
             .start = .{ .line = 0, .character = 2 },
             .end = .{ .line = 0, .character = 3 },
@@ -385,7 +385,7 @@ test "input edit handles utf-16 positions over multibyte text" {
         .rangeLength = 1,
         .text = "!",
     } };
-    const input_edit = inputEditForPartialChange("a¶↉🠁", partial.literal_0, .@"utf-16");
+    const input_edit = inputEditForPartialChange("a¶↉🠁", partial.text_document_content_change_partial, .@"utf-16");
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 3,
@@ -399,7 +399,7 @@ test "input edit handles utf-16 positions over multibyte text" {
 
 test "apply content changes with edits handles multiple ordered partial edits" {
     var applied_change = try applyContentChangesWithEdits(testing.allocator, "calc ::= expr\n", &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = 0, .character = 4 },
@@ -407,7 +407,7 @@ test "apply content changes with edits handles multiple ordered partial edits" {
             .rangeLength = 4,
             .text = "start",
         } },
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 10 },
                 .end = .{ .line = 0, .character = 14 },
@@ -432,7 +432,7 @@ test "apply content changes with edits handles multiple ordered partial edits" {
 
 test "apply content changes with edits handles last full text and trailing partial edits" {
     var applied_change = try applyContentChangesWithEdits(testing.allocator, "ignored", &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = 0, .character = 7 },
@@ -440,8 +440,8 @@ test "apply content changes with edits handles last full text and trailing parti
             .rangeLength = 7,
             .text = "discard",
         } },
-        .{ .literal_1 = .{ .text = "calc ::= expr" } },
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_whole_document = .{ .text = "calc ::= expr" } },
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 9 },
                 .end = .{ .line = 0, .character = 13 },
@@ -475,6 +475,6 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const OOM = std.mem.Allocator.Error;
 const lsp = @import("lsp");
-const types = lsp.types;
+const types = lsp.types.flat;
 const DiffMatchPatch = @import("dmp");
 const ts = @import("tree-sitter");

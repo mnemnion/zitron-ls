@@ -13,7 +13,7 @@ fn zitronLanguage() *const ts.Language {
 }
 
 /// Errors that can occur while loading the configured fixture source.
-pub const FixtureError = OOM || std.fs.File.OpenError || std.fs.File.ReadError || error{FileTooBig};
+pub const FixtureError = std.Io.Dir.ReadFileAllocError;
 
 fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKind {
     return switch (encoding) {
@@ -27,7 +27,7 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
     return .{
         .positionEncoding = positionEncodingKind(offset_encoding),
         .textDocumentSync = .{
-            .TextDocumentSyncOptions = .{
+            .text_document_sync_options = .{
                 .openClose = true,
                 .change = .Incremental,
             },
@@ -165,7 +165,7 @@ pub const Server = struct {
             server.offset_encoding,
         ) orelse return null;
 
-        return .{ .array_of_CompletionItem = items };
+        return .{ .completion_items = items };
     }
 
     /// LSP `textDocument/hover` handler for Zitron grammar symbols.
@@ -184,7 +184,7 @@ pub const Server = struct {
 
         return .{
             .contents = .{
-                .MarkupContent = .{
+                .markup_content = .{
                     .kind = .markdown,
                     .value = value,
                 },
@@ -205,8 +205,8 @@ pub const Server = struct {
             .unsupported_zig_code => null,
             .symbol => |symbol| switch (symbol.kind) {
                 .rule_definition, .action_definition => .{
-                    .Definition = .{
-                        .Location = doc.locationForNode(
+                    .definition = .{
+                        .location = doc.locationForNode(
                             params.textDocument.uri,
                             symbol.name_node,
                             server.offset_encoding,
@@ -217,8 +217,8 @@ pub const Server = struct {
                     server.tags_query,
                     symbol.symbol_name,
                 )) |definition| .{
-                    .Definition = .{
-                        .Location = doc.locationForNode(
+                    .definition = .{
+                        .location = doc.locationForNode(
                             params.textDocument.uri,
                             definition.name_node,
                             server.offset_encoding,
@@ -226,8 +226,8 @@ pub const Server = struct {
                     },
                 } else null,
                 .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
-                    .Definition = .{
-                        .Location = doc.locationForNode(
+                    .definition = .{
+                        .location = doc.locationForNode(
                             params.textDocument.uri,
                             definition.name_node,
                             server.offset_encoding,
@@ -367,8 +367,8 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
 }
 
 /// Loads the configured fixture source into memory for smoke tests and helpers.
-pub fn loadFixtureAlloc(allocator: std.mem.Allocator) FixtureError![]u8 {
-    return std.fs.cwd().readFileAlloc(allocator, build_options.fixture_path, 64 * 1024);
+pub fn loadFixtureAlloc(io: std.Io, allocator: std.mem.Allocator) FixtureError![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, build_options.fixture_path, allocator, .limited(64 * 1024));
 }
 
 fn completionItemsContainLabel(items: []const types.CompletionItem, label: []const u8) bool {
@@ -392,7 +392,7 @@ test "embedded tags query compiles for the zitron grammar" {
 }
 
 test "tree-sitter zitron parses the configured fixture" {
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     const parsed = try parseSource(sample);
@@ -405,13 +405,13 @@ test "server tracks open documents" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/calc.zy",
-            .languageId = "zitron",
+            .languageId = .{ .custom_value = "zitron" },
             .version = 1,
             .text = sample,
         },
@@ -427,13 +427,13 @@ test "server applies incremental didChange updates" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/calc.zy",
-            .languageId = "zitron",
+            .languageId = .{ .custom_value = "zitron" },
             .version = 1,
             .text = sample,
         },
@@ -446,7 +446,7 @@ test "server applies incremental didChange updates" {
             .version = 2,
         },
         .contentChanges = &.{
-            .{ .literal_0 = .{
+            .{ .text_document_content_change_partial = .{
                 .range = .{
                     .start = end_position,
                     .end = end_position,
@@ -473,7 +473,7 @@ test "server returns directive completions from stored live document state" {
     try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/directive_completion.zy",
-            .languageId = "zitron",
+            .languageId = .{ .custom_value = "zitron" },
             .version = 1,
             .text =
             \\%t
@@ -487,7 +487,7 @@ test "server returns directive completions from stored live document state" {
         .position = .{ .line = 0, .character = 2 },
     })) orelse return error.UnexpectedCompletionResult;
     switch (result) {
-        .array_of_CompletionItem => |items| {
+        .completion_items => |items| {
             try expect(items.len >= 2);
             try expect(completionItemsContainLabel(items, "%type"));
             try expect(completionItemsContainLabel(items, "%token_type"));
@@ -497,14 +497,14 @@ test "server returns directive completions from stored live document state" {
 }
 
 test "incremental tree-sitter reparse matches fresh parse" {
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     var incremental = try Document.init(testing_allocator, 1, sample);
     defer incremental.deinit(testing_allocator);
 
     try incremental.updateIncremental(testing_allocator, 2, &.{
-        .{ .literal_0 = .{
+        .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
                 .end = .{ .line = 0, .character = 4 },
@@ -525,7 +525,7 @@ test "query resolution finds rule definitions and references in calc" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
@@ -555,7 +555,7 @@ test "query resolution returns no match on punctuation" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
@@ -569,7 +569,7 @@ test "query resolution returns unsupported inside zig code" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.putDocument("file:///samples/calc.zy", 1, sample);
@@ -585,13 +585,13 @@ test "hover definition and references operate on stored live document state" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    const sample = try loadFixtureAlloc(testing_allocator);
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
     defer testing_allocator.free(sample);
 
     try server.@"textDocument/didOpen"(testing_allocator, .{
         .textDocument = .{
             .uri = "file:///samples/calc.zy",
-            .languageId = "zitron",
+            .languageId = .{ .custom_value = "zitron" },
             .version = 1,
             .text = sample,
         },
@@ -602,7 +602,7 @@ test "hover definition and references operate on stored live document state" {
         .position = try positionOfText(sample, "calc ::= expr"),
     })).?;
     switch (hover.contents) {
-        .MarkupContent => |content| {
+        .markup_content => |content| {
             try expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
         },
         else => return error.UnexpectedHoverContents,
@@ -614,8 +614,8 @@ test "hover definition and references operate on stored live document state" {
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
     })) orelse return error.UnexpectedDefinitionTarget;
     switch (definition) {
-        .Definition => |target| switch (target) {
-            .Location => |location| {
+        .definition => |target| switch (target) {
+            .location => |location| {
                 try expectEqualStrings("file:///samples/calc.zy", location.uri);
                 try expectEqual(@as(u32, 48), location.range.start.line);
                 try expectEqual(@as(u32, 0), location.range.start.character);
@@ -674,8 +674,8 @@ test "named action definitions resolve in the same document" {
         .position = definition_position,
     })) orelse return error.UnexpectedDefinitionTarget;
     switch (definition) {
-        .Definition => |target| switch (target) {
-            .Location => |location| {
+        .definition => |target| switch (target) {
+            .location => |location| {
                 try expectEqualStrings("file:///samples/named_actions.zy", location.uri);
                 try expectEqual(definition_target, location.range.start);
             },
@@ -691,8 +691,8 @@ test "named action definitions resolve in the same document" {
         .position = implementation_position,
     })) orelse return error.UnexpectedDefinitionTarget;
     switch (implementation_definition) {
-        .Definition => |target| switch (target) {
-            .Location => |location| {
+        .definition => |target| switch (target) {
+            .location => |location| {
                 try expectEqualStrings("file:///samples/named_actions.zy", location.uri);
                 try expectEqual(definition_target, location.range.start);
             },
@@ -743,8 +743,8 @@ test "definition on discard resolves that rule instead of a neighbor" {
         .position = reference_position,
     })) orelse return error.UnexpectedDefinitionTarget;
     switch (definition) {
-        .Definition => |target| switch (target) {
-            .Location => |location| {
+        .definition => |target| switch (target) {
+            .location => |location| {
                 try expectEqualStrings("file:///samples/discard.zy", location.uri);
                 try expectEqual(definition_target, location.range.start);
             },
@@ -775,7 +775,7 @@ const OOM = std.mem.Allocator.Error;
 const Document = @import("Document.zig");
 const completion = @import("completion.zig");
 const lsp = @import("lsp");
-const types = lsp.types;
+const types = lsp.types.flat;
 const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
