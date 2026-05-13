@@ -1,6 +1,6 @@
 //! Text diffing between document revisions and LSP change events.
 
-fn edits(
+pub fn edits(
     allocator: Allocator,
     before: []const u8,
     after: []const u8,
@@ -197,7 +197,7 @@ fn applyTextEdits(
     return try final_text.toOwnedSlice(allocator);
 }
 
-fn deinitTextEdits(allocator: Allocator, text_edits: *ArrayList(types.TextEdit)) void {
+pub fn deinitTextEdits(allocator: Allocator, text_edits: *ArrayList(types.TextEdit)) void {
     defer text_edits.deinit(allocator);
     for (text_edits.items) |item| {
         if (item.newText.len != 0) allocator.free(item.newText);

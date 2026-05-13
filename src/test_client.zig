@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("textDocument/didOpen"),
         .{
             .textDocument = .{
-                .uri = "file:///samples/calc.zy",
+                .uri = fixture_uri,
                 .languageId = .{ .custom_value = "zitron" },
                 .version = 1,
                 .text = fixture_text,
@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("textDocument/didChange"),
         .{
             .textDocument = .{
-                .uri = "file:///samples/calc.zy",
+                .uri = fixture_uri,
                 .version = 2,
             },
             .contentChanges = &.{
@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/hover",
         lsp.ParamsType("textDocument/hover"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
             .position = try positionOfText(fixture_text, "calc ::= expr"),
         },
         .{ .emit_null_optional_fields = false },
@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/definition",
         lsp.ParamsType("textDocument/definition"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
             .position = try positionOfTextAfter(fixture_text, calc_rule_index + 1, "expr"),
         },
         .{ .emit_null_optional_fields = false },
@@ -153,12 +153,12 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/hover",
         lsp.ParamsType("textDocument/hover"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
             .position = try positionOfText(fixture_text, "answer = A"),
         },
         .{ .emit_null_optional_fields = false },
     );
-    try expectNullResponse(init.io, allocator, &transport.transport, 5);
+    try expectAnyResponse(init.io, allocator, &transport.transport, 5);
 
     try transport.transport.writeRequest(
         init.io,
@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/references",
         lsp.ParamsType("textDocument/references"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
             .position = try positionOfTextAfter(fixture_text, calc_rule_index + 1, "expr"),
             .context = .{ .includeDeclaration = false },
         },
@@ -183,7 +183,7 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/completion",
         lsp.ParamsType("textDocument/completion"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
             .position = lsp.offsets.indexToPosition(fixture_text, token_type_anchor + 2, offset_encoding),
         },
         .{ .emit_null_optional_fields = false },
@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init) Error!void {
         "textDocument/didClose",
         lsp.ParamsType("textDocument/didClose"),
         .{
-            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .textDocument = .{ .uri = fixture_uri },
         },
         .{ .emit_null_optional_fields = false },
     );
@@ -352,7 +352,7 @@ fn expectDefinitionResponse(
     switch (resolved) {
         .definition => |target| switch (target) {
             .location => |location| {
-                try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                try expectEqualStrings(fixture_uri, location.uri);
                 try expectEqual(@as(u32, 48), location.range.start.line);
                 try expectEqual(@as(u32, 0), location.range.start.character);
             },
@@ -389,6 +389,31 @@ fn expectNullResponse(
                 },
                 .@"error" => return error_set.UnexpectedResponse,
             }
+        },
+        else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn expectAnyResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    id: i64,
+) Error!void {
+    const json_message = try transport.readJsonMessage(io, allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .response => |response| {
+            if (response.id == null or !response.id.?.eql(.{ .number = id })) {
+                return error_set.UnexpectedResponse;
+            }
+            _ = response.result_or_error;
         },
         else => return error_set.UnexpectedResponse,
     }
@@ -431,7 +456,7 @@ fn expectReferencesResponse(
     const resolved = references.value orelse return error_set.UnexpectedResponse;
     try expectEqual(@as(usize, 4), resolved.len);
     for (resolved) |location| {
-        try expectEqualStrings("file:///samples/calc.zy", location.uri);
+        try expectEqualStrings(fixture_uri, location.uri);
     }
 }
 
@@ -544,3 +569,4 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 const lsp = @import("lsp");
 const zitron = @import("lsp_zitron");
 const offset_encoding: lsp.offsets.Encoding = .@"utf-8";
+const fixture_uri = "file:///Users/atman/Dropbox/deck/z/lsp_zitron/samples/calc.zy";

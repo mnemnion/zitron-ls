@@ -148,6 +148,21 @@ pub fn resolveAtPosition(
     return if (best) |symbol| .{ .symbol = symbol } else .no_match;
 }
 
+/// Returns whether the requested position is within embedded Zig source.
+pub fn containsZigCodeAtPosition(
+    document: Document,
+    offset_encoding: lsp.offsets.Encoding,
+    position: types.Position,
+) bool {
+    const source_index = lsp.offsets.positionToIndex(document.source, position, offset_encoding);
+    const point = tsPointFromIndex(document.source, source_index);
+    const root = document.tree.rootNode();
+    const raw_node = root.descendantForPointRange(point, point) orelse return false;
+    if (containsUnsupportedCode(raw_node)) return true;
+    const node = root.namedDescendantForPointRange(point, point) orelse return false;
+    return containsUnsupportedCode(node);
+}
+
 /// Finds the definition symbol for a named rule in this document.
 pub fn findRuleDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
     return document.findDefinition(tags_query, symbol_name, .rule_definition);
@@ -472,6 +487,22 @@ test "resolution and references work without server" {
         .@"utf-8",
     )) orelse return error.UnexpectedReferences;
     try expect(references.len >= 2);
+}
+
+test "classifies zig code positions for middleware routing" {
+    const sample =
+        \\calc ::= expr(A). { answer = A; }
+        \\%code {
+        \\const parser_name = "calc";
+        \\}
+    ;
+
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    try expect(document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "answer")));
+    try expect(document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "parser_name")));
+    try expect(!document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "calc ::= expr")));
 }
 
 test "resolution chooses discard rule reference instead of leftmost rule" {
