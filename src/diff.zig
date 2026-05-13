@@ -1,48 +1,91 @@
 //! Text diffing between document revisions and LSP change events.
 
-pub fn edits(
+pub const TextChanges = struct {
+    items: []types.TextDocumentContentChangeEvent,
+
+    pub fn deinit(text_changes: *TextChanges, allocator: Allocator) void {
+        for (text_changes.items) |item| {
+            switch (item) {
+                .text_document_content_change_partial => |partial| {
+                    if (partial.text.len != 0) allocator.free(partial.text);
+                },
+                .text_document_content_change_whole_document => {},
+            }
+        }
+        allocator.free(text_changes.items);
+        text_changes.* = undefined;
+    }
+};
+
+pub fn textChanges(
     allocator: Allocator,
     before: []const u8,
     after: []const u8,
     encoding: lsp.offsets.Encoding,
-) OOM!ArrayList(types.TextEdit) {
-    var dmp = DiffMatchPatch.Diff.init(.default);
-    defer dmp.deinit(allocator);
-    _ = try dmp.diff(allocator, before, after);
+) OOM!TextChanges {
+    var difference = Diff.init(.default);
+    defer difference.deinit(allocator);
+    _ = try difference.diff(allocator, before, after);
+    return try textChangesFromDiff(&difference, allocator, encoding);
+}
 
-    var edit_count: usize = 0;
-    for (dmp.edits.items) |item| {
+pub fn textChangesFromDiff(
+    difference: *const Diff,
+    allocator: Allocator,
+    encoding: lsp.offsets.Encoding,
+) OOM!TextChanges {
+    var content_changes: ArrayList(types.TextDocumentContentChangeEvent) = .empty;
+    errdefer {
+        for (content_changes.items) |item| {
+            switch (item) {
+                .text_document_content_change_partial => |partial| {
+                    if (partial.text.len != 0) allocator.free(partial.text);
+                },
+                .text_document_content_change_whole_document => {},
+            }
+        }
+        content_changes.deinit(allocator);
+    }
+
+    var position: types.Position = .{ .line = 0, .character = 0 };
+    var index: usize = 0;
+    while (index < difference.edits.items.len) {
+        const item = difference.edits.items[index];
         switch (item.operation) {
-            .equal => {},
-            .insert, .delete => edit_count += 1,
+            .equal => {
+                position = advancePosition(position, item.text, encoding);
+                index += 1;
+            },
+            .insert, .delete => {
+                const start = position;
+                var end = start;
+                var replacement: ArrayList(u8) = .empty;
+                errdefer replacement.deinit(allocator);
+
+                while (index < difference.edits.items.len) : (index += 1) {
+                    const edit = difference.edits.items[index];
+                    switch (edit.operation) {
+                        .equal => break,
+                        .insert => try replacement.appendSlice(allocator, edit.text),
+                        .delete => end = advancePosition(end, edit.text, encoding),
+                    }
+                }
+
+                const replacement_text = try replacement.toOwnedSlice(allocator);
+                errdefer allocator.free(replacement_text);
+                try content_changes.append(allocator, .{ .text_document_content_change_partial = .{
+                    .range = .{
+                        .start = start,
+                        .end = end,
+                    },
+                    .text = replacement_text,
+                } });
+                position = advancePosition(start, replacement_text, encoding);
+            },
         }
     }
 
-    var text_edits: ArrayList(types.TextEdit) = try .initCapacity(allocator, edit_count);
-    errdefer deinitTextEdits(allocator, &text_edits);
-
-    var offset: usize = 0;
-    for (dmp.edits.items) |item| {
-        const start = offset;
-        switch (item.operation) {
-            .equal => offset += item.text.len,
-            .delete => {
-                offset += item.text.len;
-                text_edits.appendAssumeCapacity(.{
-                    .range = lsp.offsets.locToRange(before, .{ .start = start, .end = offset }, encoding),
-                    .newText = "",
-                });
-            },
-            .insert => {
-                text_edits.appendAssumeCapacity(.{
-                    .range = lsp.offsets.locToRange(before, .{ .start = start, .end = start }, encoding),
-                    .newText = try allocator.dupe(u8, item.text),
-                });
-            },
-        }
-    }
-
-    return text_edits;
+    return .{ .items = try content_changes.toOwnedSlice(allocator) };
 }
 
 const AppliedChange = struct {
@@ -152,56 +195,34 @@ fn pointFromByteIndex(text: []const u8, index: usize) ts.Point {
 fn advancePoint(start_point: ts.Point, text: []const u8) ts.Point {
     var point = start_point;
     var line_start: usize = 0;
+    var saw_newline = false;
     for (text, 0..) |char, index| {
         if (char == '\n') {
+            saw_newline = true;
             point.row += 1;
             line_start = index + 1;
         }
     }
-    point.column = @intCast(text.len - line_start);
+    point.column = @intCast(if (saw_newline)
+        text.len - line_start
+    else
+        start_point.column + text.len);
     return point;
 }
 
-fn textEditLessThan(_: void, lhs: types.TextEdit, rhs: types.TextEdit) bool {
-    return lsp.offsets.orderPosition(lhs.range.start, rhs.range.start) == .lt or
-        lsp.offsets.orderPosition(lhs.range.end, rhs.range.end) == .lt;
-}
-
-fn applyTextEdits(
-    allocator: Allocator,
+fn advancePosition(
+    start_position: types.Position,
     text: []const u8,
-    text_edits: []const types.TextEdit,
     encoding: lsp.offsets.Encoding,
-) OOM![]const u8 {
-    const sortable = try allocator.dupe(types.TextEdit, text_edits);
-    defer allocator.free(sortable);
-    std.mem.sort(types.TextEdit, sortable, {}, textEditLessThan);
-
-    var final_text: ArrayList(u8) = .empty;
-    errdefer final_text.deinit(allocator);
-
-    var last: usize = 0;
-    for (sortable) |item| {
-        const start = lsp.offsets.positionToIndex(text, item.range.start, encoding);
-        if (start > last) {
-            try final_text.appendSlice(allocator, text[last..start]);
-            last = start;
-        }
-        try final_text.appendSlice(allocator, item.newText);
-        last = lsp.offsets.positionToIndex(text, item.range.end, encoding);
-    }
-    if (last < text.len) {
-        try final_text.appendSlice(allocator, text[last..]);
-    }
-
-    return try final_text.toOwnedSlice(allocator);
-}
-
-pub fn deinitTextEdits(allocator: Allocator, text_edits: *ArrayList(types.TextEdit)) void {
-    defer text_edits.deinit(allocator);
-    for (text_edits.items) |item| {
-        if (item.newText.len != 0) allocator.free(item.newText);
-    }
+) types.Position {
+    const relative = lsp.offsets.indexToPosition(text, text.len, encoding);
+    return if (relative.line == 0) .{
+        .line = start_position.line,
+        .character = start_position.character + relative.character,
+    } else .{
+        .line = start_position.line + relative.line,
+        .character = relative.character,
+    };
 }
 
 //| Tests
@@ -212,52 +233,150 @@ const expectEqual = testing.expectEqual;
 const expectEqualDeep = testing.expectEqualDeep;
 const expectEqualStrings = testing.expectEqualStrings;
 
-test "edits round trip pure insert" {
-    var text_edits = try edits(testing.allocator, "calc ::= expr", "calc ::= expr.", .@"utf-8");
-    defer deinitTextEdits(testing.allocator, &text_edits);
+test "text changes no-op returns zero changes" {
+    var changes = try textChanges(testing.allocator, "same", "same", .@"utf-8");
+    defer changes.deinit(testing.allocator);
 
-    const applied = try applyTextEdits(testing.allocator, "calc ::= expr", text_edits.items, .@"utf-8");
-    defer testing.allocator.free(applied);
-
-    try expectEqual(@as(usize, 1), text_edits.items.len);
-    try expectEqualStrings("calc ::= expr.", applied);
+    try expectEqual(@as(usize, 0), changes.items.len);
 }
 
-test "edits round trip pure delete" {
-    var text_edits = try edits(testing.allocator, "calc ::= expr.\n", "calc ::= expr", .@"utf-8");
-    defer deinitTextEdits(testing.allocator, &text_edits);
+test "text changes handle pure insert" {
+    const before = "calc";
+    const after = "calc ::= expr";
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-8");
+    defer changes.deinit(testing.allocator);
 
-    const applied = try applyTextEdits(testing.allocator, "calc ::= expr.\n", text_edits.items, .@"utf-8");
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
     defer testing.allocator.free(applied);
 
-    try expectEqual(@as(usize, 1), text_edits.items.len);
-    try expectEqualStrings("calc ::= expr", applied);
+    try expectEqual(@as(usize, 1), changes.items.len);
+    try expectEqualStrings(after, applied);
+    const change = changes.items[0].text_document_content_change_partial;
+    try expectEqualDeep(types.Range{
+        .start = .{ .line = 0, .character = 4 },
+        .end = .{ .line = 0, .character = 4 },
+    }, change.range);
+    try expectEqualStrings(" ::= expr", change.text);
 }
 
-test "edits round trip mixed replace with multiple edits" {
-    const before = "calc ::= expr\nexpr ::= term\nterm ::= TOKEN\n";
-    const after = "start ::= expr\nexpr ::= factor\nfactor ::= TOKEN\n";
-    var text_edits = try edits(testing.allocator, before, after, .@"utf-8");
-    defer deinitTextEdits(testing.allocator, &text_edits);
+test "text changes handle pure delete" {
+    const before = "calc ::= expr";
+    const after = "calc";
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-8");
+    defer changes.deinit(testing.allocator);
 
-    const applied = try applyTextEdits(testing.allocator, before, text_edits.items, .@"utf-8");
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
     defer testing.allocator.free(applied);
 
-    try expect(text_edits.items.len >= 2);
+    try expectEqual(@as(usize, 1), changes.items.len);
+    try expectEqualStrings(after, applied);
+    const change = changes.items[0].text_document_content_change_partial;
+    try expectEqualDeep(types.Range{
+        .start = .{ .line = 0, .character = 4 },
+        .end = .{ .line = 0, .character = 13 },
+    }, change.range);
+    try expectEqualStrings("", change.text);
+}
+
+test "text changes coalesce delete insert replacement" {
+    const before = "abc";
+    const after = "aXYc";
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-8");
+    defer changes.deinit(testing.allocator);
+
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
+    defer testing.allocator.free(applied);
+
+    try expectEqual(@as(usize, 1), changes.items.len);
+    try expectEqualStrings(after, applied);
+    const change = changes.items[0].text_document_content_change_partial;
+    try expectEqualDeep(types.Range{
+        .start = .{ .line = 0, .character = 1 },
+        .end = .{ .line = 0, .character = 2 },
+    }, change.range);
+    try expectEqualStrings("XY", change.text);
+}
+
+test "text changes coalesce insert delete replacement" {
+    const before = "abcd";
+    const after = "aXYd";
+    var difference = Diff.init(.default);
+    defer difference.deinit(testing.allocator);
+    try difference.edits.append(testing.allocator, Edit.asBorrow(.equal, "a"));
+    try difference.edits.append(testing.allocator, Edit.asBorrow(.insert, "XY"));
+    try difference.edits.append(testing.allocator, Edit.asBorrow(.delete, "bc"));
+    try difference.edits.append(testing.allocator, Edit.asBorrow(.equal, "d"));
+
+    var changes = try textChangesFromDiff(&difference, testing.allocator, .@"utf-8");
+    defer changes.deinit(testing.allocator);
+
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
+    defer testing.allocator.free(applied);
+
+    try expectEqual(@as(usize, 1), changes.items.len);
+    try expectEqualStrings(after, applied);
+    const change = changes.items[0].text_document_content_change_partial;
+    try expectEqualDeep(types.Range{
+        .start = .{ .line = 0, .character = 1 },
+        .end = .{ .line = 0, .character = 3 },
+    }, change.range);
+    try expectEqualStrings("XY", change.text);
+}
+
+test "text changes apply multiple mutation runs in order" {
+    const before = "abcde";
+    const after = "aXcYe";
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-8");
+    defer changes.deinit(testing.allocator);
+
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
+    defer testing.allocator.free(applied);
+
+    try expectEqual(@as(usize, 2), changes.items.len);
     try expectEqualStrings(after, applied);
 }
 
-test "edits preserve utf-16 positions" {
+test "text changes update later ranges after multiline edit" {
+    const before =
+        \\a
+        \\b
+        \\c
+        \\
+    ;
+    const after =
+        \\a
+        \\xx
+        \\b
+        \\YY
+        \\c
+        \\
+    ;
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-8");
+    defer changes.deinit(testing.allocator);
+
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-8");
+    defer testing.allocator.free(applied);
+
+    try expectEqualStrings(after, applied);
+}
+
+test "text changes preserve utf-16 positions" {
     const before = "a¶↉🠁";
-    const after = "a¶🠁!";
-    var text_edits = try edits(testing.allocator, before, after, .@"utf-16");
-    defer deinitTextEdits(testing.allocator, &text_edits);
+    const after = "a¶!🠁";
+    var changes = try textChanges(testing.allocator, before, after, .@"utf-16");
+    defer changes.deinit(testing.allocator);
 
-    const applied = try applyTextEdits(testing.allocator, before, text_edits.items, .@"utf-16");
+    const applied = try applyContentChanges(testing.allocator, before, changes.items, .@"utf-16");
     defer testing.allocator.free(applied);
 
-    try expect(text_edits.items.len >= 1);
+    try expectEqual(@as(usize, 1), changes.items.len);
     try expectEqualStrings(after, applied);
+    const change = changes.items[0].text_document_content_change_partial;
+    try expectEqualDeep(types.Range{
+        .start = .{ .line = 0, .character = 2 },
+        .end = .{ .line = 0, .character = 3 },
+    }, change.range);
+    try expectEqualStrings("!", change.text);
 }
 
 test "apply content changes handles whole document replacement" {
@@ -393,7 +512,28 @@ test "input edit handles utf-16 positions over multibyte text" {
         .new_end_byte = 4,
         .start_point = .{ .row = 0, .column = 3 },
         .old_end_point = .{ .row = 0, .column = 6 },
-        .new_end_point = .{ .row = 0, .column = 1 },
+        .new_end_point = .{ .row = 0, .column = 4 },
+    }, input_edit);
+}
+
+test "input edit keeps same-line new end after nonzero column insert" {
+    const partial = types.TextDocumentContentChangeEvent{ .text_document_content_change_partial = .{
+        .range = .{
+            .start = .{ .line = 0, .character = 4 },
+            .end = .{ .line = 0, .character = 4 },
+        },
+        .rangeLength = 0,
+        .text = " ::= TOKEN",
+    } };
+    const input_edit = inputEditForPartialChange("rule.", partial.text_document_content_change_partial, .@"utf-8");
+
+    try expectEqualDeep(ts.InputEdit{
+        .start_byte = 4,
+        .old_end_byte = 4,
+        .new_end_byte = 14,
+        .start_point = .{ .row = 0, .column = 4 },
+        .old_end_point = .{ .row = 0, .column = 4 },
+        .new_end_point = .{ .row = 0, .column = 14 },
     }, input_edit);
 }
 
@@ -456,25 +596,13 @@ test "apply content changes with edits handles last full text and trailing parti
     try expectEqualStrings("calc ::= term", applied_change.text);
 }
 
-test "edits output matches expected utf-8 replace range" {
-    const before = "calc ::= expr";
-    const after = "start ::= expr";
-    var text_edits = try edits(testing.allocator, before, after, .@"utf-8");
-    defer deinitTextEdits(testing.allocator, &text_edits);
-
-    const applied = try applyTextEdits(testing.allocator, before, text_edits.items, .@"utf-8");
-    defer testing.allocator.free(applied);
-
-    try expect(text_edits.items.len >= 2);
-    try expectEqualDeep(types.Position{ .line = 0, .character = 0 }, text_edits.items[0].range.start);
-    try expectEqualStrings(after, applied);
-}
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const OOM = std.mem.Allocator.Error;
 const lsp = @import("lsp");
 const types = lsp.types.flat;
-const DiffMatchPatch = @import("dmp");
+const dmp = @import("dmp");
+const Diff = dmp.Diff;
+const Edit = dmp.Edit;
 const ts = @import("tree-sitter");

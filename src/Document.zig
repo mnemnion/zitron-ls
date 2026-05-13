@@ -452,6 +452,33 @@ test "updateIncremental preserves parse correctness" {
     try expect(!document.parsed.has_error);
 }
 
+test "updateIncremental accepts same-line insert after nonzero column" {
+    var document = try Document.init(testing_allocator, 1, "rule.");
+    defer document.deinit(testing_allocator);
+
+    const insert_position = lsp.offsets.indexToPosition(document.source, 4, .@"utf-8");
+    try document.updateIncremental(
+        testing_allocator,
+        2,
+        &.{
+            .{ .text_document_content_change_partial = .{
+                .range = .{
+                    .start = insert_position,
+                    .end = insert_position,
+                },
+                .rangeLength = 0,
+                .text = " ::= TOKEN",
+            } },
+        },
+        .@"utf-8",
+    );
+
+    try expectEqual(@as(i32, 2), document.version);
+    try expectEqualStrings("rule ::= TOKEN.", document.source);
+    try expectEqualStrings("source_file", document.parsed.root_kind);
+    try expect(!document.parsed.has_error);
+}
+
 test "resolution and references work without server" {
     const sample =
         \\calc ::= expr.

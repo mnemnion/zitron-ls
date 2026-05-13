@@ -256,23 +256,22 @@ fn middlewareSyncDocument(
     }
 
     if (doc.opened) {
-        var text_edits = try diff.edits(middleware.allocator, doc.generated_text, generated.stdout, .@"utf-8");
-        defer diff.deinitTextEdits(middleware.allocator, &text_edits);
+        var text_changes = try diff.textChanges(middleware.allocator, doc.generated_text, generated.stdout, .@"utf-8");
+        defer text_changes.deinit(middleware.allocator);
 
-        const content_changes = try textEditsToContentChanges(middleware.allocator, text_edits.items);
-        defer middleware.allocator.free(content_changes);
-
-        try middleware.zls_transport.transport.writeNotification(
-            middleware.io,
-            middleware.allocator,
-            "textDocument/didChange",
-            lsp.ParamsType("textDocument/didChange"),
-            .{
-                .textDocument = .{ .uri = doc.generated_uri, .version = version },
-                .contentChanges = content_changes,
-            },
-            .{ .emit_null_optional_fields = false },
-        );
+        if (text_changes.items.len != 0) {
+            try middleware.zls_transport.transport.writeNotification(
+                middleware.io,
+                middleware.allocator,
+                "textDocument/didChange",
+                lsp.ParamsType("textDocument/didChange"),
+                .{
+                    .textDocument = .{ .uri = doc.generated_uri, .version = version },
+                    .contentChanges = text_changes.items,
+                },
+                .{ .emit_null_optional_fields = false },
+            );
+        }
     } else {
         try middleware.zls_transport.transport.writeNotification(
             middleware.io,
@@ -1028,20 +1027,6 @@ fn runZitron(
         .stdout = stdout,
         .stderr = stderr,
     };
-}
-
-fn textEditsToContentChanges(
-    allocator: std.mem.Allocator,
-    text_edits: []const types.TextEdit,
-) OOM![]types.TextDocumentContentChangeEvent {
-    const content_changes = try allocator.alloc(types.TextDocumentContentChangeEvent, text_edits.len);
-    for (text_edits, content_changes) |edit, *change| {
-        change.* = .{ .text_document_content_change_partial = .{
-            .range = edit.range,
-            .text = edit.newText,
-        } };
-    }
-    return content_changes;
 }
 
 fn filePathFromUri(allocator: std.mem.Allocator, uri: []const u8) Error![]u8 {

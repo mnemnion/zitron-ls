@@ -116,6 +116,36 @@ pub fn main(init: std.process.Init) Error!void {
         .{ .emit_null_optional_fields = false },
     );
 
+    const expect_anchor = try positionOfText(fixture_text, "    try std.testing.expectApproxEqAbs");
+    try transport.transport.writeNotification(
+        init.io,
+        allocator,
+        "textDocument/didChange",
+        lsp.ParamsType("textDocument/didChange"),
+        .{
+            .textDocument = .{
+                .uri = fixture_uri,
+                .version = 3,
+            },
+            .contentChanges = &.{
+                .{ .text_document_content_change_partial = .{
+                    .range = .{
+                        .start = expect_anchor,
+                        .end = expect_anchor,
+                    },
+                    .rangeLength = 0,
+                    .text =
+                    \\    const smoke_a = 1;
+                    \\    const smoke_b = smoke_a + 1;
+                    \\    _ = smoke_b;
+                    \\
+                    ,
+                } },
+            },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+
     try transport.transport.writeRequest(
         init.io,
         allocator,
