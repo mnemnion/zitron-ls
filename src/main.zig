@@ -1,7 +1,7 @@
 //! Main executable of lsp_zitron.
 
 pub fn main(init: std.process.Init) Error!void {
-    var server = try zitron.Server.init(init.gpa);
+    var server = try zitron.Server.initProduction(init.io, init.gpa);
     defer server.deinit();
 
     var read_buffer: [4096]u8 = undefined;

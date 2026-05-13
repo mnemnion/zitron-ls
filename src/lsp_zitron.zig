@@ -44,13 +44,14 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
 /// LSP server state and handlers for Zitron grammars.
 pub const Server = struct {
     /// Errors produced while parsing or updating server-managed documents.
-    pub const Error = Document.Error;
+    pub const Error = Document.Error || ZigMiddleware.Error;
 
     allocator: std.mem.Allocator,
     scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(Document),
     tags_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
+    zig_middleware: ZigMiddleware,
 
     /// Creates a server instance and compiles the grammar tag query.
     pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
@@ -64,11 +65,21 @@ pub const Server = struct {
             .documents = .empty,
             .tags_query = tags_query,
             .offset_encoding = .@"utf-16",
+            .zig_middleware = ZigMiddleware.disabled(),
         };
+    }
+
+    /// Creates a server instance with the production Zig middleware enabled.
+    pub fn initProduction(io: std.Io, allocator: std.mem.Allocator) Error!Server {
+        var server = try init(allocator);
+        errdefer server.deinit();
+        server.zig_middleware = try ZigMiddleware.init(io, allocator);
+        return server;
     }
 
     /// Releases all document state and query resources owned by the server.
     pub fn deinit(server: *Server) void {
+        server.zig_middleware.deinit();
         var it = server.documents.iterator();
         while (it.next()) |entry| {
             server.allocator.free(entry.key_ptr.*);
@@ -125,6 +136,11 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        try server.zig_middleware.syncDocument(
+            params.textDocument.uri,
+            params.textDocument.version,
+            params.textDocument.text,
+        );
     }
 
     /// LSP `textDocument/didChange` handler that applies incremental document changes.
@@ -140,6 +156,11 @@ pub const Server = struct {
             params.contentChanges,
             server.offset_encoding,
         );
+        try server.zig_middleware.syncDocument(
+            params.textDocument.uri,
+            params.textDocument.version,
+            doc.source,
+        );
     }
 
     /// LSP `textDocument/didClose` handler that drops cached document state.
@@ -148,6 +169,7 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidCloseTextDocumentParams,
     ) void {
+        server.zig_middleware.closeDocument(params.textDocument.uri);
         server.removeDocument(params.textDocument.uri);
     }
 
@@ -156,8 +178,12 @@ pub const Server = struct {
         server: *Server,
         arena: std.mem.Allocator,
         params: types.CompletionParams,
-    ) OOM!lsp.ResultType("textDocument/completion") {
+    ) Error!lsp.ResultType("textDocument/completion") {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
+            return try server.zig_middleware.forwardCompletion(arena, params.textDocument.uri, params);
+        }
+
         const items = try completion.completeDirectives(
             arena,
             doc.source,
@@ -173,12 +199,11 @@ pub const Server = struct {
         server: *Server,
         arena: std.mem.Allocator,
         params: types.HoverParams,
-    ) OOM!?types.Hover {
+    ) Error!?types.Hover {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
-
         const value = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => return null,
-            .unsupported_zig_code => return null,
+            .unsupported_zig_code => return try server.zig_middleware.forwardHover(arena, params.textDocument.uri, params),
             .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol),
         };
 
@@ -195,14 +220,13 @@ pub const Server = struct {
     /// LSP `textDocument/definition` handler for grammar symbol lookups.
     pub fn @"textDocument/definition"(
         server: *Server,
-        _: std.mem.Allocator,
+        arena: std.mem.Allocator,
         params: types.DefinitionParams,
-    ) lsp.ResultType("textDocument/definition") {
+    ) Error!lsp.ResultType("textDocument/definition") {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
-
         return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
-            .unsupported_zig_code => null,
+            .unsupported_zig_code => try server.zig_middleware.forwardDefinition(arena, params.textDocument.uri, params),
             .symbol => |symbol| switch (symbol.kind) {
                 .rule_definition, .action_definition => .{
                     .definition = .{
@@ -243,12 +267,11 @@ pub const Server = struct {
         server: *Server,
         arena: std.mem.Allocator,
         params: types.ReferenceParams,
-    ) OOM!lsp.ResultType("textDocument/references") {
+    ) Error!lsp.ResultType("textDocument/references") {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
-
         return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
-            .unsupported_zig_code => null,
+            .unsupported_zig_code => try server.zig_middleware.forwardReferences(arena, params.textDocument.uri, params),
             .symbol => |symbol| try doc.findReferences(
                 server.tags_query,
                 arena,
@@ -579,6 +602,51 @@ test "query resolution returns unsupported inside zig code" {
     try expectEqual(Document.Resolution.unsupported_zig_code, resolution);
 }
 
+test "disabled Zig middleware returns null for Zig-code requests" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
+    defer testing_allocator.free(sample);
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/calc.zy",
+            .languageId = .{ .custom_value = "zitron" },
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const position = try positionOfText(sample, "answer = A");
+    const hover = try server.@"textDocument/hover"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = position,
+    });
+    try expect(hover == null);
+
+    const definition = try server.@"textDocument/definition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = position,
+    });
+    try expect(definition == null);
+
+    const references = try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = position,
+        .context = .{ .includeDeclaration = false },
+    });
+    try expect(references == null);
+
+    const completion_result = try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = position,
+    });
+    try expect(completion_result == null);
+}
+
 test "hover definition and references operate on stored live document state" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -609,7 +677,7 @@ test "hover definition and references operate on stored live document state" {
     }
 
     const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
-    const definition = (server.@"textDocument/definition"(testing_allocator, .{
+    const definition = (try server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
     })) orelse return error.UnexpectedDefinitionTarget;
@@ -669,7 +737,7 @@ test "named action definitions resolve in the same document" {
 
     const definition_target = try positionOfText(sample, "@vector_form(F;V)");
     const definition_position = try positionOfText(sample, "vector_form(F;V)");
-    const definition = (server.@"textDocument/definition"(testing_allocator, .{
+    const definition = (try server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/named_actions.zy" },
         .position = definition_position,
     })) orelse return error.UnexpectedDefinitionTarget;
@@ -686,7 +754,7 @@ test "named action definitions resolve in the same document" {
 
     const implementation_anchor = try byteIndexOf(sample, "%impl @vector_form(F;V)");
     const implementation_position = try positionOfTextAfter(sample, implementation_anchor + 1, "vector_form(F;V)");
-    const implementation_definition = (server.@"textDocument/definition"(testing_allocator, .{
+    const implementation_definition = (try server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/named_actions.zy" },
         .position = implementation_position,
     })) orelse return error.UnexpectedDefinitionTarget;
@@ -708,7 +776,7 @@ test "named action definitions resolve in the same document" {
     try server.putDocument("file:///samples/missing_named_action.zy", 1, missing_definition_sample);
     const missing_anchor = try byteIndexOf(missing_definition_sample, "%impl @other_action()");
     const missing_position = try positionOfTextAfter(missing_definition_sample, missing_anchor + 1, "other_action()");
-    const missing_result = server.@"textDocument/definition"(testing_allocator, .{
+    const missing_result = try server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/missing_named_action.zy" },
         .position = missing_position,
     });
@@ -738,7 +806,7 @@ test "definition on discard resolves that rule instead of a neighbor" {
         else => return error.UnexpectedResolution,
     }
 
-    const definition = (server.@"textDocument/definition"(testing_allocator, .{
+    const definition = (try server.@"textDocument/definition"(testing_allocator, .{
         .textDocument = .{ .uri = "file:///samples/discard.zy" },
         .position = reference_position,
     })) orelse return error.UnexpectedDefinitionTarget;
@@ -773,6 +841,7 @@ test "initialize negotiates position encoding" {
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
 const Document = @import("Document.zig");
+const ZigMiddleware = @import("ZigMiddleware.zig");
 const completion = @import("completion.zig");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
@@ -781,3 +850,8 @@ const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
 const zitron_grammar = @import("tree_sitter_zitron");
 const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";
+
+comptime {
+    std.testing.refAllDecls(Document);
+    std.testing.refAllDecls(ZigMiddleware);
+}
