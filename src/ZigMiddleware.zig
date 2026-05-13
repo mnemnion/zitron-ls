@@ -249,8 +249,11 @@ fn middlewareSyncDocument(
     }
     errdefer middleware.allocator.free(generated.stdout);
 
-    var line_map = try LineMap.parse(middleware.allocator, generated.stdout, doc.source_path);
-    errdefer line_map.deinit(middleware.allocator);
+    if (doc.line_map) |*line_map| {
+        try line_map.update(middleware.allocator, generated.stdout, doc.source_path);
+    } else {
+        doc.line_map = try LineMap.parse(middleware.allocator, generated.stdout, doc.source_path);
+    }
 
     if (doc.opened) {
         var text_edits = try diff.edits(middleware.allocator, doc.generated_text, generated.stdout, .@"utf-8");
@@ -290,9 +293,7 @@ fn middlewareSyncDocument(
     }
 
     middleware.allocator.free(doc.generated_text);
-    if (doc.line_map) |*old_map| old_map.deinit(middleware.allocator);
     doc.generated_text = generated.stdout;
-    doc.line_map = line_map;
 }
 
 fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
@@ -319,12 +320,13 @@ fn middlewareForwardHover(
     params: types.HoverParams,
 ) Error!?types.Hover {
     const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = doc.line_map.?.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/hover", mapped);
-    if (result) |*hover_result| translateHover(hover_result, doc.line_map.?);
+    if (result) |*hover_result| translateHover(hover_result, line_map);
     return result;
 }
 
@@ -335,12 +337,13 @@ fn middlewareForwardDefinition(
     params: types.DefinitionParams,
 ) Error!lsp.ResultType("textDocument/definition") {
     const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = doc.line_map.?.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/definition", mapped)) orelse return null;
-    return try translateDefinition(arena, result, doc.line_map.?, doc.generated_uri, doc.source_uri);
+    return try translateDefinition(arena, result, line_map, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardReferences(
@@ -350,12 +353,13 @@ fn middlewareForwardReferences(
     params: types.ReferenceParams,
 ) Error!lsp.ResultType("textDocument/references") {
     const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = doc.line_map.?.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse return null;
-    return try translateLocations(arena, result, doc.line_map.?, doc.generated_uri, doc.source_uri);
+    return try translateLocations(arena, result, line_map, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardCompletion(
@@ -365,105 +369,123 @@ fn middlewareForwardCompletion(
     params: types.CompletionParams,
 ) Error!lsp.ResultType("textDocument/completion") {
     const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = doc.line_map.?.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/completion", mapped);
-    try translateCompletionResult(arena, &result, doc.line_map.?);
+    try translateCompletionResult(arena, &result, line_map);
     return result;
 }
 
 /// Bidirectional line mapping derived from Zitron `// #line` comments.
 pub const LineMap = struct {
-    entries: []Entry,
+    /// Spans are stored in generated-line order, which is the order encountered
+    /// while scanning the generated Zig file.
+    spans: std.ArrayList(Span) = .empty,
+    /// Indexes into `spans`, sorted by source-line order for source -> generated
+    /// lookups. The buffer is retained across updates.
+    source_order: std.ArrayList(usize) = .empty,
 
-    // TODO: make this less crappy.  O(logₙ), not O(n).  Range map.
-    // Are we actually just making one entry per translation line? that's nuts.
-    // We should have leaf entries for each _range_, and the nodes direct either
-    // coordinate toward the leaf which translates it.
-    // ---
-    // Furthermore, we don't need to throw it away every time: it should be quite
-    // possible to reuse it, rarely creating new leaves when new blocks appear, and
-    // most usually just checking that nothing has changed, or, adjusting everything
-    // downstream from whatever did change.  This needs to be much, much better than
-    // it is.
+    // TODO: this should also retain the offsets which begin and end each
+    // translated code block (we don't care about the template code, only the
+    // translated code). that won't be used immediately, but we need it, and
+    // this is when we're traversing the generated text, so we get it now.
 
-    // TODO: this should also retain the offsets which begin and end each translated
-    // code block (we don't care about the template code, only the translated code).
-    // that won't be used immediately, but we need it, and this is when we're traversing
-    // the generated text, so we get it now.
-
-    const Entry = struct {
-        generated_line: u32,
+    /// One contiguous translated range.  The source and generated ranges have
+    /// the same length, so one object records both coordinate systems.
+    const Span = struct {
+        /// First zero-based line in the original `.zy` document.
         source_line: u32,
+        /// First zero-based line in the generated Zig document.
+        generated_line: u32,
+        /// Number of contiguous mapped lines shared by both coordinate systems.
+        line_count: u32,
+
+        /// Exclusive source-line end.  Keeping this as a helper avoids repeating
+        /// the half-open interval convention at every lookup site.
+        fn sourceEnd(span: Span) u32 {
+            return span.source_line + span.line_count;
+        }
+
+        /// Exclusive generated-line end, matching `sourceEnd` in length.
+        fn generatedEnd(span: Span) u32 {
+            return span.generated_line + span.line_count;
+        }
+
+        /// Compares a source line against this half-open span.
+        fn orderSource(span: Span, line: u32) std.math.Order {
+            if (line < span.source_line) return .lt;
+            if (line < span.sourceEnd()) return .eq;
+            return .gt;
+        }
+
+        /// Compares a generated line against this half-open span.
+        fn orderGenerated(span: Span, line: u32) std.math.Order {
+            if (line < span.generated_line) return .lt;
+            if (line < span.generatedEnd()) return .eq;
+            return .gt;
+        }
     };
 
+    /// Parses generated Zig into an initial map by delegating to `update`, so the
+    /// initial build and incremental rebuild use the same span coalescing rules.
     pub fn parse(allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!LineMap {
-        var entries: std.ArrayList(Entry) = .empty;
-        errdefer entries.deinit(allocator);
-
-        var generated_line: u32 = 0;
-        var active_source_line: ?u32 = null;
-        var lines = std.mem.splitScalar(u8, generated_text, '\n');
-        while (lines.next()) |line| : (generated_line += 1) {
-            if (parseLineDirective(line)) |directive| {
-                active_source_line = if (std.mem.eql(u8, directive.path, source_path))
-                    directive.line
-                else
-                    null;
-                continue;
-            }
-
-            if (active_source_line) |source_line| {
-                try entries.append(allocator, .{
-                    .generated_line = generated_line,
-                    .source_line = source_line,
-                });
-                active_source_line = source_line + 1;
-            }
-        }
-
-        return .{ .entries = try entries.toOwnedSlice(allocator) };
+        var map: LineMap = .{};
+        errdefer map.deinit(allocator);
+        try map.update(allocator, generated_text, source_path);
+        return map;
     }
 
+    /// Rebuilds this map from freshly generated Zig while retaining the backing
+    /// allocations. The number of spans should usually stay stable, so this avoids
+    /// churn without carrying incremental tree state.
+    pub fn update(map: *LineMap, allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!void {
+        map.spans.clearRetainingCapacity();
+        map.source_order.clearRetainingCapacity();
+
+        try map.collectSpans(allocator, generated_text, source_path);
+        try map.rebuildSourceOrder(allocator);
+    }
+
+    /// Frees the reusable span and index buffers.
     pub fn deinit(map: *LineMap, allocator: std.mem.Allocator) void {
-        allocator.free(map.entries);
+        map.spans.deinit(allocator);
+        map.source_order.deinit(allocator);
+        map.* = .{};
     }
 
-    pub fn sourcePositionToGenerated(map: LineMap, position: types.Position) ?types.Position {
-        for (map.entries) |entry| {
-            if (entry.source_line == position.line) {
-                return .{
-                    .line = entry.generated_line,
-                    .character = position.character,
-                };
-            }
-        }
-
-        return null;
+    /// Translates a source position to generated coordinates by finding the
+    /// earliest span that contains the source line and preserving the column.
+    pub fn sourcePositionToGenerated(map: *const LineMap, position: types.Position) ?types.Position {
+        const span = map.findSource(position.line) orelse return null;
+        return .{
+            .line = span.generated_line + (position.line - span.source_line),
+            .character = position.character,
+        };
     }
 
-    pub fn generatedPositionToSource(map: LineMap, position: types.Position) ?types.Position {
-        for (map.entries) |entry| {
-            if (entry.generated_line == position.line) {
-                return .{
-                    .line = entry.source_line,
-                    .character = position.character,
-                };
-            }
-        }
-
-        return null;
+    /// Translates a generated position back to source coordinates by finding the
+    /// generated-order span containing the generated line and preserving column.
+    pub fn generatedPositionToSource(map: *const LineMap, position: types.Position) ?types.Position {
+        const span = map.findGenerated(position.line) orelse return null;
+        return .{
+            .line = span.source_line + (position.line - span.generated_line),
+            .character = position.character,
+        };
     }
 
-    pub fn generatedRangeToSource(map: LineMap, range: types.Range) ?types.Range {
-        var line = range.start.line;
-        while (line <= range.end.line) : (line += 1) {
-            if (map.generatedPositionToSource(.{
-                .line = line,
-                .character = 0,
-            }) == null) return null;
+    /// Translates a generated range only when every generated line in the range is
+    /// covered by adjacent mapped spans.  Gaps represent template/generated-only
+    /// Zig and cannot be reported as a source range.
+    pub fn generatedRangeToSource(map: *const LineMap, range: types.Range) ?types.Range {
+        var index = map.findGeneratedIndex(range.start.line) orelse return null;
+        while (map.spans.items[index].orderGenerated(range.end.line) != .eq) {
+            const next_index = index + 1;
+            if (next_index >= map.spans.items.len) return null;
+            if (map.spans.items[next_index].generated_line != map.spans.items[index].generatedEnd()) return null;
+            index = next_index;
         }
 
         return .{
@@ -471,13 +493,146 @@ pub const LineMap = struct {
             .end = map.generatedPositionToSource(range.end).?,
         };
     }
+
+    /// Scans generated text for `#line` comments and coalesces consecutive mapped
+    /// lines into generated-order spans.
+    fn collectSpans(map: *LineMap, allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!void {
+        var generated_line: u32 = 0;
+        var active_source_line: ?u32 = null;
+        var active_span: ?Span = null;
+        var lines = std.mem.splitScalar(u8, generated_text, '\n');
+        while (lines.next()) |line| : (generated_line += 1) {
+            if (parseLineDirective(line)) |directive| {
+                if (active_span) |span| try map.spans.append(allocator, span);
+                active_span = null;
+                active_source_line = if (std.mem.eql(u8, directive.path, source_path))
+                    directive.line
+                else
+                    null;
+                continue;
+            }
+
+            const source_line = active_source_line orelse {
+                if (active_span) |span| try map.spans.append(allocator, span);
+                active_span = null;
+                continue;
+            };
+
+            if (active_span) |*span| {
+                if (span.sourceEnd() == source_line and span.generatedEnd() == generated_line) {
+                    span.line_count += 1;
+                } else {
+                    try map.spans.append(allocator, span.*);
+                    active_span = .{
+                        .source_line = source_line,
+                        .generated_line = generated_line,
+                        .line_count = 1,
+                    };
+                }
+            } else {
+                active_span = .{
+                    .source_line = source_line,
+                    .generated_line = generated_line,
+                    .line_count = 1,
+                };
+            }
+            active_source_line = source_line + 1;
+        }
+
+        if (active_span) |span| try map.spans.append(allocator, span);
+    }
+
+    /// Rebuilds the source-order index over the current span buffer.
+    fn rebuildSourceOrder(map: *LineMap, allocator: std.mem.Allocator) OOM!void {
+        try map.source_order.ensureTotalCapacity(allocator, map.spans.items.len);
+        for (0..map.spans.items.len) |index| {
+            try map.source_order.append(allocator, index);
+        }
+        std.mem.sort(usize, map.source_order.items, map.spans.items, sourceIndexLessThan);
+    }
+
+    /// Returns the number of spans in the map.  Tests use this to assert
+    /// that multi-line ranges stay coalesced instead of becoming per-line nodes.
+    fn len(map: *const LineMap) usize {
+        return map.spans.items.len;
+    }
+
+    /// Finds a generated-order span containing a generated line.
+    fn findGenerated(map: *const LineMap, line: u32) ?Span {
+        const index = map.findGeneratedIndex(line) orelse return null;
+        return map.spans.items[index];
+    }
+
+    /// Finds the index of a generated-order span containing a generated line.
+    fn findGeneratedIndex(map: *const LineMap, line: u32) ?usize {
+        var low: usize = 0;
+        var high: usize = map.spans.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (map.spans.items[mid].orderGenerated(line)) {
+                .lt => high = mid,
+                .eq => return mid,
+                .gt => low = mid + 1,
+            }
+        }
+
+        return null;
+    }
+
+    /// Finds the earliest generated span containing a source line.
+    fn findSource(map: *const LineMap, line: u32) ?Span {
+        const index = map.findSourceIndex(line) orelse return null;
+        return map.spans.items[map.source_order.items[index]];
+    }
+
+    fn spanInSourceOrder(map: *const LineMap, index: usize) Span {
+        return map.spans.items[map.source_order.items[index]];
+    }
+
+    /// Finds the source-order index of the earliest generated span containing a
+    /// source line.
+    fn findSourceIndex(map: *const LineMap, line: u32) ?usize {
+        var low: usize = 0;
+        var high: usize = map.source_order.items.len;
+        var found: ?usize = null;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const span = map.spanInSourceOrder(mid);
+            switch (span.orderSource(line)) {
+                .lt => high = mid,
+                .eq => {
+                    found = mid;
+                    high = mid;
+                },
+                .gt => low = mid + 1,
+            }
+        }
+        return found;
+    }
+
+    /// Sorts source indexes by source start, then generated start.  The
+    /// generated tie-breaker makes duplicate source lines choose the earliest
+    /// generated mapping.
+    fn sourceIndexLessThan(spans: []const Span, lhs_index: usize, rhs_index: usize) bool {
+        const lhs = spans[lhs_index];
+        const rhs = spans[rhs_index];
+        if (lhs.source_line != rhs.source_line) return lhs.source_line < rhs.source_line;
+        if (lhs.generated_line != rhs.generated_line) return lhs.generated_line < rhs.generated_line;
+        return lhs_index < rhs_index;
+    }
 };
 
+/// Parsed form of a generated `// #line N path` marker.  Zitron emits these
+/// markers as the only bridge between generated Zig and original Zitron source.
 const LineDirective = struct {
+    /// One-based line from the directive, normalized to zero-based LSP lines.
     line: u32,
+    /// Path payload from the directive; only spans for the source `.zy` path are
+    /// mapped back to the client document.
     path: []const u8,
 };
 
+/// Recognizes the exact generated-line marker format used by Zitron.
 fn parseLineDirective(line: []const u8) ?LineDirective {
     const trimmed = trimLeft(line, " \t");
     const prefix = "// #line ";
@@ -495,6 +650,8 @@ fn parseLineDirective(line: []const u8) ?LineDirective {
     };
 }
 
+/// Removes a small set of leading bytes without allocating.  Directive parsing
+/// uses this so indentation before comments does not break mapping.
 fn trimLeft(slice: []const u8, values_to_strip: []const u8) []const u8 {
     var index: usize = 0;
     while (index < slice.len and std.mem.indexOfScalar(u8, values_to_strip, slice[index]) != null) {
@@ -503,7 +660,7 @@ fn trimLeft(slice: []const u8, values_to_strip: []const u8) []const u8 {
     return slice[index..];
 }
 
-pub fn translateHover(hover_result: *types.Hover, map: LineMap) void {
+pub fn translateHover(hover_result: *types.Hover, map: *const LineMap) void {
     if (hover_result.range) |range| {
         hover_result.range = map.generatedRangeToSource(range);
     }
@@ -512,7 +669,7 @@ pub fn translateHover(hover_result: *types.Hover, map: LineMap) void {
 pub fn translateDefinition(
     arena: std.mem.Allocator,
     definition_result: lsp.types.Definition.Result,
-    map: LineMap,
+    map: *const LineMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?lsp.types.Definition.Result {
@@ -538,7 +695,7 @@ pub fn translateDefinition(
 pub fn translateDefinitionValue(
     arena: std.mem.Allocator,
     definition_result: types.Definition,
-    map: LineMap,
+    map: *const LineMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.Definition {
@@ -563,7 +720,7 @@ pub fn translateDefinitionValue(
 
 fn translateDefinitionLink(
     link: types.DefinitionLink,
-    map: LineMap,
+    map: *const LineMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) ?types.DefinitionLink {
@@ -579,7 +736,7 @@ fn translateDefinitionLink(
 pub fn translateLocations(
     arena: std.mem.Allocator,
     locations: []const types.Location,
-    map: LineMap,
+    map: *const LineMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?[]const types.Location {
@@ -596,7 +753,7 @@ pub fn translateLocations(
 pub fn translateCompletionResult(
     arena: std.mem.Allocator,
     result: *lsp.ResultType("textDocument/completion"),
-    map: LineMap,
+    map: *const LineMap,
 ) OOM!void {
     const completion_result = result.* orelse return;
     switch (completion_result) {
@@ -616,7 +773,7 @@ pub fn translateCompletionResult(
     }
 }
 
-fn translateLocation(location: types.Location, map: LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
+fn translateLocation(location: types.Location, map: *const LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
         .uri = source_uri,
@@ -627,7 +784,7 @@ fn translateLocation(location: types.Location, map: LineMap, generated_uri: []co
 fn translateCompletionItems(
     arena: std.mem.Allocator,
     items_const: []const types.CompletionItem,
-    map: LineMap,
+    map: *const LineMap,
 ) OOM![]const types.CompletionItem {
     const items = try arena.dupe(types.CompletionItem, items_const);
     for (items) |*item| {
@@ -652,7 +809,7 @@ fn translateCompletionItems(
     return items;
 }
 
-fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: LineMap) ?types.CompletionItem.TextEdit {
+fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *const LineMap) ?types.CompletionItem.TextEdit {
     return switch (text_edit) {
         .text_edit => |edit| .{ .text_edit = translateTextEdit(edit, map) orelse return null },
         .insert_replace_edit => |edit| .{ .insert_replace_edit = .{
@@ -665,7 +822,7 @@ fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: Li
 
 fn translateCompletionDefaultEditRange(
     edit_range: lsp.types.ClientCapabilities.TextDocument.Completion.EditRange,
-    map: LineMap,
+    map: *const LineMap,
 ) ?lsp.types.ClientCapabilities.TextDocument.Completion.EditRange {
     return switch (edit_range) {
         .range => |range| .{ .range = map.generatedRangeToSource(range) orelse return null },
@@ -676,7 +833,7 @@ fn translateCompletionDefaultEditRange(
     };
 }
 
-fn translateTextEdit(edit: types.TextEdit, map: LineMap) ?types.TextEdit {
+fn translateTextEdit(edit: types.TextEdit, map: *const LineMap) ?types.TextEdit {
     return .{
         .range = map.generatedRangeToSource(edit.range) orelse return null,
         .newText = edit.newText,
@@ -955,6 +1112,123 @@ test "line map translates only fully mapped generated ranges" {
     }));
 }
 
+test "line map stores one span for a multi-line mapped range" {
+    const generated =
+        \\// #line 20 source.zy
+        \\const a = 1;
+        \\const b = 2;
+        \\const c = 3;
+    ;
+
+    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try expectEqual(@as(usize, 1), map.len());
+    try expectEqual(@as(u32, 3), map.spans.items[0].line_count);
+    try expectEqual(types.Position{ .line = 21, .character = 9 }, map.generatedPositionToSource(.{
+        .line = 3,
+        .character = 9,
+    }).?);
+}
+
+test "line map update reuses allocation and applies changed spans" {
+    const original =
+        \\// #line 10 source.zy
+        \\const a = 1;
+        \\const b = 2;
+        \\// #line 20 source.zy
+        \\const c = 3;
+        \\// #line 30 source.zy
+        \\const d = 4;
+    ;
+
+    var map = try LineMap.parse(testing_allocator, original, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const spans_capacity = map.spans.capacity;
+    const source_order_capacity = map.source_order.capacity;
+
+    try map.update(testing_allocator, original, "source.zy");
+    try expectEqual(spans_capacity, map.spans.capacity);
+    try expectEqual(source_order_capacity, map.source_order.capacity);
+
+    const shifted =
+        \\// #line 10 source.zy
+        \\const a = 1;
+        \\const b = 2;
+        \\// #line 80 source.zig
+        \\const generated_only = true;
+        \\// #line 21 source.zy
+        \\const c = 3;
+        \\// #line 90 source.zig
+        \\// #line 33 source.zy
+        \\const d = 4;
+    ;
+    try map.update(testing_allocator, shifted, "source.zy");
+
+    try expectEqual(spans_capacity, map.spans.capacity);
+    try expectEqual(source_order_capacity, map.source_order.capacity);
+    try expectEqual(types.Position{ .line = 20, .character = 4 }, map.generatedPositionToSource(.{
+        .line = 6,
+        .character = 4,
+    }).?);
+    try expectEqual(types.Position{ .line = 32, .character = 4 }, map.generatedPositionToSource(.{
+        .line = 9,
+        .character = 4,
+    }).?);
+    try expectEqual(types.Position{ .line = 9, .character = 4 }, map.sourcePositionToGenerated(.{
+        .line = 32,
+        .character = 4,
+    }).?);
+}
+
+test "line map update retains capacity after growing and shrinking" {
+    const one_span =
+        \\// #line 10 source.zy
+        \\const a = 1;
+    ;
+    const two_spans =
+        \\// #line 10 source.zy
+        \\const a = 1;
+        \\// #line 20 source.zy
+        \\const b = 2;
+    ;
+
+    var map = try LineMap.parse(testing_allocator, one_span, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try map.update(testing_allocator, two_spans, "source.zy");
+    try expectEqual(@as(usize, 2), map.len());
+    const grown_spans_capacity = map.spans.capacity;
+    const grown_source_order_capacity = map.source_order.capacity;
+
+    try map.update(testing_allocator, one_span, "source.zy");
+    try expectEqual(@as(usize, 1), map.len());
+    try expectEqual(grown_spans_capacity, map.spans.capacity);
+    try expectEqual(grown_source_order_capacity, map.source_order.capacity);
+}
+
+test "line map source lookup chooses the earliest generated duplicate" {
+    const generated =
+        \\// #line 5 source.zy
+        \\const first = 1;
+        \\// #line 5 source.zy
+        \\const second = 2;
+    ;
+
+    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try expectEqual(types.Position{ .line = 1, .character = 6 }, map.sourcePositionToGenerated(.{
+        .line = 4,
+        .character = 6,
+    }).?);
+    try expectEqual(types.Position{ .line = 4, .character = 6 }, map.generatedPositionToSource(.{
+        .line = 3,
+        .character = 6,
+    }).?);
+}
+
 test "translates hover and definition results back to source ranges" {
     const generated =
         \\// #line 5 source.zy
@@ -970,7 +1244,7 @@ test "translates hover and definition results back to source ranges" {
             .end = .{ .line = 1, .character = 12 },
         },
     };
-    translateHover(&hover_result, map);
+    translateHover(&hover_result, &map);
     try expectEqual(types.Range{
         .start = .{ .line = 4, .character = 6 },
         .end = .{ .line = 4, .character = 12 },
@@ -986,7 +1260,7 @@ test "translates hover and definition results back to source ranges" {
     const translated = try translateDefinition(
         testing_allocator,
         .{ .definition = definition },
-        map,
+        &map,
         "file:///source.zitron.zig",
         "file:///source.zy",
     );
@@ -1030,7 +1304,7 @@ test "translates completion edits back to source ranges" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try translateCompletionResult(arena_state.allocator(), &result, map);
+    try translateCompletionResult(arena_state.allocator(), &result, &map);
     switch (result.?) {
         .completion_items => |translated| switch (translated[0].textEdit.?) {
             .text_edit => |edit| {
