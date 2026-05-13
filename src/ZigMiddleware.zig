@@ -1,14 +1,37 @@
 //! Zig middleware for generated Zitron parser code.
 
-allocator: std.mem.Allocator,
-io: std.Io,
-zls_child: std.process.Child,
-zls_transport: lsp.Transport.Stdio,
-zls_read_buffer: []u8,
-documents: std.StringHashMapUnmanaged(GeneratedDocument),
-next_request_id: i64,
+mode: Mode,
 
 const ZigMiddleware = @This();
+
+const Mode = union(enum) {
+    disabled,
+    enabled: Middleware,
+};
+
+const Middleware = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zls_child: std.process.Child,
+    zls_transport: lsp.Transport.Stdio,
+    zls_read_buffer: []u8,
+    documents: std.StringHashMapUnmanaged(GeneratedDocument),
+    next_request_id: i64,
+
+    const deinit = middlewareDeinit;
+    const syncDocument = middlewareSyncDocument;
+    const closeDocument = middlewareCloseDocument;
+    const forwardHover = middlewareForwardHover;
+    const forwardDefinition = middlewareForwardDefinition;
+    const forwardReferences = middlewareForwardReferences;
+    const forwardCompletion = middlewareForwardCompletion;
+    const initializeZls = middlewareInitializeZls;
+    const shutdownZls = middlewareShutdownZls;
+    const request = middlewareRequest;
+    const readResponseForId = middlewareReadResponseForId;
+    const nextRequestId = middlewareNextRequestId;
+    const documentReady = middlewareDocumentReady;
+};
 
 pub const Error =
     OOM ||
@@ -47,7 +70,18 @@ const GeneratedDocument = struct {
     }
 };
 
+pub fn disabled() ZigMiddleware {
+    return .{ .mode = .disabled };
+}
+
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
+    return initImpl(io, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => disabled(),
+    };
+}
+
+fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     try checkZitron(allocator, io);
 
     const read_buffer = try allocator.alloc(u8, 4096);
@@ -61,7 +95,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     });
     errdefer child.kill(io);
 
-    var middleware: ZigMiddleware = .{
+    var mware: Middleware = .{
         .allocator = allocator,
         .io = io,
         .zls_child = child,
@@ -70,13 +104,87 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
         .documents = .empty,
         .next_request_id = 1,
     };
-    errdefer middleware.deinit();
+    errdefer mware.deinit();
 
-    try middleware.initializeZls();
-    return middleware;
+    try mware.initializeZls();
+    return .{ .mode = .{ .enabled = mware } };
 }
 
 pub fn deinit(middleware: *ZigMiddleware) void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |*mware| mware.deinit(),
+    }
+}
+
+pub fn syncDocument(
+    middleware: *ZigMiddleware,
+    uri: []const u8,
+    version: i32,
+    source_text: []const u8,
+) Error!void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |*mware| try mware.syncDocument(uri, version, source_text),
+    }
+}
+
+pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |*mware| mware.closeDocument(uri),
+    }
+}
+
+pub fn forwardHover(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.HoverParams,
+) Error!?types.Hover {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardHover(arena, source_uri, params),
+    };
+}
+
+pub fn forwardDefinition(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.DefinitionParams,
+) Error!lsp.ResultType("textDocument/definition") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardDefinition(arena, source_uri, params),
+    };
+}
+
+pub fn forwardReferences(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.ReferenceParams,
+) Error!lsp.ResultType("textDocument/references") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardReferences(arena, source_uri, params),
+    };
+}
+
+pub fn forwardCompletion(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.CompletionParams,
+) Error!lsp.ResultType("textDocument/completion") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardCompletion(arena, source_uri, params),
+    };
+}
+
+fn middlewareDeinit(middleware: *Middleware) void {
     var it = middleware.documents.iterator();
     while (it.next()) |entry| {
         middleware.allocator.free(entry.key_ptr.*);
@@ -89,8 +197,8 @@ pub fn deinit(middleware: *ZigMiddleware) void {
     middleware.allocator.free(middleware.zls_read_buffer);
 }
 
-pub fn syncDocument(
-    middleware: *ZigMiddleware,
+fn middlewareSyncDocument(
+    middleware: *Middleware,
     uri: []const u8,
     version: i32,
     source_text: []const u8,
@@ -187,7 +295,7 @@ pub fn syncDocument(
     doc.line_map = line_map;
 }
 
-pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
+fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
     const removed = middleware.documents.fetchRemove(uri) orelse return;
     middleware.allocator.free(removed.key);
     var doc = removed.value;
@@ -204,8 +312,8 @@ pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
     doc.deinit(middleware.allocator);
 }
 
-pub fn forwardHover(
-    middleware: *ZigMiddleware,
+fn middlewareForwardHover(
+    middleware: *Middleware,
     arena: std.mem.Allocator,
     source_uri: []const u8,
     params: types.HoverParams,
@@ -220,8 +328,8 @@ pub fn forwardHover(
     return result;
 }
 
-pub fn forwardDefinition(
-    middleware: *ZigMiddleware,
+fn middlewareForwardDefinition(
+    middleware: *Middleware,
     arena: std.mem.Allocator,
     source_uri: []const u8,
     params: types.DefinitionParams,
@@ -235,8 +343,8 @@ pub fn forwardDefinition(
     return try translateDefinition(arena, result, doc.line_map.?, doc.generated_uri, doc.source_uri);
 }
 
-pub fn forwardReferences(
-    middleware: *ZigMiddleware,
+fn middlewareForwardReferences(
+    middleware: *Middleware,
     arena: std.mem.Allocator,
     source_uri: []const u8,
     params: types.ReferenceParams,
@@ -250,8 +358,8 @@ pub fn forwardReferences(
     return try translateLocations(arena, result, doc.line_map.?, doc.generated_uri, doc.source_uri);
 }
 
-pub fn forwardCompletion(
-    middleware: *ZigMiddleware,
+fn middlewareForwardCompletion(
+    middleware: *Middleware,
     arena: std.mem.Allocator,
     source_uri: []const u8,
     params: types.CompletionParams,
@@ -271,8 +379,20 @@ pub const LineMap = struct {
     entries: []Entry,
 
     // TODO: make this less crappy.  O(logₙ), not O(n).  Range map.
-    // I don't even understand how this can work, how are we mapping a line
-    // which is inside of a range?  This is sketchy, this doesn't check out.
+    // Are we actually just making one entry per translation line? that's nuts.
+    // We should have leaf entries for each _range_, and the nodes direct either
+    // coordinate toward the leaf which translates it.
+    // ---
+    // Furthermore, we don't need to throw it away every time: it should be quite
+    // possible to reuse it, rarely creating new leaves when new blocks appear, and
+    // most usually just checking that nothing has changed, or, adjusting everything
+    // downstream from whatever did change.  This needs to be much, much better than
+    // it is.
+
+    // TODO: this should also retain the offsets which begin and end each translated
+    // code block (we don't care about the template code, only the translated code).
+    // that won't be used immediately, but we need it, and this is when we're traversing
+    // the generated text, so we get it now.
 
     const Entry = struct {
         generated_line: u32,
@@ -578,7 +698,7 @@ fn checkZitron(allocator: std.mem.Allocator, io: std.Io) Error!void {
     }
 }
 
-fn initializeZls(middleware: *ZigMiddleware) Error!void {
+fn middlewareInitializeZls(middleware: *Middleware) Error!void {
     const id = middleware.nextRequestId();
     try middleware.zls_transport.transport.writeRequest(
         middleware.io,
@@ -609,7 +729,7 @@ fn initializeZls(middleware: *ZigMiddleware) Error!void {
     );
 }
 
-fn shutdownZls(middleware: *ZigMiddleware) Error!void {
+fn middlewareShutdownZls(middleware: *Middleware) Error!void {
     const id = middleware.nextRequestId();
     try middleware.zls_transport.transport.writeRequest(
         middleware.io,
@@ -635,8 +755,8 @@ fn shutdownZls(middleware: *ZigMiddleware) Error!void {
     _ = try middleware.zls_child.wait(middleware.io);
 }
 
-fn request(
-    middleware: *ZigMiddleware,
+fn middlewareRequest(
+    middleware: *Middleware,
     arena: std.mem.Allocator,
     comptime method: []const u8,
     params: lsp.ParamsType(method),
@@ -672,7 +792,7 @@ fn request(
     return typed.value;
 }
 
-fn readResponseForId(middleware: *ZigMiddleware, allocator: std.mem.Allocator, id: lsp.JsonRPCMessage.ID) Error![]u8 {
+fn middlewareReadResponseForId(middleware: *Middleware, allocator: std.mem.Allocator, id: lsp.JsonRPCMessage.ID) Error![]u8 {
     while (true) {
         const json_message = try middleware.zls_transport.transport.readJsonMessage(middleware.io, allocator);
         errdefer allocator.free(json_message);
@@ -692,13 +812,13 @@ fn readResponseForId(middleware: *ZigMiddleware, allocator: std.mem.Allocator, i
     }
 }
 
-fn nextRequestId(middleware: *ZigMiddleware) lsp.JsonRPCMessage.ID {
+fn middlewareNextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
     const id = middleware.next_request_id;
     middleware.next_request_id += 1;
     return .{ .number = id };
 }
 
-fn documentReady(middleware: *ZigMiddleware, source_uri: []const u8) Error!*GeneratedDocument {
+fn middlewareDocumentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
     const doc = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
     if (doc.generation_error != null) return error.RequestFailed;
     if (doc.line_map == null) return error.MissingLineMap;
