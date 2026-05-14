@@ -962,6 +962,9 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
                     .positionEncodings = &.{.@"utf-8"},
                 },
                 .textDocument = .{
+                    .hover = .{
+                        .contentFormat = &.{ .markdown, .plaintext },
+                    },
                     .documentSymbol = .{
                         .hierarchicalDocumentSymbolSupport = true,
                     },
