@@ -7,6 +7,7 @@
 pub const server_name = "lsp_zitron";
 
 const server_version = "0.0.1";
+const zitron_completion_triggers = [_][]const u8{ "%", "(" };
 
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
@@ -23,7 +24,11 @@ fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKi
     };
 }
 
-fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabilities {
+fn serverCapabilities(
+    allocator: std.mem.Allocator,
+    offset_encoding: lsp.offsets.Encoding,
+    zls_completion_triggers: ?[]const []const u8,
+) types.ServerCapabilities {
     return .{
         .positionEncoding = positionEncodingKind(offset_encoding),
         .textDocumentSync = .{
@@ -33,13 +38,41 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
             },
         },
         .completionProvider = .{
-            .triggerCharacters = &.{ "%", "(" },
+            .triggerCharacters = mergeCompletionTriggers(
+                allocator,
+                zls_completion_triggers,
+            ) catch &zitron_completion_triggers,
         },
         .hoverProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
     };
+}
+
+fn mergeCompletionTriggers(
+    allocator: std.mem.Allocator,
+    zls_completion_triggers: ?[]const []const u8,
+) OOM![]const []const u8 {
+    const zls_triggers = zls_completion_triggers orelse return &zitron_completion_triggers;
+
+    var merged: std.ArrayList([]const u8) = .empty;
+    errdefer merged.deinit(allocator);
+    try merged.appendSlice(allocator, &zitron_completion_triggers);
+    for (zls_triggers) |trigger| {
+        if (!containsString(merged.items, trigger)) {
+            try merged.append(allocator, trigger);
+        }
+    }
+
+    return try merged.toOwnedSlice(allocator);
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
 }
 
 /// LSP server state and handlers for Zitron grammars.
@@ -94,7 +127,7 @@ pub const Server = struct {
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         server: *Server,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         params: types.InitializeParams,
     ) types.InitializeResult {
         if (params.capabilities.general) |general| {
@@ -110,7 +143,11 @@ pub const Server = struct {
         }
 
         return .{
-            .capabilities = serverCapabilities(server.offset_encoding),
+            .capabilities = serverCapabilities(
+                allocator,
+                server.offset_encoding,
+                server.zig_middleware.completionTriggerCharacters(),
+            ),
             .serverInfo = .{
                 .name = server_name,
                 .version = server_version,
@@ -481,7 +518,28 @@ fn expectActionAliasCompletion(
 }
 
 test "server capabilities match the implemented handlers" {
-    lsp.basic_server.validateServerCapabilities(Server, serverCapabilities(.@"utf-16"));
+    lsp.basic_server.validateServerCapabilities(
+        Server,
+        serverCapabilities(testing_allocator, .@"utf-16", null),
+    );
+}
+
+test "server capabilities merge zls completion triggers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const capabilities = serverCapabilities(
+        arena_state.allocator(),
+        .@"utf-8",
+        &.{ ".", ":", "(" },
+    );
+    const triggers = capabilities.completionProvider.?.triggerCharacters.?;
+
+    try expectEqual(@as(usize, 4), triggers.len);
+    try expectEqualStrings("%", triggers[0]);
+    try expectEqualStrings("(", triggers[1]);
+    try expectEqualStrings(".", triggers[2]);
+    try expectEqualStrings(":", triggers[3]);
 }
 
 test "embedded tags query compiles for the zitron grammar" {

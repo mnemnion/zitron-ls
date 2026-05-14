@@ -16,6 +16,7 @@ const Middleware = struct {
     zls_transport: lsp.Transport.Stdio,
     zls_read_buffer: []u8,
     documents: std.StringHashMapUnmanaged(GeneratedDocument),
+    zls_completion_triggers: []const []const u8,
     next_request_id: i64,
 
     const deinit = middlewareDeinit;
@@ -103,6 +104,7 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
         .zls_transport = lsp.Transport.Stdio.init(read_buffer, child.stdout.?, child.stdin.?),
         .zls_read_buffer = read_buffer,
         .documents = .empty,
+        .zls_completion_triggers = &.{},
         .next_request_id = 1,
     };
     errdefer mware.deinit();
@@ -116,6 +118,13 @@ pub fn deinit(middleware: *ZigMiddleware) void {
         .disabled => {},
         .enabled => |*mware| mware.deinit(),
     }
+}
+
+pub fn completionTriggerCharacters(middleware: *const ZigMiddleware) ?[]const []const u8 {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| mware.zls_completion_triggers,
+    };
 }
 
 pub fn syncDocument(
@@ -197,6 +206,7 @@ pub fn forwardDocumentSymbols(
 }
 
 fn middlewareDeinit(middleware: *Middleware) void {
+    freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
     var it = middleware.documents.iterator();
     while (it.next()) |entry| {
         middleware.allocator.free(entry.key_ptr.*);
@@ -961,7 +971,34 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
         .{ .emit_null_optional_fields = false },
     );
     const initialize_response = try middleware.readResponseForId(middleware.allocator, id);
-    middleware.allocator.free(initialize_response);
+    defer middleware.allocator.free(initialize_response);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, initialize_response, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const result_value = switch (parsed.value) {
+        .response => |response| switch (response.result_or_error) {
+            .result => |maybe_result| maybe_result,
+            .@"error" => return error.RequestFailed,
+        },
+        else => return error.UnexpectedResponse,
+    };
+    if (result_value == null or result_value.? == .null) return error.UnexpectedResponse;
+
+    const initialize_result = try std.json.parseFromValue(types.InitializeResult, middleware.allocator, result_value.?, .{
+        .ignore_unknown_fields = true,
+    });
+    defer initialize_result.deinit();
+
+    if (initialize_result.value.capabilities.completionProvider) |completion_options| {
+        if (completion_options.triggerCharacters) |trigger_characters| {
+            freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
+            middleware.zls_completion_triggers = try dupeStringSlices(middleware.allocator, trigger_characters);
+        }
+    }
+
     try middleware.zls_transport.transport.writeNotification(
         middleware.io,
         middleware.allocator,
@@ -970,6 +1007,28 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
         .{},
         .{ .emit_null_optional_fields = false },
     );
+}
+
+fn dupeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) OOM![]const []const u8 {
+    if (slices.len == 0) return &.{};
+
+    const owned = try allocator.alloc([]const u8, slices.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |owned_slice| allocator.free(owned_slice);
+        allocator.free(owned);
+    }
+    for (slices, owned) |slice, *dest| {
+        dest.* = try allocator.dupe(u8, slice);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) void {
+    if (slices.len == 0) return;
+    for (slices) |slice| allocator.free(slice);
+    allocator.free(slices);
 }
 
 fn middlewareShutdownZls(middleware: *Middleware) Error!void {
