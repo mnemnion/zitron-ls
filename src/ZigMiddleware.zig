@@ -25,6 +25,7 @@ const Middleware = struct {
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
+    const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
     const initializeZls = middlewareInitializeZls;
     const shutdownZls = middlewareShutdownZls;
     const request = middlewareRequest;
@@ -181,6 +182,17 @@ pub fn forwardCompletion(
     return switch (middleware.mode) {
         .disabled => null,
         .enabled => |*mware| try mware.forwardCompletion(arena, source_uri, params),
+    };
+}
+
+pub fn forwardDocumentSymbols(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+) Error!?[]const types.DocumentSymbol {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardDocumentSymbols(arena, source_uri),
     };
 }
 
@@ -376,6 +388,19 @@ fn middlewareForwardCompletion(
     var result = try middleware.request(arena, "textDocument/completion", mapped);
     try translateCompletionResult(arena, &result, line_map);
     return result;
+}
+
+fn middlewareForwardDocumentSymbols(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+) Error!?[]const types.DocumentSymbol {
+    const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
+    const result = (try middleware.request(arena, "textDocument/documentSymbol", .{
+        .textDocument = .{ .uri = doc.generated_uri },
+    })) orelse return null;
+    return try translateDocumentSymbols(arena, result, line_map);
 }
 
 /// Bidirectional line mapping derived from Zitron `// #line` comments.
@@ -772,12 +797,69 @@ pub fn translateCompletionResult(
     }
 }
 
+pub fn translateDocumentSymbols(
+    arena: std.mem.Allocator,
+    result: lsp.types.DocumentSymbol.Result,
+    map: *const LineMap,
+) OOM!?[]const types.DocumentSymbol {
+    return switch (result) {
+        .document_symbols => |symbols| translateDocumentSymbolSlice(arena, symbols, map),
+        .symbol_informations => null,
+    };
+}
+
 fn translateLocation(location: types.Location, map: *const LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
         .uri = source_uri,
         .range = map.generatedRangeToSource(location.range) orelse return null,
     };
+}
+
+fn translateDocumentSymbolSlice(
+    arena: std.mem.Allocator,
+    symbols: []const types.DocumentSymbol,
+    map: *const LineMap,
+) OOM!?[]const types.DocumentSymbol {
+    var translated: std.ArrayList(types.DocumentSymbol) = .empty;
+    for (symbols) |symbol| {
+        if (startsWithYy(symbol.name)) {
+            if (symbol.children) |children| {
+                if (try translateDocumentSymbolSlice(arena, children, map)) |mapped_children| {
+                    try translated.appendSlice(arena, mapped_children);
+                }
+            }
+            continue;
+        }
+        if (try translateDocumentSymbol(arena, symbol, map)) |mapped| {
+            try translated.append(arena, mapped);
+        }
+    }
+
+    return if (translated.items.len == 0) null else try translated.toOwnedSlice(arena);
+}
+
+fn translateDocumentSymbol(
+    arena: std.mem.Allocator,
+    symbol: types.DocumentSymbol,
+    map: *const LineMap,
+) OOM!?types.DocumentSymbol {
+    return .{
+        .name = symbol.name,
+        .detail = symbol.detail,
+        .kind = symbol.kind,
+        .tags = symbol.tags,
+        .deprecated = symbol.deprecated,
+        .range = map.generatedRangeToSource(symbol.range) orelse return null,
+        .selectionRange = map.generatedRangeToSource(symbol.selectionRange) orelse return null,
+        .children = if (symbol.children) |children| try translateDocumentSymbolSlice(arena, children, map) else null,
+    };
+}
+
+fn startsWithYy(name: []const u8) bool {
+    return name.len >= 2 and
+        std.ascii.toLower(name[0]) == 'y' and
+        std.ascii.toLower(name[1]) == 'y';
 }
 
 fn translateCompletionItems(
@@ -868,6 +950,11 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
             .capabilities = .{
                 .general = .{
                     .positionEncodings = &.{.@"utf-8"},
+                },
+                .textDocument = .{
+                    .documentSymbol = .{
+                        .hierarchicalDocumentSymbolSupport = true,
+                    },
                 },
             },
         },
@@ -1300,6 +1387,134 @@ test "translates completion edits back to source ranges" {
         },
         else => return error.UnexpectedCompletion,
     }
+}
+
+test "translates document symbols and drops generated yy symbols" {
+    const generated =
+        \\// #line 5 source.zy
+        \\pub const Token = struct {
+        \\    pub fn lit() void {}
+        \\};
+        \\// #line 80 source.zig
+        \\const generated_only = true;
+        \\// #line 20 source.zy
+        \\const yyFallback = 1;
+    ;
+    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const children = [_]types.DocumentSymbol{
+        .{
+            .name = "lit",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 2, .character = 4 },
+                .end = .{ .line = 2, .character = 25 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 2, .character = 11 },
+                .end = .{ .line = 2, .character = 14 },
+            },
+        },
+        .{
+            .name = "YYDropMe",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 7, .character = 0 },
+                .end = .{ .line = 7, .character = 21 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 7, .character = 6 },
+                .end = .{ .line = 7, .character = 14 },
+            },
+        },
+    };
+    const symbols = [_]types.DocumentSymbol{
+        .{
+            .name = "Token",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 1, .character = 0 },
+                .end = .{ .line = 3, .character = 1 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 1, .character = 10 },
+                .end = .{ .line = 1, .character = 15 },
+            },
+            .children = &children,
+        },
+        .{
+            .name = "yyContainer",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 1, .character = 0 },
+                .end = .{ .line = 3, .character = 1 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 1, .character = 10 },
+                .end = .{ .line = 1, .character = 21 },
+            },
+            .children = &.{
+                .{
+                    .name = "keptChild",
+                    .kind = .Function,
+                    .range = .{
+                        .start = .{ .line = 2, .character = 4 },
+                        .end = .{ .line = 2, .character = 25 },
+                    },
+                    .selectionRange = .{
+                        .start = .{ .line = 2, .character = 11 },
+                        .end = .{ .line = 2, .character = 20 },
+                    },
+                },
+            },
+        },
+        .{
+            .name = "generated_only",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 5, .character = 0 },
+                .end = .{ .line = 5, .character = 28 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 5, .character = 6 },
+                .end = .{ .line = 5, .character = 20 },
+            },
+        },
+        .{
+            .name = "yyFallback",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 7, .character = 0 },
+                .end = .{ .line = 7, .character = 21 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 7, .character = 6 },
+                .end = .{ .line = 7, .character = 16 },
+            },
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = (try translateDocumentSymbols(
+        arena_state.allocator(),
+        .{ .document_symbols = &symbols },
+        &map,
+    )) orelse return error.UnexpectedDocumentSymbols;
+    try expectEqual(@as(usize, 2), translated.len);
+    try expectEqualStrings("Token", translated[0].name);
+    try expectEqual(@as(u32, 4), translated[0].range.start.line);
+    try expectEqual(@as(u32, 10), translated[0].selectionRange.start.character);
+
+    const translated_children = translated[0].children orelse return error.UnexpectedDocumentSymbols;
+    try expectEqual(@as(usize, 1), translated_children.len);
+    try expectEqualStrings("lit", translated_children[0].name);
+    try expectEqual(@as(u32, 5), translated_children[0].range.start.line);
+
+    try expectEqualStrings("keptChild", translated[1].name);
+    try expectEqual(@as(u32, 5), translated[1].range.start.line);
 }
 
 const std = @import("std");

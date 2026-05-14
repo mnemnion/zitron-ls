@@ -227,6 +227,35 @@ pub fn findReferences(
     return if (references.items.len == 0) null else try references.toOwnedSlice(arena);
 }
 
+/// Collects document-local symbols for editor outlines and symbol pickers.
+pub fn documentSymbols(
+    document: Document,
+    tags_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM![]const types.DocumentSymbol {
+    var symbols: std.ArrayList(types.DocumentSymbol) = .empty;
+
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(tags_query, document.tree.rootNode());
+
+    while (cursor.nextMatch()) |match| {
+        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
+        if (candidate.kind == .rule_reference) continue;
+
+        try symbols.append(arena, .{
+            .name = candidate.symbol_name,
+            .detail = documentSymbolDetail(candidate.kind),
+            .kind = documentSymbolKind(candidate.kind),
+            .range = rangeFromNode(document.source, candidate.semantic_node, offset_encoding),
+            .selectionRange = rangeFromNode(document.source, candidate.name_node, offset_encoding),
+        });
+    }
+
+    return try symbols.toOwnedSlice(arena);
+}
+
 /// Builds an LSP location for the given syntax node in this document.
 pub fn locationForNode(
     document: Document,
@@ -257,6 +286,24 @@ fn findDefinition(
     }
 
     return null;
+}
+
+fn documentSymbolKind(kind: SemanticKind) types.SymbolKind {
+    return switch (kind) {
+        .rule_definition => .Class,
+        .rule_reference => .Class,
+        .action_definition => .Interface,
+        .action_implementation => .Function,
+    };
+}
+
+fn documentSymbolDetail(kind: SemanticKind) []const u8 {
+    return switch (kind) {
+        .rule_definition => "rule",
+        .rule_reference => "rule reference",
+        .action_definition => "named action",
+        .action_implementation => "named action implementation",
+    };
 }
 
 fn parseDocument(source: []const u8) Error!ParsedDocument {
@@ -514,6 +561,40 @@ test "resolution and references work without server" {
         .@"utf-8",
     )) orelse return error.UnexpectedReferences;
     try expect(references.len >= 2);
+}
+
+test "documentSymbols returns local definitions and named action implementations" {
+    const sample =
+        \\calc ::= expr(A). @on_calc(A)
+        \\expr(A) ::= NUMBER(A).
+        \\%impl @on_calc(A) { _ = A; }
+    ;
+    var query = try compileTagsQuery();
+    defer query.destroy();
+
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+
+    const symbols = try document.documentSymbols(query, arena.allocator(), .@"utf-8");
+    try expectEqual(@as(usize, 4), symbols.len);
+
+    try expectEqualStrings("calc", symbols[0].name);
+    try expectEqual(types.SymbolKind.Class, symbols[0].kind);
+    try expectEqualStrings("rule", symbols[0].detail.?);
+    try expectEqual(@as(u32, 0), symbols[0].selectionRange.start.line);
+    try expectEqual(@as(u32, 0), symbols[0].selectionRange.start.character);
+
+    try expectEqualStrings("@on_calc", symbols[1].name);
+    try expectEqual(types.SymbolKind.Interface, symbols[1].kind);
+
+    try expectEqualStrings("expr", symbols[2].name);
+    try expectEqual(types.SymbolKind.Class, symbols[2].kind);
+
+    try expectEqualStrings("@on_calc", symbols[3].name);
+    try expectEqual(types.SymbolKind.Function, symbols[3].kind);
 }
 
 test "classifies zig code positions for middleware routing" {
