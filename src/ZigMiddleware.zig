@@ -55,6 +55,7 @@ pub const Error =
 const GeneratedDocument = struct {
     source_uri: []u8,
     source_path: []u8,
+    source_text: []const u8,
     generated_uri: []u8,
     generated_text: []u8,
     code_map: CodeMap,
@@ -253,6 +254,7 @@ fn middlewareSyncDocument(
         gop.value_ptr.* = .{
             .source_uri = try middleware.allocator.dupe(u8, uri),
             .source_path = source_path,
+            .source_text = source_text,
             .generated_uri = generated_uri,
             .generated_text = try middleware.allocator.alloc(u8, 0),
             .code_map = .{},
@@ -264,6 +266,7 @@ fn middlewareSyncDocument(
 
     const doc = gop.value_ptr;
     doc.version = version;
+    doc.source_text = source_text;
     if (doc.generation_error) |message| {
         middleware.allocator.free(message);
         doc.generation_error = null;
@@ -441,12 +444,15 @@ fn middlewareForwardRename(
 
 /// Mapping between original Zitron code blocks and generated Zig code.
 pub const CodeMap = struct {
-    /// Spans are stored in generated-line order, which is the order encountered
+    /// Generated spans are stored in generated-line order, which is the order encountered
     /// while scanning the generated Zig file.
-    spans: std.ArrayList(Span) = .empty,
-    /// Indexes into `spans`, sorted by source-line order for source -> generated
+    gen_span: std.ArrayList(GenSpan) = .empty,
+    /// Source ranges for the generated spans.  Indexes are kept in lockstep with
+    /// `gen_span`, but the range retains exact tree-sitter byte and point data.
+    src_range: std.ArrayList(ts.Range) = .empty,
+    /// Indexes into `gen_span` and `src_range`, sorted by source-line order for source -> generated
     /// lookups. The buffer is retained across updates.
-    source_order: std.ArrayList(usize) = .empty,
+    src_order: std.ArrayList(usize) = .empty,
 
     /// Half-open byte range in either the source or generated text.
     pub const ByteRange = struct {
@@ -454,45 +460,47 @@ pub const CodeMap = struct {
         end: usize,
     };
 
-    /// One contiguous translated range. Line spans keep the legacy LSP
-    /// position mapping; byte ranges keep the actual code-block extents for
-    /// later transformed-code handling.
-    const Span = struct {
+    /// One contiguous generated range. Source-line offsets keep the legacy LSP
+    /// position mapping; `src_range` keeps the actual source code-block extent.
+    const GenSpan = struct {
         /// First zero-based line in the original `.zy` document.
         source_line: u32,
         /// First zero-based line in the generated Zig document.
         generated_line: u32,
         /// Number of contiguous mapped lines shared by both coordinate systems.
         line_count: u32,
-        /// Half-open byte range in the original `.zy` document.
-        source_range: ByteRange,
         /// Half-open byte range in the generated Zig document.
         generated_range: ByteRange,
 
         /// Exclusive source-line end.  Keeping this as a helper avoids repeating
         /// the half-open interval convention at every lookup site.
-        fn sourceEnd(span: Span) u32 {
+        fn sourceEnd(span: GenSpan) u32 {
             return span.source_line + span.line_count;
         }
 
         /// Exclusive generated-line end, matching `sourceEnd` in length.
-        fn generatedEnd(span: Span) u32 {
+        fn generatedEnd(span: GenSpan) u32 {
             return span.generated_line + span.line_count;
         }
 
         /// Compares a source line against this half-open span.
-        fn orderSource(span: Span, line: u32) std.math.Order {
+        fn orderSource(span: GenSpan, line: u32) std.math.Order {
             if (line < span.source_line) return .lt;
             if (line < span.sourceEnd()) return .eq;
             return .gt;
         }
 
         /// Compares a generated line against this half-open span.
-        fn orderGenerated(span: Span, line: u32) std.math.Order {
+        fn orderGenerated(span: GenSpan, line: u32) std.math.Order {
             if (line < span.generated_line) return .lt;
             if (line < span.generatedEnd()) return .eq;
             return .gt;
         }
+    };
+
+    const ActiveSpan = struct {
+        gen_span: GenSpan,
+        src_range: ts.Range,
     };
 
     /// Parses generated Zig into an initial map by delegating to `update`, so the
@@ -519,8 +527,9 @@ pub const CodeMap = struct {
         generated_text: []const u8,
         source_path: []const u8,
     ) OOM!void {
-        map.spans.clearRetainingCapacity();
-        map.source_order.clearRetainingCapacity();
+        map.gen_span.clearRetainingCapacity();
+        map.src_range.clearRetainingCapacity();
+        map.src_order.clearRetainingCapacity();
 
         try map.collectSpans(allocator, source_root, generated_text, source_path);
         try map.rebuildSourceOrder(allocator);
@@ -528,8 +537,9 @@ pub const CodeMap = struct {
 
     /// Frees the reusable span and index buffers.
     pub fn deinit(map: *CodeMap, allocator: std.mem.Allocator) void {
-        map.spans.deinit(allocator);
-        map.source_order.deinit(allocator);
+        map.gen_span.deinit(allocator);
+        map.src_range.deinit(allocator);
+        map.src_order.deinit(allocator);
         map.* = .{};
     }
 
@@ -558,10 +568,10 @@ pub const CodeMap = struct {
     /// Zig and cannot be reported as a source range.
     pub fn generatedRangeToSource(map: *const CodeMap, range: types.Range) ?types.Range {
         var index = map.findGeneratedIndex(range.start.line) orelse return null;
-        while (map.spans.items[index].orderGenerated(range.end.line) != .eq) {
+        while (map.gen_span.items[index].orderGenerated(range.end.line) != .eq) {
             const next_index = index + 1;
-            if (next_index >= map.spans.items.len) return null;
-            if (map.spans.items[next_index].generated_line != map.spans.items[index].generatedEnd()) return null;
+            if (next_index >= map.gen_span.items.len) return null;
+            if (map.gen_span.items[next_index].generated_line != map.gen_span.items[index].generatedEnd()) return null;
             index = next_index;
         }
 
@@ -582,7 +592,7 @@ pub const CodeMap = struct {
     ) OOM!void {
         var generated_line: u32 = 0;
         var generated_offset: usize = 0;
-        var active_span: ?Span = null;
+        var active_span: ?ActiveSpan = null;
         var generated_lines = std.mem.splitScalar(u8, generated_text, '\n');
         while (generated_lines.next()) |line| : (generated_line += 1) {
             const line_end = generated_offset + line.len;
@@ -591,16 +601,18 @@ pub const CodeMap = struct {
             if (parseLineDirective(line)) |directive| {
                 try map.processActiveSpan(allocator, &active_span, generated_line, generated_offset);
                 if (std.mem.eql(u8, directive.path, source_path)) {
-                    if (zigCodeRangeForLine(source_root, directive.line)) |source_range| {
+                    if (zigCodeRangeForLine(source_root, directive.line)) |src_range| {
                         active_span = .{
-                            .source_line = directive.line,
-                            .generated_line = generated_line + 1,
-                            .line_count = 0,
-                            .source_range = source_range,
-                            .generated_range = .{
-                                .start = next_generated_offset,
-                                .end = next_generated_offset,
+                            .gen_span = .{
+                                .source_line = directive.line,
+                                .generated_line = generated_line + 1,
+                                .line_count = 0,
+                                .generated_range = .{
+                                    .start = next_generated_offset,
+                                    .end = next_generated_offset,
+                                },
                             },
+                            .src_range = src_range,
                         };
                     }
                 }
@@ -615,47 +627,49 @@ pub const CodeMap = struct {
     fn processActiveSpan(
         map: *CodeMap,
         allocator: std.mem.Allocator,
-        active_span: *?Span,
+        active_span: *?ActiveSpan,
         end_generated_line: u32,
         end_generated_offset: usize,
     ) OOM!void {
         var span = active_span.* orelse return;
         active_span.* = null;
-        const line_count = end_generated_line - span.generated_line;
+        const line_count = end_generated_line - span.gen_span.generated_line;
         if (line_count == 0) return;
-        span.line_count = line_count;
-        span.generated_range.end = end_generated_offset;
-        try map.spans.append(allocator, span);
+        span.gen_span.line_count = line_count;
+        span.gen_span.generated_range.end = end_generated_offset;
+        try map.gen_span.append(allocator, span.gen_span);
+        errdefer _ = map.gen_span.pop();
+        try map.src_range.append(allocator, span.src_range);
     }
 
     /// Rebuilds the source-order index over the current span buffer.
     fn rebuildSourceOrder(map: *CodeMap, allocator: std.mem.Allocator) OOM!void {
-        try map.source_order.ensureTotalCapacity(allocator, map.spans.items.len);
-        for (0..map.spans.items.len) |index| {
-            try map.source_order.append(allocator, index);
+        try map.src_order.ensureTotalCapacity(allocator, map.gen_span.items.len);
+        for (0..map.gen_span.items.len) |index| {
+            try map.src_order.append(allocator, index);
         }
-        std.mem.sort(usize, map.source_order.items, map.spans.items, sourceIndexLessThan);
+        std.mem.sort(usize, map.src_order.items, map.gen_span.items, sourceIndexLessThan);
     }
 
     /// Returns the number of spans in the map.  Tests use this to assert
     /// that multi-line ranges stay coalesced instead of becoming per-line nodes.
     fn len(map: *const CodeMap) usize {
-        return map.spans.items.len;
+        return map.gen_span.items.len;
     }
 
     /// Finds a generated-order span containing a generated line.
-    fn findGenerated(map: *const CodeMap, line: u32) ?Span {
+    fn findGenerated(map: *const CodeMap, line: u32) ?GenSpan {
         const index = map.findGeneratedIndex(line) orelse return null;
-        return map.spans.items[index];
+        return map.gen_span.items[index];
     }
 
     /// Finds the index of a generated-order span containing a generated line.
     fn findGeneratedIndex(map: *const CodeMap, line: u32) ?usize {
         var low: usize = 0;
-        var high: usize = map.spans.items.len;
+        var high: usize = map.gen_span.items.len;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            switch (map.spans.items[mid].orderGenerated(line)) {
+            switch (map.gen_span.items[mid].orderGenerated(line)) {
                 .lt => high = mid,
                 .eq => return mid,
                 .gt => low = mid + 1,
@@ -666,20 +680,20 @@ pub const CodeMap = struct {
     }
 
     /// Finds the earliest generated span containing a source line.
-    fn findSource(map: *const CodeMap, line: u32) ?Span {
+    fn findSource(map: *const CodeMap, line: u32) ?GenSpan {
         const index = map.findSourceIndex(line) orelse return null;
-        return map.spans.items[map.source_order.items[index]];
+        return map.gen_span.items[map.src_order.items[index]];
     }
 
-    fn spanInSourceOrder(map: *const CodeMap, index: usize) Span {
-        return map.spans.items[map.source_order.items[index]];
+    fn spanInSourceOrder(map: *const CodeMap, index: usize) GenSpan {
+        return map.gen_span.items[map.src_order.items[index]];
     }
 
     /// Finds the source-order index of the earliest generated span containing a
     /// source line.
     fn findSourceIndex(map: *const CodeMap, line: u32) ?usize {
         var low: usize = 0;
-        var high: usize = map.source_order.items.len;
+        var high: usize = map.src_order.items.len;
         var found: ?usize = null;
         while (low < high) {
             const mid = low + (high - low) / 2;
@@ -698,7 +712,7 @@ pub const CodeMap = struct {
 
     /// Sorts source indexes by source start, then generated start.  The
     /// generated tie-breaker keeps defensive duplicate mappings deterministic.
-    fn sourceIndexLessThan(spans: []const Span, lhs_index: usize, rhs_index: usize) bool {
+    fn sourceIndexLessThan(spans: []const GenSpan, lhs_index: usize, rhs_index: usize) bool {
         const lhs = spans[lhs_index];
         const rhs = spans[rhs_index];
         if (lhs.source_line != rhs.source_line) return lhs.source_line < rhs.source_line;
@@ -707,17 +721,17 @@ pub const CodeMap = struct {
     }
 };
 
-fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?CodeMap.ByteRange {
+fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?ts.Range {
     const line_start: ts.Point = .{ .row = line, .column = 0 };
     var node = source_root.descendantForPointRange(line_start, lineEndPoint(source_root, line)) orelse return null;
-    if (std.mem.eql(u8, node.kind(), "zig_code")) return byteRangeForNode(node);
+    if (std.mem.eql(u8, node.kind(), "zig_code")) return node.range();
 
     while (true) {
         const zig_code = descendantOfKindOnLine(node, "zig_code", line) orelse {
             node = node.parent() orelse return null;
             continue;
         };
-        return byteRangeForNode(zig_code);
+        return zig_code.range();
     }
 }
 
@@ -746,13 +760,6 @@ fn descendantOfKindOnLine(node: ts.Node, kind: []const u8, line: u32) ?ts.Node {
 
 fn nodeContainsLine(node: ts.Node, line: u32) bool {
     return node.startPoint().row <= line and line <= node.endPoint().row;
-}
-
-fn byteRangeForNode(node: ts.Node) CodeMap.ByteRange {
-    return .{
-        .start = node.startByte(),
-        .end = node.endByte(),
-    };
 }
 
 /// Parsed form of a generated `// #line N path` marker. Zitron emits these
@@ -1542,7 +1549,7 @@ test "code map stores one span for a multi-line mapped range" {
     defer map.deinit(testing_allocator);
 
     try expectEqual(@as(usize, 1), map.len());
-    try expectEqual(@as(u32, 3), map.spans.items[0].line_count);
+    try expectEqual(@as(u32, 3), map.gen_span.items[0].line_count);
     try expectEqual(types.Position{ .line = 21, .character = 9 }, map.generatedPositionToSource(.{
         .line = 3,
         .character = 9,
@@ -1563,12 +1570,14 @@ test "code map update reuses allocation and applies changed spans" {
     var map = try parseCodeMapForTest(original, original, "source.zy");
     defer map.deinit(testing_allocator);
 
-    const spans_capacity = map.spans.capacity;
-    const source_order_capacity = map.source_order.capacity;
+    const gen_span_capacity = map.gen_span.capacity;
+    const src_range_capacity = map.src_range.capacity;
+    const src_order_capacity = map.src_order.capacity;
 
     try updateCodeMapForTest(&map, original, original, "source.zy");
-    try expectEqual(spans_capacity, map.spans.capacity);
-    try expectEqual(source_order_capacity, map.source_order.capacity);
+    try expectEqual(gen_span_capacity, map.gen_span.capacity);
+    try expectEqual(src_range_capacity, map.src_range.capacity);
+    try expectEqual(src_order_capacity, map.src_order.capacity);
 
     const shifted =
         \\// #line 10 source.zy
@@ -1584,8 +1593,9 @@ test "code map update reuses allocation and applies changed spans" {
     ;
     try updateCodeMapForTest(&map, shifted, shifted, "source.zy");
 
-    try expectEqual(spans_capacity, map.spans.capacity);
-    try expectEqual(source_order_capacity, map.source_order.capacity);
+    try expectEqual(gen_span_capacity, map.gen_span.capacity);
+    try expectEqual(src_range_capacity, map.src_range.capacity);
+    try expectEqual(src_order_capacity, map.src_order.capacity);
     try expectEqual(types.Position{ .line = 20, .character = 4 }, map.generatedPositionToSource(.{
         .line = 6,
         .character = 4,
@@ -1617,13 +1627,15 @@ test "code map update retains capacity after growing and shrinking" {
 
     try updateCodeMapForTest(&map, two_spans, two_spans, "source.zy");
     try expectEqual(@as(usize, 2), map.len());
-    const grown_spans_capacity = map.spans.capacity;
-    const grown_source_order_capacity = map.source_order.capacity;
+    const grown_gen_span_capacity = map.gen_span.capacity;
+    const grown_src_range_capacity = map.src_range.capacity;
+    const grown_src_order_capacity = map.src_order.capacity;
 
     try updateCodeMapForTest(&map, one_span, one_span, "source.zy");
     try expectEqual(@as(usize, 1), map.len());
-    try expectEqual(grown_spans_capacity, map.spans.capacity);
-    try expectEqual(grown_source_order_capacity, map.source_order.capacity);
+    try expectEqual(grown_gen_span_capacity, map.gen_span.capacity);
+    try expectEqual(grown_src_range_capacity, map.src_range.capacity);
+    try expectEqual(grown_src_order_capacity, map.src_order.capacity);
 }
 
 test "code map handles duplicate line directives deterministically" {
@@ -1667,17 +1679,19 @@ test "code map stores source and generated byte ranges" {
 
     try expectEqual(@as(usize, 2), map.len());
 
-    const code_span = map.spans.items[0];
-    try expectEqual(std.mem.indexOf(u8, source, "{\n").? + 1, code_span.source_range.start);
-    try expectEqual(std.mem.indexOf(u8, source, "}\n").?, code_span.source_range.end);
-    try expectEqual(std.mem.indexOf(u8, generated, "\n\n").? + 1, code_span.generated_range.start);
-    try expectEqual(std.mem.indexOf(u8, generated, "// #line 4").?, code_span.generated_range.end);
+    const code_gen_span = map.gen_span.items[0];
+    const code_src_range = map.src_range.items[0];
+    try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, source, "{\n").? + 1)), code_src_range.start_byte);
+    try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, source, "}\n").?)), code_src_range.end_byte);
+    try expectEqual(std.mem.indexOf(u8, generated, "\n\n").? + 1, code_gen_span.generated_range.start);
+    try expectEqual(std.mem.indexOf(u8, generated, "// #line 4").?, code_gen_span.generated_range.end);
 
-    const action_span = map.spans.items[1];
-    try expectEqual(std.mem.indexOf(u8, source, "{ result").? + 1, action_span.source_range.start);
-    try expectEqual(std.mem.lastIndexOfScalar(u8, source, '}').?, action_span.source_range.end);
-    try expectEqual(std.mem.indexOf(u8, generated, " result").?, action_span.generated_range.start);
-    try expectEqual(generated.len, action_span.generated_range.end);
+    const action_gen_span = map.gen_span.items[1];
+    const action_src_range = map.src_range.items[1];
+    try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, source, "{ result").? + 1)), action_src_range.start_byte);
+    try expectEqual(@as(u32, @intCast(std.mem.lastIndexOfScalar(u8, source, '}').?)), action_src_range.end_byte);
+    try expectEqual(std.mem.indexOf(u8, generated, " result").?, action_gen_span.generated_range.start);
+    try expectEqual(generated.len, action_gen_span.generated_range.end);
 }
 
 test "translates hover and definition results back to source ranges" {
