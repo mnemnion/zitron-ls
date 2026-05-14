@@ -16,6 +16,7 @@ const Middleware = struct {
     zls_transport: lsp.Transport.Stdio,
     zls_read_buffer: []u8,
     documents: std.StringHashMapUnmanaged(GeneratedDocument),
+    zls_completion_triggers: []const []const u8,
     next_request_id: i64,
 
     const deinit = middlewareDeinit;
@@ -25,6 +26,7 @@ const Middleware = struct {
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
+    const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
     const initializeZls = middlewareInitializeZls;
     const shutdownZls = middlewareShutdownZls;
     const request = middlewareRequest;
@@ -102,6 +104,7 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
         .zls_transport = lsp.Transport.Stdio.init(read_buffer, child.stdout.?, child.stdin.?),
         .zls_read_buffer = read_buffer,
         .documents = .empty,
+        .zls_completion_triggers = &.{},
         .next_request_id = 1,
     };
     errdefer mware.deinit();
@@ -115,6 +118,13 @@ pub fn deinit(middleware: *ZigMiddleware) void {
         .disabled => {},
         .enabled => |*mware| mware.deinit(),
     }
+}
+
+pub fn completionTriggerCharacters(middleware: *const ZigMiddleware) ?[]const []const u8 {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| mware.zls_completion_triggers,
+    };
 }
 
 pub fn syncDocument(
@@ -184,7 +194,19 @@ pub fn forwardCompletion(
     };
 }
 
+pub fn forwardDocumentSymbols(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+) Error!?[]const types.DocumentSymbol {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardDocumentSymbols(arena, source_uri),
+    };
+}
+
 fn middlewareDeinit(middleware: *Middleware) void {
+    freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
     var it = middleware.documents.iterator();
     while (it.next()) |entry| {
         middleware.allocator.free(entry.key_ptr.*);
@@ -376,6 +398,19 @@ fn middlewareForwardCompletion(
     var result = try middleware.request(arena, "textDocument/completion", mapped);
     try translateCompletionResult(arena, &result, line_map);
     return result;
+}
+
+fn middlewareForwardDocumentSymbols(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+) Error!?[]const types.DocumentSymbol {
+    const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
+    const result = (try middleware.request(arena, "textDocument/documentSymbol", .{
+        .textDocument = .{ .uri = doc.generated_uri },
+    })) orelse return null;
+    return try translateDocumentSymbols(arena, result, line_map);
 }
 
 /// Bidirectional line mapping derived from Zitron `// #line` comments.
@@ -772,12 +807,69 @@ pub fn translateCompletionResult(
     }
 }
 
+pub fn translateDocumentSymbols(
+    arena: std.mem.Allocator,
+    result: lsp.types.DocumentSymbol.Result,
+    map: *const LineMap,
+) OOM!?[]const types.DocumentSymbol {
+    return switch (result) {
+        .document_symbols => |symbols| translateDocumentSymbolSlice(arena, symbols, map),
+        .symbol_informations => null,
+    };
+}
+
 fn translateLocation(location: types.Location, map: *const LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
         .uri = source_uri,
         .range = map.generatedRangeToSource(location.range) orelse return null,
     };
+}
+
+fn translateDocumentSymbolSlice(
+    arena: std.mem.Allocator,
+    symbols: []const types.DocumentSymbol,
+    map: *const LineMap,
+) OOM!?[]const types.DocumentSymbol {
+    var translated: std.ArrayList(types.DocumentSymbol) = .empty;
+    for (symbols) |symbol| {
+        if (startsWithYy(symbol.name)) {
+            if (symbol.children) |children| {
+                if (try translateDocumentSymbolSlice(arena, children, map)) |mapped_children| {
+                    try translated.appendSlice(arena, mapped_children);
+                }
+            }
+            continue;
+        }
+        if (try translateDocumentSymbol(arena, symbol, map)) |mapped| {
+            try translated.append(arena, mapped);
+        }
+    }
+
+    return if (translated.items.len == 0) null else try translated.toOwnedSlice(arena);
+}
+
+fn translateDocumentSymbol(
+    arena: std.mem.Allocator,
+    symbol: types.DocumentSymbol,
+    map: *const LineMap,
+) OOM!?types.DocumentSymbol {
+    return .{
+        .name = symbol.name,
+        .detail = symbol.detail,
+        .kind = symbol.kind,
+        .tags = symbol.tags,
+        .deprecated = symbol.deprecated,
+        .range = map.generatedRangeToSource(symbol.range) orelse return null,
+        .selectionRange = map.generatedRangeToSource(symbol.selectionRange) orelse return null,
+        .children = if (symbol.children) |children| try translateDocumentSymbolSlice(arena, children, map) else null,
+    };
+}
+
+fn startsWithYy(name: []const u8) bool {
+    return name.len >= 2 and
+        std.ascii.toLower(name[0]) == 'y' and
+        std.ascii.toLower(name[1]) == 'y';
 }
 
 fn translateCompletionItems(
@@ -869,12 +961,47 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
                 .general = .{
                     .positionEncodings = &.{.@"utf-8"},
                 },
+                .textDocument = .{
+                    .hover = .{
+                        .contentFormat = &.{ .markdown, .plaintext },
+                    },
+                    .documentSymbol = .{
+                        .hierarchicalDocumentSymbolSupport = true,
+                    },
+                },
             },
         },
         .{ .emit_null_optional_fields = false },
     );
     const initialize_response = try middleware.readResponseForId(middleware.allocator, id);
-    middleware.allocator.free(initialize_response);
+    defer middleware.allocator.free(initialize_response);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, initialize_response, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const result_value = switch (parsed.value) {
+        .response => |response| switch (response.result_or_error) {
+            .result => |maybe_result| maybe_result,
+            .@"error" => return error.RequestFailed,
+        },
+        else => return error.UnexpectedResponse,
+    };
+    if (result_value == null or result_value.? == .null) return error.UnexpectedResponse;
+
+    const initialize_result = try std.json.parseFromValue(types.InitializeResult, middleware.allocator, result_value.?, .{
+        .ignore_unknown_fields = true,
+    });
+    defer initialize_result.deinit();
+
+    if (initialize_result.value.capabilities.completionProvider) |completion_options| {
+        if (completion_options.triggerCharacters) |trigger_characters| {
+            freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
+            middleware.zls_completion_triggers = try dupeStringSlices(middleware.allocator, trigger_characters);
+        }
+    }
+
     try middleware.zls_transport.transport.writeNotification(
         middleware.io,
         middleware.allocator,
@@ -883,6 +1010,28 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
         .{},
         .{ .emit_null_optional_fields = false },
     );
+}
+
+fn dupeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) OOM![]const []const u8 {
+    if (slices.len == 0) return &.{};
+
+    const owned = try allocator.alloc([]const u8, slices.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |owned_slice| allocator.free(owned_slice);
+        allocator.free(owned);
+    }
+    for (slices, owned) |slice, *dest| {
+        dest.* = try allocator.dupe(u8, slice);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) void {
+    if (slices.len == 0) return;
+    for (slices) |slice| allocator.free(slice);
+    allocator.free(slices);
 }
 
 fn middlewareShutdownZls(middleware: *Middleware) Error!void {
@@ -1300,6 +1449,134 @@ test "translates completion edits back to source ranges" {
         },
         else => return error.UnexpectedCompletion,
     }
+}
+
+test "translates document symbols and drops generated yy symbols" {
+    const generated =
+        \\// #line 5 source.zy
+        \\pub const Token = struct {
+        \\    pub fn lit() void {}
+        \\};
+        \\// #line 80 source.zig
+        \\const generated_only = true;
+        \\// #line 20 source.zy
+        \\const yyFallback = 1;
+    ;
+    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const children = [_]types.DocumentSymbol{
+        .{
+            .name = "lit",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 2, .character = 4 },
+                .end = .{ .line = 2, .character = 25 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 2, .character = 11 },
+                .end = .{ .line = 2, .character = 14 },
+            },
+        },
+        .{
+            .name = "YYDropMe",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 7, .character = 0 },
+                .end = .{ .line = 7, .character = 21 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 7, .character = 6 },
+                .end = .{ .line = 7, .character = 14 },
+            },
+        },
+    };
+    const symbols = [_]types.DocumentSymbol{
+        .{
+            .name = "Token",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 1, .character = 0 },
+                .end = .{ .line = 3, .character = 1 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 1, .character = 10 },
+                .end = .{ .line = 1, .character = 15 },
+            },
+            .children = &children,
+        },
+        .{
+            .name = "yyContainer",
+            .kind = .Function,
+            .range = .{
+                .start = .{ .line = 1, .character = 0 },
+                .end = .{ .line = 3, .character = 1 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 1, .character = 10 },
+                .end = .{ .line = 1, .character = 21 },
+            },
+            .children = &.{
+                .{
+                    .name = "keptChild",
+                    .kind = .Function,
+                    .range = .{
+                        .start = .{ .line = 2, .character = 4 },
+                        .end = .{ .line = 2, .character = 25 },
+                    },
+                    .selectionRange = .{
+                        .start = .{ .line = 2, .character = 11 },
+                        .end = .{ .line = 2, .character = 20 },
+                    },
+                },
+            },
+        },
+        .{
+            .name = "generated_only",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 5, .character = 0 },
+                .end = .{ .line = 5, .character = 28 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 5, .character = 6 },
+                .end = .{ .line = 5, .character = 20 },
+            },
+        },
+        .{
+            .name = "yyFallback",
+            .kind = .Constant,
+            .range = .{
+                .start = .{ .line = 7, .character = 0 },
+                .end = .{ .line = 7, .character = 21 },
+            },
+            .selectionRange = .{
+                .start = .{ .line = 7, .character = 6 },
+                .end = .{ .line = 7, .character = 16 },
+            },
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = (try translateDocumentSymbols(
+        arena_state.allocator(),
+        .{ .document_symbols = &symbols },
+        &map,
+    )) orelse return error.UnexpectedDocumentSymbols;
+    try expectEqual(@as(usize, 2), translated.len);
+    try expectEqualStrings("Token", translated[0].name);
+    try expectEqual(@as(u32, 4), translated[0].range.start.line);
+    try expectEqual(@as(u32, 10), translated[0].selectionRange.start.character);
+
+    const translated_children = translated[0].children orelse return error.UnexpectedDocumentSymbols;
+    try expectEqual(@as(usize, 1), translated_children.len);
+    try expectEqualStrings("lit", translated_children[0].name);
+    try expectEqual(@as(u32, 5), translated_children[0].range.start.line);
+
+    try expectEqualStrings("keptChild", translated[1].name);
+    try expectEqual(@as(u32, 5), translated[1].range.start.line);
 }
 
 const std = @import("std");

@@ -7,6 +7,7 @@
 pub const server_name = "lsp_zitron";
 
 const server_version = "0.0.1";
+const zitron_completion_triggers = [_][]const u8{ "%", "(" };
 
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
@@ -23,7 +24,11 @@ fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKi
     };
 }
 
-fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabilities {
+fn serverCapabilities(
+    allocator: std.mem.Allocator,
+    offset_encoding: lsp.offsets.Encoding,
+    zls_completion_triggers: ?[]const []const u8,
+) types.ServerCapabilities {
     return .{
         .positionEncoding = positionEncodingKind(offset_encoding),
         .textDocumentSync = .{
@@ -33,12 +38,41 @@ fn serverCapabilities(offset_encoding: lsp.offsets.Encoding) types.ServerCapabil
             },
         },
         .completionProvider = .{
-            .triggerCharacters = &.{"%"},
+            .triggerCharacters = mergeCompletionTriggers(
+                allocator,
+                zls_completion_triggers,
+            ) catch &zitron_completion_triggers,
         },
         .hoverProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
+        .documentSymbolProvider = .{ .bool = true },
     };
+}
+
+fn mergeCompletionTriggers(
+    allocator: std.mem.Allocator,
+    zls_completion_triggers: ?[]const []const u8,
+) OOM![]const []const u8 {
+    const zls_triggers = zls_completion_triggers orelse return &zitron_completion_triggers;
+
+    var merged: std.ArrayList([]const u8) = .empty;
+    errdefer merged.deinit(allocator);
+    try merged.appendSlice(allocator, &zitron_completion_triggers);
+    for (zls_triggers) |trigger| {
+        if (!containsString(merged.items, trigger)) {
+            try merged.append(allocator, trigger);
+        }
+    }
+
+    return try merged.toOwnedSlice(allocator);
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
 }
 
 /// LSP server state and handlers for Zitron grammars.
@@ -93,7 +127,7 @@ pub const Server = struct {
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         server: *Server,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
         params: types.InitializeParams,
     ) types.InitializeResult {
         if (params.capabilities.general) |general| {
@@ -109,7 +143,11 @@ pub const Server = struct {
         }
 
         return .{
-            .capabilities = serverCapabilities(server.offset_encoding),
+            .capabilities = serverCapabilities(
+                allocator,
+                server.offset_encoding,
+                server.zig_middleware.completionTriggerCharacters(),
+            ),
             .serverInfo = .{
                 .name = server_name,
                 .version = server_version,
@@ -184,9 +222,29 @@ pub const Server = struct {
             return try server.zig_middleware.forwardCompletion(arena, params.textDocument.uri, params);
         }
 
-        const items = try completion.completeDirectives(
+        const root = doc.tree.rootNode();
+        const items = try completion.completeImplAliases(
             arena,
             doc.source,
+            root,
+            params.position,
+            server.offset_encoding,
+        ) orelse try completion.completeRuleActionAliases(
+            arena,
+            doc.source,
+            root,
+            params.position,
+            server.offset_encoding,
+        ) orelse try completion.completeDirectives(
+            arena,
+            doc.source,
+            root,
+            params.position,
+            server.offset_encoding,
+        ) orelse try completion.completeGrammarParticles(
+            arena,
+            doc.source,
+            root,
             params.position,
             server.offset_encoding,
         ) orelse return null;
@@ -280,6 +338,28 @@ pub const Server = struct {
                 params.context.includeDeclaration,
                 server.offset_encoding,
             ),
+        };
+    }
+
+    /// LSP `textDocument/documentSymbol` handler for document-local grammar symbols.
+    pub fn @"textDocument/documentSymbol"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DocumentSymbolParams,
+    ) Error!lsp.ResultType("textDocument/documentSymbol") {
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const local_symbols = try doc.documentSymbols(
+            server.tags_query,
+            arena,
+            server.offset_encoding,
+        );
+        var symbols: std.ArrayList(types.DocumentSymbol) = .empty;
+        try symbols.appendSlice(arena, local_symbols);
+        if (try server.zig_middleware.forwardDocumentSymbols(arena, params.textDocument.uri)) |zig_symbols| {
+            try symbols.appendSlice(arena, zig_symbols);
+        }
+        return .{
+            .document_symbols = try symbols.toOwnedSlice(arena),
         };
     }
 
@@ -401,8 +481,65 @@ fn completionItemsContainLabel(items: []const types.CompletionItem, label: []con
     return false;
 }
 
+fn completionItemWithLabel(items: []const types.CompletionItem, label: []const u8) ?types.CompletionItem {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.label, label)) return item;
+    }
+    return null;
+}
+
+fn expectActionAliasCompletion(
+    server: *Server,
+    arena: std.mem.Allocator,
+    sample: []const u8,
+    marker: []const u8,
+    expected: []const u8,
+) !void {
+    const position = lsp.offsets.indexToPosition(sample, (try byteIndexOf(sample, marker)) + marker.len, test_offset_encoding);
+    const result = (try server.@"textDocument/completion"(arena, .{
+        .textDocument = .{ .uri = "file:///samples/action_alias_completion.zy" },
+        .position = position,
+        .context = .{
+            .triggerKind = .TriggerCharacter,
+            .triggerCharacter = "(",
+        },
+    })) orelse return error.UnexpectedCompletionResult;
+
+    const items = switch (result) {
+        .completion_items => |completion_items| completion_items,
+        else => return error.UnexpectedCompletionResult,
+    };
+    const item = completionItemWithLabel(items, expected) orelse return error.UnexpectedCompletionResult;
+    try expectEqualStrings("@action aliases", item.detail.?);
+    switch (item.textEdit.?) {
+        .text_edit => |edit| try expectEqualStrings(expected, edit.newText),
+        else => return error.UnexpectedCompletionResult,
+    }
+}
+
 test "server capabilities match the implemented handlers" {
-    lsp.basic_server.validateServerCapabilities(Server, serverCapabilities(.@"utf-16"));
+    lsp.basic_server.validateServerCapabilities(
+        Server,
+        serverCapabilities(testing_allocator, .@"utf-16", null),
+    );
+}
+
+test "server capabilities merge zls completion triggers" {
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const capabilities = serverCapabilities(
+        arena_state.allocator(),
+        .@"utf-8",
+        &.{ ".", ":", "(" },
+    );
+    const triggers = capabilities.completionProvider.?.triggerCharacters.?;
+
+    try expectEqual(@as(usize, 4), triggers.len);
+    try expectEqualStrings("%", triggers[0]);
+    try expectEqualStrings("(", triggers[1]);
+    try expectEqualStrings(".", triggers[2]);
+    try expectEqualStrings(":", triggers[3]);
 }
 
 test "embedded tags query compiles for the zitron grammar" {
@@ -514,6 +651,164 @@ test "server returns directive completions from stored live document state" {
             try expect(items.len >= 2);
             try expect(completionItemsContainLabel(items, "%type"));
             try expect(completionItemsContainLabel(items, "%token_type"));
+        },
+        else => return error.UnexpectedCompletionResult,
+    }
+}
+
+test "server returns impl alias list completion from action definition" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample =
+        \\pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; K, V)
+        \\%impl @on_pair2(
+    ;
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/impl_completion.zy",
+            .languageId = .{ .custom_value = "zitron" },
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const result = (try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/impl_completion.zy" },
+        .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+        .context = .{
+            .triggerKind = .TriggerCharacter,
+            .triggerCharacter = "(",
+        },
+    })) orelse return error.UnexpectedCompletionResult;
+
+    const items = switch (result) {
+        .completion_items => |completion_items| completion_items,
+        else => return error.UnexpectedCompletionResult,
+    };
+    const item = completionItemWithLabel(items, "P; K, V") orelse return error.UnexpectedCompletionResult;
+    try expectEqual(types.CompletionItemKind.Variable, item.kind.?);
+    switch (item.textEdit.?) {
+        .text_edit => |edit| {
+            try expectEqualStrings("P; K, V", edit.newText);
+            try expectEqual(@as(u32, 1), edit.range.start.line);
+            try expectEqual(@as(u32, 16), edit.range.start.character);
+        },
+        else => return error.UnexpectedCompletionResult,
+    }
+}
+
+test "server returns rule action alias completions in house style" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const cases = [_]struct {
+        sample: []const u8,
+        marker: []const u8,
+        expected: []const u8,
+    }{
+        .{ .sample = "one_lhs(A) ::= . @one_lhs(", .marker = "@one_lhs(", .expected = "A" },
+        .{ .sample = "one_rhs ::= TOKEN(B). @one_rhs(", .marker = "@one_rhs(", .expected = ";B" },
+        .{ .sample = "one_each(A) ::= TOKEN(B). @one_each(", .marker = "@one_each(", .expected = "A;B" },
+        .{ .sample = "several_rhs ::= ONE(B) TWO(C). @several_rhs(", .marker = "@several_rhs(", .expected = " ; B, C" },
+        .{ .sample = "buncha(A) ::= ONE(B) TWO(C) THREE(D). @buncha(", .marker = "@buncha(", .expected = "A; B, C, D" },
+    };
+
+    for (cases, 1..) |case, version| {
+        try server.@"textDocument/didOpen"(testing_allocator, .{
+            .textDocument = .{
+                .uri = "file:///samples/action_alias_completion.zy",
+                .languageId = .{ .custom_value = "zitron" },
+                .version = @intCast(version),
+                .text = case.sample,
+            },
+        });
+        try expectActionAliasCompletion(&server, arena_state.allocator(), case.sample, case.marker, case.expected);
+    }
+}
+
+test "server completes grammar particles including multiterminals" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample =
+        \\foo ::= FOO|BAR|BAZ.
+        \\bar ::= FOO.
+        \\calc ::= F
+    ;
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/particle_completion.zy",
+            .languageId = .{ .custom_value = "zitron" },
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const result = (try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/particle_completion.zy" },
+        .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+    })) orelse return error.UnexpectedCompletionResult;
+
+    const items = switch (result) {
+        .completion_items => |completion_items| completion_items,
+        else => return error.UnexpectedCompletionResult,
+    };
+    const terminal = completionItemWithLabel(items, "FOO") orelse return error.UnexpectedCompletionResult;
+    try expectEqualStrings("terminal", terminal.detail.?);
+    try expectEqual(types.CompletionItemKind.EnumMember, terminal.kind.?);
+
+    const multiterminal = completionItemWithLabel(items, "FOO|BAR|BAZ") orelse return error.UnexpectedCompletionResult;
+    try expectEqualStrings("multiterminal", multiterminal.detail.?);
+    try expectEqual(types.CompletionItemKind.Constant, multiterminal.kind.?);
+    try expectEqualStrings("FOO|BAR|BAZ", multiterminal.filterText.?);
+}
+
+test "server completes multiterminals from matching member terminals" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample =
+        \\foo ::= FOO|BAR|BAZ.
+        \\calc ::= BA
+    ;
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/multiterminal_member_completion.zy",
+            .languageId = .{ .custom_value = "zitron" },
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const result = (try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/multiterminal_member_completion.zy" },
+        .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+    })) orelse return error.UnexpectedCompletionResult;
+
+    const items = switch (result) {
+        .completion_items => |completion_items| completion_items,
+        else => return error.UnexpectedCompletionResult,
+    };
+
+    const multiterminal = completionItemWithLabel(items, "FOO|BAR|BAZ") orelse return error.UnexpectedCompletionResult;
+    try expectEqualStrings("BAR", multiterminal.filterText.?);
+    switch (multiterminal.textEdit.?) {
+        .text_edit => |edit| {
+            try expectEqualStrings("FOO|BAR|BAZ", edit.newText);
+            try expectEqual(@as(u32, 1), edit.range.start.line);
+            try expectEqual(@as(u32, 9), edit.range.start.character);
         },
         else => return error.UnexpectedCompletionResult,
     }
@@ -721,6 +1016,47 @@ test "hover definition and references operate on stored live document state" {
 
     const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
+}
+
+test "document symbols operate on stored live document state" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample =
+        \\calc ::= expr(A). @on_calc(A)
+        \\expr(A) ::= NUMBER(A).
+        \\%impl @on_calc(A) { _ = A; }
+    ;
+
+    try server.@"textDocument/didOpen"(testing_allocator, .{
+        .textDocument = .{
+            .uri = "file:///samples/symbols.zy",
+            .languageId = .{ .custom_value = "zitron" },
+            .version = 1,
+            .text = sample,
+        },
+    });
+
+    const result = (try server.@"textDocument/documentSymbol"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/symbols.zy" },
+    })) orelse return error.UnexpectedDocumentSymbols;
+
+    switch (result) {
+        .document_symbols => |symbols| {
+            try expectEqual(@as(usize, 4), symbols.len);
+            try expectEqualStrings("calc", symbols[0].name);
+            try expectEqual(types.SymbolKind.Class, symbols[0].kind);
+            try expectEqualStrings("@on_calc", symbols[1].name);
+            try expectEqual(types.SymbolKind.Interface, symbols[1].kind);
+            try expectEqualStrings("expr", symbols[2].name);
+            try expectEqual(types.SymbolKind.Class, symbols[2].kind);
+            try expectEqualStrings("@on_calc", symbols[3].name);
+            try expectEqual(types.SymbolKind.Function, symbols[3].kind);
+        },
+        else => return error.UnexpectedDocumentSymbols,
+    }
 }
 
 test "named action definitions resolve in the same document" {

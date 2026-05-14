@@ -220,6 +220,19 @@ pub fn main(init: std.process.Init) Error!void {
     );
     try expectCompletionResponse(init.io, allocator, &transport.transport);
 
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 8 },
+        "textDocument/documentSymbol",
+        lsp.ParamsType("textDocument/documentSymbol"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectDocumentSymbolsResponse(init.io, allocator, &transport.transport);
+
     try transport.transport.writeNotification(
         init.io,
         allocator,
@@ -536,6 +549,50 @@ fn expectCompletionResponse(
     try expect(!hasCompletionLabel(items, "%ifdef"));
 }
 
+fn expectDocumentSymbolsResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+) Error!void {
+    const json_message = try transport.readJsonMessage(io, allocator);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const symbols_value = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = 8 })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const symbols_result = try std.json.parseFromValue(
+        lsp.ResultType("textDocument/documentSymbol"),
+        allocator,
+        symbols_value,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer symbols_result.deinit();
+
+    const resolved = symbols_result.value orelse return error_set.UnexpectedResponse;
+    const symbols = switch (resolved) {
+        .document_symbols => |items| items,
+        .symbol_informations => return error_set.UnexpectedResponse,
+    };
+
+    try expect(hasDocumentSymbol(symbols, "calc", .Class));
+    try expect(hasDocumentSymbol(symbols, "expr", .Class));
+}
+
 fn expectShutdownResponse(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -581,6 +638,20 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
 fn hasCompletionLabel(items: []const lsp.types.flat.CompletionItem, label: []const u8) bool {
     for (items) |item| {
         if (std.mem.eql(u8, item.label, label)) return true;
+    }
+    return false;
+}
+
+fn hasDocumentSymbol(
+    items: []const lsp.types.flat.DocumentSymbol,
+    name: []const u8,
+    kind: lsp.types.flat.SymbolKind,
+) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name) and item.kind == kind) return true;
+        if (item.children) |children| {
+            if (hasDocumentSymbol(children, name, kind)) return true;
+        }
     }
     return false;
 }
