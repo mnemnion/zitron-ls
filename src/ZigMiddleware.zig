@@ -47,7 +47,6 @@ pub const Error =
     error{
         ChildProcessFailed,
         MissingGeneratedDocument,
-        MissingLineMap,
         RequestFailed,
         UnexpectedResponse,
         UnsupportedUri,
@@ -58,7 +57,7 @@ const GeneratedDocument = struct {
     source_path: []u8,
     generated_uri: []u8,
     generated_text: []u8,
-    line_map: ?LineMap,
+    code_map: CodeMap,
     generation_error: ?[]u8,
     version: i32,
     opened: bool,
@@ -68,7 +67,7 @@ const GeneratedDocument = struct {
         allocator.free(doc.source_path);
         allocator.free(doc.generated_uri);
         allocator.free(doc.generated_text);
-        if (doc.line_map) |*map| map.deinit(allocator);
+        doc.code_map.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
     }
 };
@@ -133,10 +132,11 @@ pub fn syncDocument(
     uri: []const u8,
     version: i32,
     source_text: []const u8,
+    source_root: ts.Node,
 ) Error!void {
     switch (middleware.mode) {
         .disabled => {},
-        .enabled => |*mware| try mware.syncDocument(uri, version, source_text),
+        .enabled => |*mware| try mware.syncDocument(uri, version, source_text, source_root),
     }
 }
 
@@ -237,6 +237,7 @@ fn middlewareSyncDocument(
     uri: []const u8,
     version: i32,
     source_text: []const u8,
+    source_root: ts.Node,
 ) Error!void {
     const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
     if (!gop.found_existing) {
@@ -254,7 +255,7 @@ fn middlewareSyncDocument(
             .source_path = source_path,
             .generated_uri = generated_uri,
             .generated_text = try middleware.allocator.alloc(u8, 0),
-            .line_map = null,
+            .code_map = .{},
             .generation_error = null,
             .version = version,
             .opened = false,
@@ -284,11 +285,7 @@ fn middlewareSyncDocument(
     }
     errdefer middleware.allocator.free(generated.stdout);
 
-    if (doc.line_map) |*line_map| {
-        try line_map.update(middleware.allocator, generated.stdout, doc.source_path);
-    } else {
-        doc.line_map = try LineMap.parse(middleware.allocator, generated.stdout, doc.source_path);
-    }
+    try doc.code_map.update(middleware.allocator, source_root, generated.stdout, doc.source_path);
 
     if (doc.opened) {
         var text_changes = try diff.textChanges(middleware.allocator, doc.generated_text, generated.stdout, .@"utf-8");
@@ -354,13 +351,13 @@ fn middlewareForwardHover(
     params: types.HoverParams,
 ) Error!?types.Hover {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/hover", mapped);
-    if (result) |*hover_result| translateHover(hover_result, line_map);
+    if (result) |*hover_result| translateHover(hover_result, code_map);
     return result;
 }
 
@@ -371,13 +368,13 @@ fn middlewareForwardDefinition(
     params: types.DefinitionParams,
 ) Error!lsp.ResultType("textDocument/definition") {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/definition", mapped)) orelse return null;
-    return try translateDefinition(arena, result, line_map, doc.generated_uri, doc.source_uri);
+    return try translateDefinition(arena, result, code_map, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardReferences(
@@ -387,13 +384,13 @@ fn middlewareForwardReferences(
     params: types.ReferenceParams,
 ) Error!lsp.ResultType("textDocument/references") {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse return null;
-    return try translateLocations(arena, result, line_map, doc.generated_uri, doc.source_uri);
+    return try translateLocations(arena, result, code_map, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardCompletion(
@@ -403,13 +400,13 @@ fn middlewareForwardCompletion(
     params: types.CompletionParams,
 ) Error!lsp.ResultType("textDocument/completion") {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/completion", mapped);
-    try translateCompletionResult(arena, &result, line_map);
+    try translateCompletionResult(arena, &result, code_map);
     return result;
 }
 
@@ -419,11 +416,11 @@ fn middlewareForwardDocumentSymbols(
     source_uri: []const u8,
 ) Error!?[]const types.DocumentSymbol {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     const result = (try middleware.request(arena, "textDocument/documentSymbol", .{
         .textDocument = .{ .uri = doc.generated_uri },
     })) orelse return null;
-    return try translateDocumentSymbols(arena, result, line_map);
+    return try translateDocumentSymbols(arena, result, code_map);
 }
 
 fn middlewareForwardRename(
@@ -433,17 +430,17 @@ fn middlewareForwardRename(
     params: types.RenameParams,
 ) Error!lsp.ResultType("textDocument/rename") {
     const doc = try middleware.documentReady(source_uri);
-    const line_map = &(doc.line_map.?);
+    const code_map = &doc.code_map;
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse return null;
-    return try translateWorkspaceEdit(arena, result, line_map, doc.generated_uri, doc.source_uri);
+    return try translateWorkspaceEdit(arena, result, code_map, doc.generated_uri, doc.source_uri);
 }
 
-/// Bidirectional line mapping derived from Zitron `// #line` comments.
-pub const LineMap = struct {
+/// Mapping between original Zitron code blocks and generated Zig code.
+pub const CodeMap = struct {
     /// Spans are stored in generated-line order, which is the order encountered
     /// while scanning the generated Zig file.
     spans: std.ArrayList(Span) = .empty,
@@ -451,13 +448,15 @@ pub const LineMap = struct {
     /// lookups. The buffer is retained across updates.
     source_order: std.ArrayList(usize) = .empty,
 
-    // TODO: this should also retain the offsets which begin and end each
-    // translated code block (we don't care about the template code, only the
-    // translated code). that won't be used immediately, but we need it, and
-    // this is when we're traversing the generated text, so we get it now.
+    /// Half-open byte range in either the source or generated text.
+    pub const ByteRange = struct {
+        start: usize,
+        end: usize,
+    };
 
-    /// One contiguous translated range.  The source and generated ranges have
-    /// the same length, so one object records both coordinate systems.
+    /// One contiguous translated range. Line spans keep the legacy LSP
+    /// position mapping; byte ranges keep the actual code-block extents for
+    /// later transformed-code handling.
     const Span = struct {
         /// First zero-based line in the original `.zy` document.
         source_line: u32,
@@ -465,6 +464,10 @@ pub const LineMap = struct {
         generated_line: u32,
         /// Number of contiguous mapped lines shared by both coordinate systems.
         line_count: u32,
+        /// Half-open byte range in the original `.zy` document.
+        source_range: ByteRange,
+        /// Half-open byte range in the generated Zig document.
+        generated_range: ByteRange,
 
         /// Exclusive source-line end.  Keeping this as a helper avoids repeating
         /// the half-open interval convention at every lookup site.
@@ -494,26 +497,37 @@ pub const LineMap = struct {
 
     /// Parses generated Zig into an initial map by delegating to `update`, so the
     /// initial build and incremental rebuild use the same span coalescing rules.
-    pub fn parse(allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!LineMap {
-        var map: LineMap = .{};
+    pub fn parse(
+        allocator: std.mem.Allocator,
+        source_root: ts.Node,
+        generated_text: []const u8,
+        source_path: []const u8,
+    ) OOM!CodeMap {
+        var map: CodeMap = .{};
         errdefer map.deinit(allocator);
-        try map.update(allocator, generated_text, source_path);
+        try map.update(allocator, source_root, generated_text, source_path);
         return map;
     }
 
     /// Rebuilds this map from freshly generated Zig while retaining the backing
     /// allocations. The number of spans should usually stay stable, so this avoids
     /// churn without carrying incremental tree state.
-    pub fn update(map: *LineMap, allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!void {
+    pub fn update(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        source_root: ts.Node,
+        generated_text: []const u8,
+        source_path: []const u8,
+    ) OOM!void {
         map.spans.clearRetainingCapacity();
         map.source_order.clearRetainingCapacity();
 
-        try map.collectSpans(allocator, generated_text, source_path);
+        try map.collectSpans(allocator, source_root, generated_text, source_path);
         try map.rebuildSourceOrder(allocator);
     }
 
     /// Frees the reusable span and index buffers.
-    pub fn deinit(map: *LineMap, allocator: std.mem.Allocator) void {
+    pub fn deinit(map: *CodeMap, allocator: std.mem.Allocator) void {
         map.spans.deinit(allocator);
         map.source_order.deinit(allocator);
         map.* = .{};
@@ -521,7 +535,7 @@ pub const LineMap = struct {
 
     /// Translates a source position to generated coordinates by finding the
     /// earliest span that contains the source line and preserving the column.
-    pub fn sourcePositionToGenerated(map: *const LineMap, position: types.Position) ?types.Position {
+    pub fn sourcePositionToGenerated(map: *const CodeMap, position: types.Position) ?types.Position {
         const span = map.findSource(position.line) orelse return null;
         return .{
             .line = span.generated_line + (position.line - span.source_line),
@@ -531,7 +545,7 @@ pub const LineMap = struct {
 
     /// Translates a generated position back to source coordinates by finding the
     /// generated-order span containing the generated line and preserving column.
-    pub fn generatedPositionToSource(map: *const LineMap, position: types.Position) ?types.Position {
+    pub fn generatedPositionToSource(map: *const CodeMap, position: types.Position) ?types.Position {
         const span = map.findGenerated(position.line) orelse return null;
         return .{
             .line = span.source_line + (position.line - span.generated_line),
@@ -542,7 +556,7 @@ pub const LineMap = struct {
     /// Translates a generated range only when every generated line in the range is
     /// covered by adjacent mapped spans.  Gaps represent template/generated-only
     /// Zig and cannot be reported as a source range.
-    pub fn generatedRangeToSource(map: *const LineMap, range: types.Range) ?types.Range {
+    pub fn generatedRangeToSource(map: *const CodeMap, range: types.Range) ?types.Range {
         var index = map.findGeneratedIndex(range.start.line) orelse return null;
         while (map.spans.items[index].orderGenerated(range.end.line) != .eq) {
             const next_index = index + 1;
@@ -559,54 +573,63 @@ pub const LineMap = struct {
 
     /// Scans generated text for `#line` comments and coalesces consecutive mapped
     /// lines into generated-order spans.
-    fn collectSpans(map: *LineMap, allocator: std.mem.Allocator, generated_text: []const u8, source_path: []const u8) OOM!void {
+    fn collectSpans(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        source_root: ts.Node,
+        generated_text: []const u8,
+        source_path: []const u8,
+    ) OOM!void {
         var generated_line: u32 = 0;
-        var active_source_line: ?u32 = null;
+        var generated_offset: usize = 0;
         var active_span: ?Span = null;
-        var lines = std.mem.splitScalar(u8, generated_text, '\n');
-        while (lines.next()) |line| : (generated_line += 1) {
+        var generated_lines = std.mem.splitScalar(u8, generated_text, '\n');
+        while (generated_lines.next()) |line| : (generated_line += 1) {
+            const line_end = generated_offset + line.len;
+            const next_generated_offset = if (line_end < generated_text.len) line_end + 1 else line_end;
+
             if (parseLineDirective(line)) |directive| {
-                if (active_span) |span| try map.spans.append(allocator, span);
-                active_span = null;
-                active_source_line = if (std.mem.eql(u8, directive.path, source_path))
-                    directive.line
-                else
-                    null;
-                continue;
-            }
-
-            const source_line = active_source_line orelse {
-                if (active_span) |span| try map.spans.append(allocator, span);
-                active_span = null;
-                continue;
-            };
-
-            if (active_span) |*span| {
-                if (span.sourceEnd() == source_line and span.generatedEnd() == generated_line) {
-                    span.line_count += 1;
-                } else {
-                    try map.spans.append(allocator, span.*);
-                    active_span = .{
-                        .source_line = source_line,
-                        .generated_line = generated_line,
-                        .line_count = 1,
-                    };
+                try map.processActiveSpan(allocator, &active_span, generated_line, generated_offset);
+                if (std.mem.eql(u8, directive.path, source_path)) {
+                    if (zigCodeRangeForLine(source_root, directive.line)) |source_range| {
+                        active_span = .{
+                            .source_line = directive.line,
+                            .generated_line = generated_line + 1,
+                            .line_count = 0,
+                            .source_range = source_range,
+                            .generated_range = .{
+                                .start = next_generated_offset,
+                                .end = next_generated_offset,
+                            },
+                        };
+                    }
                 }
-            } else {
-                active_span = .{
-                    .source_line = source_line,
-                    .generated_line = generated_line,
-                    .line_count = 1,
-                };
             }
-            active_source_line = source_line + 1;
+
+            generated_offset = next_generated_offset;
         }
 
-        if (active_span) |span| try map.spans.append(allocator, span);
+        try map.processActiveSpan(allocator, &active_span, generated_line, generated_offset);
+    }
+
+    fn processActiveSpan(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        active_span: *?Span,
+        end_generated_line: u32,
+        end_generated_offset: usize,
+    ) OOM!void {
+        var span = active_span.* orelse return;
+        active_span.* = null;
+        const line_count = end_generated_line - span.generated_line;
+        if (line_count == 0) return;
+        span.line_count = line_count;
+        span.generated_range.end = end_generated_offset;
+        try map.spans.append(allocator, span);
     }
 
     /// Rebuilds the source-order index over the current span buffer.
-    fn rebuildSourceOrder(map: *LineMap, allocator: std.mem.Allocator) OOM!void {
+    fn rebuildSourceOrder(map: *CodeMap, allocator: std.mem.Allocator) OOM!void {
         try map.source_order.ensureTotalCapacity(allocator, map.spans.items.len);
         for (0..map.spans.items.len) |index| {
             try map.source_order.append(allocator, index);
@@ -616,18 +639,18 @@ pub const LineMap = struct {
 
     /// Returns the number of spans in the map.  Tests use this to assert
     /// that multi-line ranges stay coalesced instead of becoming per-line nodes.
-    fn len(map: *const LineMap) usize {
+    fn len(map: *const CodeMap) usize {
         return map.spans.items.len;
     }
 
     /// Finds a generated-order span containing a generated line.
-    fn findGenerated(map: *const LineMap, line: u32) ?Span {
+    fn findGenerated(map: *const CodeMap, line: u32) ?Span {
         const index = map.findGeneratedIndex(line) orelse return null;
         return map.spans.items[index];
     }
 
     /// Finds the index of a generated-order span containing a generated line.
-    fn findGeneratedIndex(map: *const LineMap, line: u32) ?usize {
+    fn findGeneratedIndex(map: *const CodeMap, line: u32) ?usize {
         var low: usize = 0;
         var high: usize = map.spans.items.len;
         while (low < high) {
@@ -643,18 +666,18 @@ pub const LineMap = struct {
     }
 
     /// Finds the earliest generated span containing a source line.
-    fn findSource(map: *const LineMap, line: u32) ?Span {
+    fn findSource(map: *const CodeMap, line: u32) ?Span {
         const index = map.findSourceIndex(line) orelse return null;
         return map.spans.items[map.source_order.items[index]];
     }
 
-    fn spanInSourceOrder(map: *const LineMap, index: usize) Span {
+    fn spanInSourceOrder(map: *const CodeMap, index: usize) Span {
         return map.spans.items[map.source_order.items[index]];
     }
 
     /// Finds the source-order index of the earliest generated span containing a
     /// source line.
-    fn findSourceIndex(map: *const LineMap, line: u32) ?usize {
+    fn findSourceIndex(map: *const CodeMap, line: u32) ?usize {
         var low: usize = 0;
         var high: usize = map.source_order.items.len;
         var found: ?usize = null;
@@ -674,8 +697,7 @@ pub const LineMap = struct {
     }
 
     /// Sorts source indexes by source start, then generated start.  The
-    /// generated tie-breaker makes duplicate source lines choose the earliest
-    /// generated mapping.
+    /// generated tie-breaker keeps defensive duplicate mappings deterministic.
     fn sourceIndexLessThan(spans: []const Span, lhs_index: usize, rhs_index: usize) bool {
         const lhs = spans[lhs_index];
         const rhs = spans[rhs_index];
@@ -685,8 +707,56 @@ pub const LineMap = struct {
     }
 };
 
-/// Parsed form of a generated `// #line N path` marker.  Zitron emits these
-/// markers as the only bridge between generated Zig and original Zitron source.
+fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?CodeMap.ByteRange {
+    const line_start: ts.Point = .{ .row = line, .column = 0 };
+    var node = source_root.descendantForPointRange(line_start, lineEndPoint(source_root, line)) orelse return null;
+    if (std.mem.eql(u8, node.kind(), "zig_code")) return byteRangeForNode(node);
+
+    while (true) {
+        const zig_code = descendantOfKindOnLine(node, "zig_code", line) orelse {
+            node = node.parent() orelse return null;
+            continue;
+        };
+        return byteRangeForNode(zig_code);
+    }
+}
+
+fn lineEndPoint(source_root: ts.Node, line: u32) ts.Point {
+    const source_end = source_root.endPoint();
+    if (source_end.row == line) return source_end;
+    return .{ .row = line, .column = std.math.maxInt(u32) };
+}
+
+fn descendantOfKindOnLine(node: ts.Node, kind: []const u8, line: u32) ?ts.Node {
+    var cursor = node.walk();
+    defer cursor.destroy();
+
+    while (true) {
+        const current = cursor.node();
+        if (nodeContainsLine(current, line)) {
+            if (std.mem.eql(u8, current.kind(), kind)) return current;
+            if (cursor.gotoFirstChild()) continue;
+        }
+
+        while (!cursor.gotoNextSibling()) {
+            if (!cursor.gotoParent()) return null;
+        }
+    }
+}
+
+fn nodeContainsLine(node: ts.Node, line: u32) bool {
+    return node.startPoint().row <= line and line <= node.endPoint().row;
+}
+
+fn byteRangeForNode(node: ts.Node) CodeMap.ByteRange {
+    return .{
+        .start = node.startByte(),
+        .end = node.endByte(),
+    };
+}
+
+/// Parsed form of a generated `// #line N path` marker. Zitron emits these
+/// markers to connect generated Zig lines back to original Zitron source lines.
 const LineDirective = struct {
     /// One-based line from the directive, normalized to zero-based LSP lines.
     line: u32,
@@ -723,7 +793,7 @@ fn trimLeft(slice: []const u8, values_to_strip: []const u8) []const u8 {
     return slice[index..];
 }
 
-pub fn translateHover(hover_result: *types.Hover, map: *const LineMap) void {
+pub fn translateHover(hover_result: *types.Hover, map: *const CodeMap) void {
     if (hover_result.range) |range| {
         hover_result.range = map.generatedRangeToSource(range);
     }
@@ -732,7 +802,7 @@ pub fn translateHover(hover_result: *types.Hover, map: *const LineMap) void {
 pub fn translateDefinition(
     arena: std.mem.Allocator,
     definition_result: lsp.types.Definition.Result,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?lsp.types.Definition.Result {
@@ -758,7 +828,7 @@ pub fn translateDefinition(
 pub fn translateDefinitionValue(
     arena: std.mem.Allocator,
     definition_result: types.Definition,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.Definition {
@@ -783,7 +853,7 @@ pub fn translateDefinitionValue(
 
 fn translateDefinitionLink(
     link: types.DefinitionLink,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) ?types.DefinitionLink {
@@ -799,7 +869,7 @@ fn translateDefinitionLink(
 pub fn translateLocations(
     arena: std.mem.Allocator,
     locations: []const types.Location,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?[]const types.Location {
@@ -816,7 +886,7 @@ pub fn translateLocations(
 pub fn translateCompletionResult(
     arena: std.mem.Allocator,
     result: *lsp.ResultType("textDocument/completion"),
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM!void {
     const completion_result = result.* orelse return;
     switch (completion_result) {
@@ -839,7 +909,7 @@ pub fn translateCompletionResult(
 pub fn translateDocumentSymbols(
     arena: std.mem.Allocator,
     result: lsp.types.DocumentSymbol.Result,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM!?[]const types.DocumentSymbol {
     return switch (result) {
         .document_symbols => |symbols| translateDocumentSymbolSlice(arena, symbols, map),
@@ -850,7 +920,7 @@ pub fn translateDocumentSymbols(
 pub fn translateWorkspaceEdit(
     arena: std.mem.Allocator,
     workspace_edit: types.WorkspaceEdit,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.WorkspaceEdit {
@@ -905,7 +975,7 @@ pub fn translateWorkspaceEdit(
     return if (has_changes) translated else null;
 }
 
-fn translateLocation(location: types.Location, map: *const LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
+fn translateLocation(location: types.Location, map: *const CodeMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
         .uri = source_uri,
@@ -916,7 +986,7 @@ fn translateLocation(location: types.Location, map: *const LineMap, generated_ur
 fn translateDocumentSymbolSlice(
     arena: std.mem.Allocator,
     symbols: []const types.DocumentSymbol,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM!?[]const types.DocumentSymbol {
     var translated: std.ArrayList(types.DocumentSymbol) = .empty;
     for (symbols) |symbol| {
@@ -939,7 +1009,7 @@ fn translateDocumentSymbolSlice(
 fn translateDocumentSymbol(
     arena: std.mem.Allocator,
     symbol: types.DocumentSymbol,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM!?types.DocumentSymbol {
     return .{
         .name = symbol.name,
@@ -962,7 +1032,7 @@ fn startsWithYy(name: []const u8) bool {
 fn translateCompletionItems(
     arena: std.mem.Allocator,
     items_const: []const types.CompletionItem,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM![]const types.CompletionItem {
     const items = try arena.dupe(types.CompletionItem, items_const);
     for (items) |*item| {
@@ -987,7 +1057,7 @@ fn translateCompletionItems(
     return items;
 }
 
-fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *const LineMap) ?types.CompletionItem.TextEdit {
+fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *const CodeMap) ?types.CompletionItem.TextEdit {
     return switch (text_edit) {
         .text_edit => |edit| .{ .text_edit = translateTextEdit(edit, map) orelse return null },
         .insert_replace_edit => |edit| .{ .insert_replace_edit = .{
@@ -1000,7 +1070,7 @@ fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *c
 
 fn translateCompletionDefaultEditRange(
     edit_range: lsp.types.ClientCapabilities.TextDocument.Completion.EditRange,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) ?lsp.types.ClientCapabilities.TextDocument.Completion.EditRange {
     return switch (edit_range) {
         .range => |range| .{ .range = map.generatedRangeToSource(range) orelse return null },
@@ -1011,7 +1081,7 @@ fn translateCompletionDefaultEditRange(
     };
 }
 
-fn translateTextEdit(edit: types.TextEdit, map: *const LineMap) ?types.TextEdit {
+fn translateTextEdit(edit: types.TextEdit, map: *const CodeMap) ?types.TextEdit {
     return .{
         .range = map.generatedRangeToSource(edit.range) orelse return null,
         .newText = edit.newText,
@@ -1021,7 +1091,7 @@ fn translateTextEdit(edit: types.TextEdit, map: *const LineMap) ?types.TextEdit 
 fn translateTextEdits(
     arena: std.mem.Allocator,
     edits: []const types.TextEdit,
-    map: *const LineMap,
+    map: *const CodeMap,
 ) OOM![]const types.TextEdit {
     var translated: std.ArrayList(types.TextEdit) = .empty;
     for (edits) |edit| {
@@ -1035,7 +1105,7 @@ fn translateTextEdits(
 fn translateTextDocumentEdit(
     arena: std.mem.Allocator,
     edit: types.TextDocumentEdit,
-    map: *const LineMap,
+    map: *const CodeMap,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.TextDocumentEdit {
@@ -1072,7 +1142,7 @@ fn translateTextDocumentEdit(
     };
 }
 
-fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *const LineMap) ?types.TextEdit.Annotated {
+fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *const CodeMap) ?types.TextEdit.Annotated {
     return .{
         .annotationId = edit.annotationId,
         .range = map.generatedRangeToSource(edit.range) orelse return null,
@@ -1080,7 +1150,7 @@ fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *const LineMa
     };
 }
 
-fn translateSnippetTextEdit(edit: types.TextDocumentEdit.Snippet, map: *const LineMap) ?types.TextDocumentEdit.Snippet {
+fn translateSnippetTextEdit(edit: types.TextDocumentEdit.Snippet, map: *const CodeMap) ?types.TextDocumentEdit.Snippet {
     return .{
         .range = map.generatedRangeToSource(edit.range) orelse return null,
         .snippet = edit.snippet,
@@ -1283,7 +1353,6 @@ fn middlewareNextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
 fn middlewareDocumentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
     const doc = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
     if (doc.generation_error != null) return error.RequestFailed;
-    if (doc.line_map == null) return error.MissingLineMap;
     return doc;
 }
 
@@ -1349,7 +1418,65 @@ fn generatedUriForSourceUri(allocator: std.mem.Allocator, uri: []const u8) Error
     return try std.fmt.allocPrint(allocator, "{s}.zitron.zig", .{uri});
 }
 
-test "line map translates source and generated positions" {
+fn parseCodeMapForTest(source_text: []const u8, generated_text: []const u8, source_path: []const u8) !CodeMap {
+    var allocated_source: ?[]u8 = null;
+    defer if (allocated_source) |source| testing_allocator.free(source);
+    const effective_source = if (std.mem.indexOf(u8, source_text, "// #line") == null) source_text else source: {
+        allocated_source = try genericZigCodeSourceForGeneratedTest(generated_text);
+        break :source allocated_source.?;
+    };
+
+    const tree = try parseZitronTreeForTest(effective_source);
+    defer tree.destroy();
+    return try CodeMap.parse(testing_allocator, tree.rootNode(), generated_text, source_path);
+}
+
+fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: []const u8, source_path: []const u8) !void {
+    var allocated_source: ?[]u8 = null;
+    defer if (allocated_source) |source| testing_allocator.free(source);
+    const effective_source = if (std.mem.indexOf(u8, source_text, "// #line") == null) source_text else source: {
+        allocated_source = try genericZigCodeSourceForGeneratedTest(generated_text);
+        break :source allocated_source.?;
+    };
+
+    const tree = try parseZitronTreeForTest(effective_source);
+    defer tree.destroy();
+    try map.update(testing_allocator, tree.rootNode(), generated_text, source_path);
+}
+
+fn genericZigCodeSourceForGeneratedTest(generated_text: []const u8) OOM![]u8 {
+    var max_source_line: u32 = 0;
+    var generated_line_count: u32 = 0;
+    var generated_lines = std.mem.splitScalar(u8, generated_text, '\n');
+    while (generated_lines.next()) |line| {
+        if (parseLineDirective(line)) |directive| {
+            max_source_line = @max(max_source_line, directive.line);
+        }
+        generated_line_count += 1;
+    }
+
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(testing_allocator);
+    try source.appendSlice(testing_allocator, "%code {\n");
+    for (0..max_source_line + generated_line_count + 1) |_| {
+        try source.append(testing_allocator, '\n');
+    }
+    try source.appendSlice(testing_allocator, "}\n");
+    return try source.toOwnedSlice(testing_allocator);
+}
+
+fn parseZitronTreeForTest(source_text: []const u8) !*ts.Tree {
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(zitronLanguage());
+    return parser.parseString(source_text, null) orelse error.ParseFailed;
+}
+
+fn zitronLanguage() *const ts.Language {
+    return ts.Language.fromRaw(zitron_grammar.language());
+}
+
+test "code map translates source and generated positions" {
     const generated =
         \\const std = @import("std");
         \\// #line 10 samples/calc.zy
@@ -1360,7 +1487,7 @@ test "line map translates source and generated positions" {
         \\ next = answer;
     ;
 
-    var map = try LineMap.parse(testing_allocator, generated, "samples/calc.zy");
+    var map = try parseCodeMapForTest(generated, generated, "samples/calc.zy");
     defer map.deinit(testing_allocator);
 
     try expectEqual(types.Position{ .line = 2, .character = 5 }, map.sourcePositionToGenerated(.{
@@ -1377,7 +1504,7 @@ test "line map translates source and generated positions" {
     }));
 }
 
-test "line map translates only fully mapped generated ranges" {
+test "code map translates only fully mapped generated ranges" {
     const generated =
         \\// #line 20 source.zy
         \\const a = 1;
@@ -1386,7 +1513,7 @@ test "line map translates only fully mapped generated ranges" {
         \\const generated_only = true;
     ;
 
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     try expectEqual(types.Range{
@@ -1403,7 +1530,7 @@ test "line map translates only fully mapped generated ranges" {
     }));
 }
 
-test "line map stores one span for a multi-line mapped range" {
+test "code map stores one span for a multi-line mapped range" {
     const generated =
         \\// #line 20 source.zy
         \\const a = 1;
@@ -1411,7 +1538,7 @@ test "line map stores one span for a multi-line mapped range" {
         \\const c = 3;
     ;
 
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     try expectEqual(@as(usize, 1), map.len());
@@ -1422,7 +1549,7 @@ test "line map stores one span for a multi-line mapped range" {
     }).?);
 }
 
-test "line map update reuses allocation and applies changed spans" {
+test "code map update reuses allocation and applies changed spans" {
     const original =
         \\// #line 10 source.zy
         \\const a = 1;
@@ -1433,13 +1560,13 @@ test "line map update reuses allocation and applies changed spans" {
         \\const d = 4;
     ;
 
-    var map = try LineMap.parse(testing_allocator, original, "source.zy");
+    var map = try parseCodeMapForTest(original, original, "source.zy");
     defer map.deinit(testing_allocator);
 
     const spans_capacity = map.spans.capacity;
     const source_order_capacity = map.source_order.capacity;
 
-    try map.update(testing_allocator, original, "source.zy");
+    try updateCodeMapForTest(&map, original, original, "source.zy");
     try expectEqual(spans_capacity, map.spans.capacity);
     try expectEqual(source_order_capacity, map.source_order.capacity);
 
@@ -1455,7 +1582,7 @@ test "line map update reuses allocation and applies changed spans" {
         \\// #line 33 source.zy
         \\const d = 4;
     ;
-    try map.update(testing_allocator, shifted, "source.zy");
+    try updateCodeMapForTest(&map, shifted, shifted, "source.zy");
 
     try expectEqual(spans_capacity, map.spans.capacity);
     try expectEqual(source_order_capacity, map.source_order.capacity);
@@ -1473,7 +1600,7 @@ test "line map update reuses allocation and applies changed spans" {
     }).?);
 }
 
-test "line map update retains capacity after growing and shrinking" {
+test "code map update retains capacity after growing and shrinking" {
     const one_span =
         \\// #line 10 source.zy
         \\const a = 1;
@@ -1485,21 +1612,21 @@ test "line map update retains capacity after growing and shrinking" {
         \\const b = 2;
     ;
 
-    var map = try LineMap.parse(testing_allocator, one_span, "source.zy");
+    var map = try parseCodeMapForTest(one_span, one_span, "source.zy");
     defer map.deinit(testing_allocator);
 
-    try map.update(testing_allocator, two_spans, "source.zy");
+    try updateCodeMapForTest(&map, two_spans, two_spans, "source.zy");
     try expectEqual(@as(usize, 2), map.len());
     const grown_spans_capacity = map.spans.capacity;
     const grown_source_order_capacity = map.source_order.capacity;
 
-    try map.update(testing_allocator, one_span, "source.zy");
+    try updateCodeMapForTest(&map, one_span, one_span, "source.zy");
     try expectEqual(@as(usize, 1), map.len());
     try expectEqual(grown_spans_capacity, map.spans.capacity);
     try expectEqual(grown_source_order_capacity, map.source_order.capacity);
 }
 
-test "line map source lookup chooses the earliest generated duplicate" {
+test "code map handles duplicate line directives deterministically" {
     const generated =
         \\// #line 5 source.zy
         \\const first = 1;
@@ -1507,7 +1634,7 @@ test "line map source lookup chooses the earliest generated duplicate" {
         \\const second = 2;
     ;
 
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     try expectEqual(types.Position{ .line = 1, .character = 6 }, map.sourcePositionToGenerated(.{
@@ -1520,12 +1647,45 @@ test "line map source lookup chooses the earliest generated duplicate" {
     }).?);
 }
 
+test "code map stores source and generated byte ranges" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+        \\rule ::= TOKEN. { result = token; }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\
+        \\const answer = 42;
+        \\// #line 4 source.zy
+        \\ result = token; // #line 99 source.zig
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try expectEqual(@as(usize, 2), map.len());
+
+    const code_span = map.spans.items[0];
+    try expectEqual(std.mem.indexOf(u8, source, "{\n").? + 1, code_span.source_range.start);
+    try expectEqual(std.mem.indexOf(u8, source, "}\n").?, code_span.source_range.end);
+    try expectEqual(std.mem.indexOf(u8, generated, "\n\n").? + 1, code_span.generated_range.start);
+    try expectEqual(std.mem.indexOf(u8, generated, "// #line 4").?, code_span.generated_range.end);
+
+    const action_span = map.spans.items[1];
+    try expectEqual(std.mem.indexOf(u8, source, "{ result").? + 1, action_span.source_range.start);
+    try expectEqual(std.mem.lastIndexOfScalar(u8, source, '}').?, action_span.source_range.end);
+    try expectEqual(std.mem.indexOf(u8, generated, " result").?, action_span.generated_range.start);
+    try expectEqual(generated.len, action_span.generated_range.end);
+}
+
 test "translates hover and definition results back to source ranges" {
     const generated =
         \\// #line 5 source.zy
         \\const answer = 42;
     ;
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     var hover_result = types.Hover{
@@ -1573,7 +1733,7 @@ test "translates completion edits back to source ranges" {
         \\// #line 5 source.zy
         \\const answer = 42;
     ;
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
     try expectEqual(@as(u32, 4), map.generatedPositionToSource(.{
         .line = 1,
@@ -1613,7 +1773,7 @@ test "translates workspace edit changes back to source ranges" {
         \\// #line 5 source.zy
         \\const answer = 42;
     ;
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     const generated_edits = [_]types.TextEdit{
@@ -1681,7 +1841,7 @@ test "translates document symbols and drops generated yy symbols" {
         \\// #line 20 source.zy
         \\const yyFallback = 1;
     ;
-    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    var map = try parseCodeMapForTest(generated, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     const children = [_]types.DocumentSymbol{
@@ -1802,6 +1962,8 @@ const std = @import("std");
 const diff = @import("diff.zig");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
+const ts = @import("tree-sitter");
+const zitron_grammar = @import("tree_sitter_zitron");
 const JsonParseError = std.json.ParseFromValueError || error{
     BufferUnderrun,
     SyntaxError,

@@ -180,10 +180,12 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
             params.textDocument.version,
-            params.textDocument.text,
+            doc.source,
+            doc.tree.rootNode(),
         );
     }
 
@@ -204,6 +206,7 @@ pub const Server = struct {
             params.textDocument.uri,
             params.textDocument.version,
             doc.source,
+            doc.tree.rootNode(),
         );
     }
 
