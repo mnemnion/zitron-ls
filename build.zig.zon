@@ -18,8 +18,8 @@
             .hash = "tree_sitter-0.26.0-8heIf3CaAQB4SSumoGzq3gLSz2rkvXxcKFyskRWqDGBz",
         },
         .tree_sitter_zitron = .{
-            .url = "https://api.github.com/repos/mnemnion/tree-sitter-zitron/tarball/v0.1.5",
-            .hash = "tree_sitter_zitron-0.1.3-EA3PTLk_AwDRyC9oruPbOPNezpEAfvNOpIJHNJXRsy-Z",
+            .url = "https://api.github.com/repos/mnemnion/tree-sitter-zitron/tarball/v0.1.6",
+            .hash = "tree_sitter_zitron-0.1.6-EA3PTC5BAwBqg066bERqSdRT2tzZK21SvgaoWJojjp97",
         },
         .muad_diff = .{
             // .url = "https://api.github.com/repos/mnemnion/muad-diff/tarball/refs/tags/ohsnap-prerelease-02",

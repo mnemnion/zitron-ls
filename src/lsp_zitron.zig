@@ -47,6 +47,7 @@ fn serverCapabilities(
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
+        .renameProvider = .{ .bool = true },
     };
 }
 
@@ -84,6 +85,7 @@ pub const Server = struct {
     scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(Document),
     tags_query: *ts.Query,
+    rename_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
     zig_middleware: ZigMiddleware,
 
@@ -92,12 +94,15 @@ pub const Server = struct {
         var query_error_offset: u32 = 0;
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
         errdefer tags_query.destroy();
+        const rename_query = try ts.Query.create(zitronLanguage(), rename_query_source, &query_error_offset);
+        errdefer rename_query.destroy();
 
         return .{
             .allocator = allocator,
             .scratch_arena = std.heap.ArenaAllocator.init(allocator),
             .documents = .empty,
             .tags_query = tags_query,
+            .rename_query = rename_query,
             .offset_encoding = .@"utf-16",
             .zig_middleware = ZigMiddleware.disabled(),
         };
@@ -121,6 +126,7 @@ pub const Server = struct {
         }
         server.documents.deinit(server.allocator);
         server.scratch_arena.deinit();
+        server.rename_query.destroy();
         server.tags_query.destroy();
     }
 
@@ -361,6 +367,32 @@ pub const Server = struct {
         return .{
             .document_symbols = try symbols.toOwnedSlice(arena),
         };
+    }
+
+    /// LSP `textDocument/rename` handler for document-local grammar symbols.
+    pub fn @"textDocument/rename"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.RenameParams,
+    ) Error!lsp.ResultType("textDocument/rename") {
+        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const symbol = doc.renameSymbolAtPosition(
+            server.rename_query,
+            server.offset_encoding,
+            params.position,
+        ) orelse return null;
+        const edits = try doc.renameEdits(
+            server.rename_query,
+            arena,
+            symbol,
+            params.newName,
+            server.offset_encoding,
+        );
+        if (edits.len == 0) return null;
+
+        var changes = std.json.ArrayHashMap([]const types.TextEdit){};
+        try changes.map.put(arena, params.textDocument.uri, edits);
+        return .{ .changes = changes };
     }
 
     /// LSP `shutdown` handler required by `lsp-kit`.
@@ -1158,6 +1190,48 @@ test "definition on discard resolves that rule instead of a neighbor" {
     }
 }
 
+test "rename returns grammar-side edits without including aliases" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/rename.zy";
+    const sample =
+        \\%type expr f64
+        \\%type NUMBER {f64}
+        \\start ::= expr(A).
+        \\expr(A) ::= term(A) PLUS|MINUS NUMBER(N). @on_expr(A; N)
+        \\term(A) ::= NUMBER(A).
+        \\%impl @on_expr(A; N) { _ = .{A,N}; }
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const nonterminal_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "expr(A)"),
+        .newName = "expression",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, nonterminal_edit, uri, "expr", "expression", 3);
+    try expectRenamePreservesAliasText(sample, nonterminal_edit, "(A)");
+
+    const terminal_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "PLUS|MINUS"),
+        .newName = "ADD",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, terminal_edit, uri, "PLUS", "ADD", 1);
+    try expectRenamePreservesAliasText(sample, terminal_edit, "|MINUS");
+
+    const action_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "on_expr(A; N)"),
+        .newName = "@on_expression",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, action_edit, uri, "@on_expr", "@on_expression", 2);
+    try expectRenamePreservesAliasText(sample, action_edit, "(A; N)");
+}
+
 test "initialize negotiates position encoding" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1174,6 +1248,39 @@ test "initialize negotiates position encoding" {
     try expectEqual(types.PositionEncodingKind.@"utf-8", result.capabilities.positionEncoding.?);
 }
 
+fn expectRenameEdits(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    uri: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+    expected_count: usize,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    const edits = changes.map.get(uri) orelse return error.UnexpectedRenameResult;
+    try expectEqual(expected_count, edits.len);
+    for (edits) |edit| {
+        try expectEqualStrings(old_name, lsp.offsets.rangeToSlice(source, edit.range, test_offset_encoding));
+        try expectEqualStrings(new_name, edit.newText);
+    }
+}
+
+fn expectRenamePreservesAliasText(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    preserved_text: []const u8,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    var it = changes.map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |edit| {
+            const end = lsp.offsets.positionToIndex(source, edit.range.end, test_offset_encoding);
+            if (std.mem.startsWith(u8, source[end..], preserved_text)) return;
+        }
+    }
+    return error.UnexpectedRenameResult;
+}
+
 const std = @import("std");
 const OOM = std.mem.Allocator.Error;
 const Document = @import("Document.zig");
@@ -1184,6 +1291,7 @@ const types = lsp.types.flat;
 const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
+const rename_query_source = @embedFile("zitron-rename-query");
 const zitron_grammar = @import("tree_sitter_zitron");
 const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";
 

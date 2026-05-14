@@ -31,6 +31,20 @@ pub const SemanticSymbol = struct {
     enclosing_kind: []const u8,
 };
 
+/// Symbol categories that can be renamed within Zitron grammar syntax.
+pub const RenameKind = enum {
+    action,
+    nonterminal,
+    terminal,
+};
+
+/// A renameable grammar-side symbol captured from the rename query.
+pub const RenameSymbol = struct {
+    kind: RenameKind,
+    symbol_name: []const u8,
+    name_node: ts.Node,
+};
+
 /// Result of resolving a symbol lookup at a document position.
 pub const Resolution = union(enum) {
     no_match,
@@ -148,6 +162,36 @@ pub fn resolveAtPosition(
     return if (best) |symbol| .{ .symbol = symbol } else .no_match;
 }
 
+/// Resolves the best renameable grammar-side symbol at the requested position.
+pub fn renameSymbolAtPosition(
+    document: Document,
+    rename_query: *const ts.Query,
+    offset_encoding: lsp.offsets.Encoding,
+    position: types.Position,
+) ?RenameSymbol {
+    const source_index = lsp.offsets.positionToIndex(document.source, position, offset_encoding);
+    const point = tsPointFromIndex(document.source, source_index);
+    const root = document.tree.rootNode();
+    const raw_node = root.descendantForPointRange(point, point) orelse return null;
+    if (containsUnsupportedCode(raw_node)) return null;
+    const node = root.namedDescendantForPointRange(point, point) orelse return null;
+    if (containsUnsupportedCode(node)) return null;
+
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(rename_query, root);
+
+    var best: ?RenameSymbol = null;
+    while (cursor.nextMatch()) |match| {
+        const candidate = renameSymbolForMatch(rename_query, document.source, source_index, match) orelse continue;
+        if (best == null or isBetterRenameMatch(candidate, best.?, source_index)) {
+            best = candidate;
+        }
+    }
+
+    return best;
+}
+
 /// Returns whether the requested position is within embedded Zig source.
 pub fn containsZigCodeAtPosition(
     document: Document,
@@ -171,6 +215,41 @@ pub fn findRuleDefinition(document: Document, tags_query: *const ts.Query, symbo
 /// Finds the definition symbol for a named action in this document.
 pub fn findActionDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
     return document.findDefinition(tags_query, symbol_name, .action_definition);
+}
+
+/// Builds same-document text edits for a grammar-side rename.
+pub fn renameEdits(
+    document: Document,
+    rename_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    symbol: RenameSymbol,
+    new_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM![]const types.TextEdit {
+    var edits: std.ArrayList(types.TextEdit) = .empty;
+    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_starts.deinit(arena);
+
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(rename_query, document.tree.rootNode());
+
+    while (cursor.nextMatch()) |match| {
+        const candidate = renameSymbolForMatch(rename_query, document.source, null, match) orelse continue;
+        if (candidate.kind != symbol.kind) continue;
+        if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
+
+        const start = candidate.name_node.startByte();
+        const gop = try seen_starts.getOrPut(arena, start);
+        if (gop.found_existing) continue;
+
+        try edits.append(arena, .{
+            .range = renameRangeFromNode(document.source, candidate.name_node, offset_encoding),
+            .newText = new_name,
+        });
+    }
+
+    return try edits.toOwnedSlice(arena);
 }
 
 /// Collects same-document references for the resolved semantic symbol.
@@ -370,11 +449,41 @@ fn semanticSymbolForMatch(
     };
 }
 
+fn renameSymbolForMatch(
+    query: *const ts.Query,
+    source: []const u8,
+    source_index: ?usize,
+    match: ts.Query.Match,
+) ?RenameSymbol {
+    for (match.captures) |capture| {
+        const capture_name = query.captureNameForId(capture.index) orelse continue;
+        if (!std.mem.eql(u8, capture_name, "name")) continue;
+        if (source_index) |index| {
+            if (!nodeContainsIndex(capture.node, index)) continue;
+        }
+        return .{
+            .kind = renameKindForNode(capture.node) orelse return null,
+            .symbol_name = normalizeSymbolName(sliceForNode(source, capture.node)),
+            .name_node = capture.node,
+        };
+    }
+
+    return null;
+}
+
 fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
     if (std.mem.eql(u8, capture_name, "definition.class")) return .rule_definition;
     if (std.mem.eql(u8, capture_name, "reference.class")) return .rule_reference;
     if (std.mem.eql(u8, capture_name, "definition.interface")) return .action_definition;
     if (std.mem.eql(u8, capture_name, "reference.implementation")) return .action_implementation;
+    return null;
+}
+
+fn renameKindForNode(node: ts.Node) ?RenameKind {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "action_name")) return .action;
+    if (std.mem.eql(u8, kind, "nonterminal")) return .nonterminal;
+    if (std.mem.eql(u8, kind, "terminal")) return .terminal;
     return null;
 }
 
@@ -398,6 +507,16 @@ fn isBetterMatch(candidate: SemanticSymbol, current: SemanticSymbol, source_inde
     return candidate_span < current_span;
 }
 
+fn isBetterRenameMatch(candidate: RenameSymbol, current: RenameSymbol, source_index: usize) bool {
+    const candidate_hits_name = nodeContainsIndex(candidate.name_node, source_index);
+    const current_hits_name = nodeContainsIndex(current.name_node, source_index);
+    if (candidate_hits_name != current_hits_name) return candidate_hits_name;
+
+    const candidate_len = candidate.name_node.endByte() - candidate.name_node.startByte();
+    const current_len = current.name_node.endByte() - current.name_node.startByte();
+    return candidate_len < current_len;
+}
+
 fn containsUnsupportedCode(node: ts.Node) bool {
     var cursor = node;
     while (true) {
@@ -416,6 +535,18 @@ fn sliceForNode(source: []const u8, node: ts.Node) []const u8 {
 fn normalizeSymbolName(symbol_name: []const u8) []const u8 {
     const open_paren = std.mem.indexOfScalar(u8, symbol_name, '(') orelse return symbol_name;
     return std.mem.trimEnd(u8, symbol_name[0..open_paren], " \t");
+}
+
+fn renameRangeFromNode(source: []const u8, node: ts.Node, offset_encoding: lsp.offsets.Encoding) types.Range {
+    const slice = sliceForNode(source, node);
+    const open_paren = std.mem.indexOfScalar(u8, slice, '(') orelse {
+        return rangeFromNode(source, node, offset_encoding);
+    };
+    const start = node.startByte();
+    return lsp.offsets.locToRange(source, .{
+        .start = start,
+        .end = start + std.mem.trimEnd(u8, slice[0..open_paren], " \t").len,
+    }, offset_encoding);
 }
 
 fn tsPointFromIndex(source: []const u8, index: usize) ts.Point {

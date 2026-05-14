@@ -38,6 +38,9 @@ pub fn build(b: *std.Build) void {
     lsp_zitron_mod.addAnonymousImport("zitron-tags-query", .{
         .root_source_file = b.path("src/zitron-tags-query.scm"),
     });
+    lsp_zitron_mod.addAnonymousImport("zitron-rename-query", .{
+        .root_source_file = b.path("src/zitron-rename-query.scm"),
+    });
     lsp_zitron_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
 
     const exe_mod = b.createModule(.{

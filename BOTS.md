@@ -23,73 +23,9 @@ Some example LSPs:
 
 - https://github.com/kristoff-it/ziggy
 
-First up is just getting everything functional. I have samples of the
-syntax which we'll add early.
+## Tree-Sitter
 
-The longer-term plan is to also integrate zitron (for transforming grammars
-as they're edited), and ZLS, so we can serve as a middleman to transfer
-LSP requests back and forth from ZLS to the original source code, example:
-go-to-definition within a grammar action.
-
-## Server Capabilities Checklist
-
-This list tracks what the server currently advertises.
-
-- [✅] `positionEncoding`
-- [✅] `textDocumentSync`
-- [  ] `notebookDocumentSync`
-- [  ] `completionProvider`
-- [✅] `hoverProvider`
-- [  ] `signatureHelpProvider`
-- [  ] `declarationProvider`
-- [✅] `definitionProvider`
-- [  ] `typeDefinitionProvider`
-- [  ] `implementationProvider`
-- [✅] `referencesProvider`
-- [  ] `documentHighlightProvider`
-- [  ] `documentSymbolProvider`
-- [  ] `codeActionProvider`
-- [  ] `codeLensProvider`
-- [  ] `documentLinkProvider`
-- [  ] `colorProvider`
-- [  ] `workspaceSymbolProvider`
-- [  ] `documentFormattingProvider`
-- [  ] `documentRangeFormattingProvider`
-- [  ] `documentOnTypeFormattingProvider`
-- [  ] `renameProvider`
-- [  ] `foldingRangeProvider`
-- [  ] `selectionRangeProvider`
-- [  ] `executeCommandProvider`
-- [  ] `callHierarchyProvider`
-- [  ] `linkedEditingRangeProvider`
-- [  ] `semanticTokensProvider`
-- [  ] `monikerProvider`
-- [  ] `typeHierarchyProvider`
-- [  ] `inlineValueProvider`
-- [  ] `inlayHintProvider`
-- [  ] `diagnosticProvider`
-- [  ] `inlineCompletionProvider`
-- [  ] `workspace`
-- [  ] `workspace.workspaceFolders`
-- [  ] `workspace.fileOperations`
-- [  ] `experimental`
-
-## Pre-Commit
-
-Before committing in this repo, run:
-
-- `zig fmt` on each touched Zig file
-- `zig build test smoke run-client`
-
-Until otherwise directed, do not run:
-
-  - `zig build coverage`
-
-The other `zig build` commands are not relevant to pre-commit, consider
-`coverage` stubbed out.
-
-## Future Work
-
-- Maintain a proper data structure for tracking line offsets, so LSP
-  change processing and tree-sitter edit conversion do not need to
-  rescan the document prefix for each change.
+If tree-sitter is not doing what it ought to, DO NOT work around that
+with elaborate server-side code.  Stop what you're doing and tell Sam
+what's going on, because the fix probably belongs on the tree-sitter
+parser side.

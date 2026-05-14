@@ -51,7 +51,7 @@ Legend:
 - [ ] Range formatting
 - [ ] Ranges formatting
 - [ ] On-type formatting
-- [ ] Rename
+- [✅] Rename (no ⚡️)
 - [ ] Prepare rename
 - [ ] Folding ranges
 - [ ] Selection ranges
@@ -122,7 +122,7 @@ Legend:
 - [ ] Cross-document grammar references
 - [ ] Cross-document grammar symbols
 - [ ] Include/import graph awareness
-- [ ] Grammar rename refactoring
+- [✅] Grammar rename refactoring (no ⚡️)
 - [ ] Grammar extract action refactoring
 - [ ] Grammar code actions for missing definitions
 - [ ] Grammar code actions for unreachable productions
