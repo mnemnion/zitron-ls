@@ -376,6 +376,10 @@ pub const Server = struct {
         params: types.RenameParams,
     ) Error!lsp.ResultType("textDocument/rename") {
         const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
+            return try server.zig_middleware.forwardRename(arena, params.textDocument.uri, params);
+        }
+
         const symbol = doc.renameSymbolAtPosition(
             server.rename_query,
             server.offset_encoding,

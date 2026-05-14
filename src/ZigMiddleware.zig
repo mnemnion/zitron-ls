@@ -27,6 +27,7 @@ const Middleware = struct {
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
     const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
+    const forwardRename = middlewareForwardRename;
     const initializeZls = middlewareInitializeZls;
     const shutdownZls = middlewareShutdownZls;
     const request = middlewareRequest;
@@ -202,6 +203,18 @@ pub fn forwardDocumentSymbols(
     return switch (middleware.mode) {
         .disabled => null,
         .enabled => |*mware| try mware.forwardDocumentSymbols(arena, source_uri),
+    };
+}
+
+pub fn forwardRename(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.RenameParams,
+) Error!lsp.ResultType("textDocument/rename") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardRename(arena, source_uri, params),
     };
 }
 
@@ -411,6 +424,22 @@ fn middlewareForwardDocumentSymbols(
         .textDocument = .{ .uri = doc.generated_uri },
     })) orelse return null;
     return try translateDocumentSymbols(arena, result, line_map);
+}
+
+fn middlewareForwardRename(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.RenameParams,
+) Error!lsp.ResultType("textDocument/rename") {
+    const doc = try middleware.documentReady(source_uri);
+    const line_map = &(doc.line_map.?);
+    var mapped = params;
+    mapped.textDocument = .{ .uri = doc.generated_uri };
+    mapped.position = line_map.sourcePositionToGenerated(params.position) orelse return null;
+
+    const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse return null;
+    return try translateWorkspaceEdit(arena, result, line_map, doc.generated_uri, doc.source_uri);
 }
 
 /// Bidirectional line mapping derived from Zitron `// #line` comments.
@@ -818,6 +847,64 @@ pub fn translateDocumentSymbols(
     };
 }
 
+pub fn translateWorkspaceEdit(
+    arena: std.mem.Allocator,
+    workspace_edit: types.WorkspaceEdit,
+    map: *const LineMap,
+    generated_uri: []const u8,
+    source_uri: []const u8,
+) OOM!?types.WorkspaceEdit {
+    var translated = workspace_edit;
+    var has_changes = false;
+
+    if (workspace_edit.changes) |changes| {
+        var translated_changes = std.json.ArrayHashMap([]const types.TextEdit){};
+        var it = changes.map.iterator();
+        while (it.next()) |entry| {
+            const uri = entry.key_ptr.*;
+            const edits = entry.value_ptr.*;
+            const translated_edits = if (std.mem.eql(u8, uri, generated_uri))
+                try translateTextEdits(arena, edits, map)
+            else
+                edits;
+            if (translated_edits.len == 0) continue;
+
+            const translated_uri = if (std.mem.eql(u8, uri, generated_uri)) source_uri else uri;
+            try translated_changes.map.put(arena, translated_uri, translated_edits);
+        }
+
+        if (translated_changes.map.count() != 0) {
+            translated.changes = translated_changes;
+            has_changes = true;
+        } else {
+            translated.changes = null;
+        }
+    }
+
+    if (workspace_edit.documentChanges) |document_changes| {
+        var translated_document_changes: std.ArrayList(@TypeOf(document_changes[0])) = .empty;
+        for (document_changes) |change| {
+            switch (change) {
+                .text_document_edit => |edit| {
+                    if (try translateTextDocumentEdit(arena, edit, map, generated_uri, source_uri)) |translated_edit| {
+                        try translated_document_changes.append(arena, .{ .text_document_edit = translated_edit });
+                    }
+                },
+                else => try translated_document_changes.append(arena, change),
+            }
+        }
+
+        if (translated_document_changes.items.len != 0) {
+            translated.documentChanges = try translated_document_changes.toOwnedSlice(arena);
+            has_changes = true;
+        } else {
+            translated.documentChanges = null;
+        }
+    }
+
+    return if (has_changes) translated else null;
+}
+
 fn translateLocation(location: types.Location, map: *const LineMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
@@ -928,6 +1015,76 @@ fn translateTextEdit(edit: types.TextEdit, map: *const LineMap) ?types.TextEdit 
     return .{
         .range = map.generatedRangeToSource(edit.range) orelse return null,
         .newText = edit.newText,
+    };
+}
+
+fn translateTextEdits(
+    arena: std.mem.Allocator,
+    edits: []const types.TextEdit,
+    map: *const LineMap,
+) OOM![]const types.TextEdit {
+    var translated: std.ArrayList(types.TextEdit) = .empty;
+    for (edits) |edit| {
+        if (translateTextEdit(edit, map)) |mapped| {
+            try translated.append(arena, mapped);
+        }
+    }
+    return try translated.toOwnedSlice(arena);
+}
+
+fn translateTextDocumentEdit(
+    arena: std.mem.Allocator,
+    edit: types.TextDocumentEdit,
+    map: *const LineMap,
+    generated_uri: []const u8,
+    source_uri: []const u8,
+) OOM!?types.TextDocumentEdit {
+    if (!std.mem.eql(u8, edit.textDocument.uri, generated_uri)) return edit;
+
+    var translated_edits: std.ArrayList(@TypeOf(edit.edits[0])) = .empty;
+    for (edit.edits) |document_edit| {
+        switch (document_edit) {
+            .text_edit => |text_edit| {
+                if (translateTextEdit(text_edit, map)) |translated| {
+                    try translated_edits.append(arena, .{ .text_edit = translated });
+                }
+            },
+            .annotated_text_edit => |annotated| {
+                if (translateAnnotatedTextEdit(annotated, map)) |translated| {
+                    try translated_edits.append(arena, .{ .annotated_text_edit = translated });
+                }
+            },
+            .snippet_text_edit => |snippet| {
+                if (translateSnippetTextEdit(snippet, map)) |translated| {
+                    try translated_edits.append(arena, .{ .snippet_text_edit = translated });
+                }
+            },
+        }
+    }
+    if (translated_edits.items.len == 0) return null;
+
+    return .{
+        .textDocument = .{
+            .uri = source_uri,
+            .version = null,
+        },
+        .edits = try translated_edits.toOwnedSlice(arena),
+    };
+}
+
+fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *const LineMap) ?types.TextEdit.Annotated {
+    return .{
+        .annotationId = edit.annotationId,
+        .range = map.generatedRangeToSource(edit.range) orelse return null,
+        .newText = edit.newText,
+    };
+}
+
+fn translateSnippetTextEdit(edit: types.TextDocumentEdit.Snippet, map: *const LineMap) ?types.TextDocumentEdit.Snippet {
+    return .{
+        .range = map.generatedRangeToSource(edit.range) orelse return null,
+        .snippet = edit.snippet,
+        .annotationId = edit.annotationId,
     };
 }
 
@@ -1449,6 +1606,68 @@ test "translates completion edits back to source ranges" {
         },
         else => return error.UnexpectedCompletion,
     }
+}
+
+test "translates workspace edit changes back to source ranges" {
+    const generated =
+        \\// #line 5 source.zy
+        \\const answer = 42;
+    ;
+    var map = try LineMap.parse(testing_allocator, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const generated_edits = [_]types.TextEdit{
+        .{
+            .range = .{
+                .start = .{ .line = 1, .character = 6 },
+                .end = .{ .line = 1, .character = 12 },
+            },
+            .newText = "solution",
+        },
+        .{
+            .range = .{
+                .start = .{ .line = 20, .character = 0 },
+                .end = .{ .line = 20, .character = 6 },
+            },
+            .newText = "dropped",
+        },
+    };
+    const other_edits = [_]types.TextEdit{.{
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 5 },
+        },
+        .newText = "other",
+    }};
+
+    var changes = std.json.ArrayHashMap([]const types.TextEdit){};
+    defer changes.deinit(testing_allocator);
+    try changes.map.put(testing_allocator, "file:///source.zitron.zig", &generated_edits);
+    try changes.map.put(testing_allocator, "file:///other.zig", &other_edits);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = (try translateWorkspaceEdit(
+        arena_state.allocator(),
+        .{ .changes = changes },
+        &map,
+        "file:///source.zitron.zig",
+        "file:///source.zy",
+    )) orelse return error.UnexpectedWorkspaceEdit;
+
+    const translated_changes = translated.changes orelse return error.UnexpectedWorkspaceEdit;
+    const source_edits = translated_changes.map.get("file:///source.zy") orelse return error.UnexpectedWorkspaceEdit;
+    try expectEqual(@as(usize, 1), source_edits.len);
+    try expectEqual(types.Range{
+        .start = .{ .line = 4, .character = 6 },
+        .end = .{ .line = 4, .character = 12 },
+    }, source_edits[0].range);
+    try expectEqualStrings("solution", source_edits[0].newText);
+
+    const preserved_edits = translated_changes.map.get("file:///other.zig") orelse return error.UnexpectedWorkspaceEdit;
+    try expectEqual(@as(usize, 1), preserved_edits.len);
+    try expectEqualStrings("other", preserved_edits[0].newText);
 }
 
 test "translates document symbols and drops generated yy symbols" {
