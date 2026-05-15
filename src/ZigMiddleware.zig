@@ -355,12 +355,27 @@ fn middlewareForwardHover(
 ) Error!?types.Hover {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
+    const span_translator = try code_map.translatorForSourcePosition(
+        middleware.allocator,
+        doc.source_text,
+        doc.generated_text,
+        params.position,
+    ) orelse return null;
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .active = span_translator,
+    };
+    defer translation_context.deinit();
+
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/hover", mapped);
-    if (result) |*hover_result| translateHover(hover_result, code_map);
+    if (result) |*hover_result| try translateHover(hover_result, &translation_context);
     return result;
 }
 
@@ -372,12 +387,27 @@ fn middlewareForwardDefinition(
 ) Error!lsp.ResultType("textDocument/definition") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
+    const span_translator = try code_map.translatorForSourcePosition(
+        middleware.allocator,
+        doc.source_text,
+        doc.generated_text,
+        params.position,
+    ) orelse return null;
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .active = span_translator,
+    };
+    defer translation_context.deinit();
+
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/definition", mapped)) orelse return null;
-    return try translateDefinition(arena, result, code_map, doc.generated_uri, doc.source_uri);
+    return try translateDefinition(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardReferences(
@@ -388,12 +418,27 @@ fn middlewareForwardReferences(
 ) Error!lsp.ResultType("textDocument/references") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
+    const span_translator = try code_map.translatorForSourcePosition(
+        middleware.allocator,
+        doc.source_text,
+        doc.generated_text,
+        params.position,
+    ) orelse return null;
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .active = span_translator,
+    };
+    defer translation_context.deinit();
+
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse return null;
-    return try translateLocations(arena, result, code_map, doc.generated_uri, doc.source_uri);
+    return try translateLocations(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
 }
 
 fn middlewareForwardCompletion(
@@ -404,12 +449,27 @@ fn middlewareForwardCompletion(
 ) Error!lsp.ResultType("textDocument/completion") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
+    const span_translator = try code_map.translatorForSourcePosition(
+        middleware.allocator,
+        doc.source_text,
+        doc.generated_text,
+        params.position,
+    ) orelse return null;
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .active = span_translator,
+    };
+    defer translation_context.deinit();
+
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/completion", mapped);
-    try translateCompletionResult(arena, &result, code_map);
+    try translateCompletionResult(arena, &result, &translation_context);
     return result;
 }
 
@@ -434,12 +494,27 @@ fn middlewareForwardRename(
 ) Error!lsp.ResultType("textDocument/rename") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
+    const span_translator = try code_map.translatorForSourcePosition(
+        middleware.allocator,
+        doc.source_text,
+        doc.generated_text,
+        params.position,
+    ) orelse return null;
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .active = span_translator,
+    };
+    defer translation_context.deinit();
+
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = code_map.sourcePositionToGenerated(params.position) orelse return null;
+    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse return null;
-    return try translateWorkspaceEdit(arena, result, code_map, doc.generated_uri, doc.source_uri);
+    return try translateWorkspaceEdit(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
 }
 
 /// Mapping between original Zitron code blocks and generated Zig code.
@@ -458,6 +533,16 @@ pub const CodeMap = struct {
     pub const ByteRange = struct {
         start: usize,
         end: usize,
+    };
+
+    pub const Mutation = struct {
+        source: types.Range,
+        generated: types.Range,
+    };
+
+    pub const TranslatedPosition = union(enum) {
+        shared: types.Position,
+        mutant: Mutation,
     };
 
     /// One contiguous generated range. Source-line offsets keep the legacy LSP
@@ -563,10 +648,28 @@ pub const CodeMap = struct {
         };
     }
 
+    fn translatorForSourcePosition(
+        map: *const CodeMap,
+        allocator: std.mem.Allocator,
+        source_text: []const u8,
+        generated_text: []const u8,
+        position: types.Position,
+    ) OOM!?SpanTranslator {
+        const source_order_index = map.findSourceIndex(position.line) orelse return null;
+        const span_index = map.src_order.items[source_order_index];
+        return try SpanTranslator.init(
+            allocator,
+            map.gen_span.items[span_index],
+            map.src_range.items[span_index],
+            source_text,
+            generated_text,
+        );
+    }
+
     /// Translates a generated range only when every generated line in the range is
     /// covered by adjacent mapped spans.  Gaps represent template/generated-only
     /// Zig and cannot be reported as a source range.
-    pub fn generatedRangeToSource(map: *const CodeMap, range: types.Range) ?types.Range {
+    pub fn generatedRangeToSource(map: *const CodeMap, range: types.Range) OOM!?types.Range {
         var index = map.findGeneratedIndex(range.start.line) orelse return null;
         while (map.gen_span.items[index].orderGenerated(range.end.line) != .eq) {
             const next_index = index + 1;
@@ -721,6 +824,323 @@ pub const CodeMap = struct {
     }
 };
 
+const SpanTranslator = struct {
+    gen_span: CodeMap.GenSpan,
+    src_range: ts.Range,
+    source_text: []const u8,
+    generated_text: []const u8,
+    difference: Diff,
+
+    const OffsetTranslation = union(enum) {
+        shared: usize,
+        mutant: CodeMap.Mutation,
+    };
+
+    fn init(
+        allocator: std.mem.Allocator,
+        gen_span: CodeMap.GenSpan,
+        src_range: ts.Range,
+        source_text: []const u8,
+        generated_text: []const u8,
+    ) OOM!SpanTranslator {
+        const source_slice = source_text[src_range.start_byte..src_range.end_byte];
+        const generated_slice = generated_text[gen_span.generated_range.start..gen_span.generated_range.end];
+
+        var difference = Diff.init(.default);
+        errdefer difference.deinit(allocator);
+        _ = try difference.diff(allocator, source_slice, generated_slice);
+
+        return .{
+            .gen_span = gen_span,
+            .src_range = src_range,
+            .source_text = source_text,
+            .generated_text = generated_text,
+            .difference = difference,
+        };
+    }
+
+    fn deinit(translator: *SpanTranslator, allocator: std.mem.Allocator) void {
+        translator.difference.deinit(allocator);
+        translator.* = undefined;
+    }
+
+    fn sourcePositionToGenerated(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
+        const source_index = lsp.offsets.positionToIndex(translator.source_text, position, .@"utf-8");
+        const source_start: usize = translator.src_range.start_byte;
+        const rel = source_index - source_start;
+        return switch (translator.sourceOffsetToGenerated(rel)) {
+            .shared => |generated_rel| .{ .shared = lsp.offsets.indexToPosition(
+                translator.generated_text,
+                translator.gen_span.generated_range.start + generated_rel,
+                .@"utf-8",
+            ) },
+            .mutant => |mutation| .{ .mutant = mutation },
+        };
+    }
+
+    fn generatedPositionToSource(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
+        const generated_index = lsp.offsets.positionToIndex(translator.generated_text, position, .@"utf-8");
+        const rel = generated_index - translator.gen_span.generated_range.start;
+        return switch (translator.generatedOffsetToSource(rel)) {
+            .shared => |source_rel| .{ .shared = lsp.offsets.indexToPosition(
+                translator.source_text,
+                @as(usize, translator.src_range.start_byte) + source_rel,
+                .@"utf-8",
+            ) },
+            .mutant => |mutation| .{ .mutant = mutation },
+        };
+    }
+
+    fn generatedRangeToSource(translator: *const SpanTranslator, range: types.Range) ?types.Range {
+        if (!translator.containsGeneratedPosition(range.start, false) or
+            !translator.containsGeneratedPosition(range.end, true))
+        {
+            return null;
+        }
+
+        const generated_start = lsp.offsets.positionToIndex(translator.generated_text, range.start, .@"utf-8");
+        const generated_end = lsp.offsets.positionToIndex(translator.generated_text, range.end, .@"utf-8");
+        const rel_start = generated_start - translator.gen_span.generated_range.start;
+        const rel_end = generated_end - translator.gen_span.generated_range.start;
+        if (!translator.generatedIntervalShared(rel_start, rel_end)) return null;
+
+        return .{
+            .start = sharedPosition(translator.generatedPositionToSource(range.start)) orelse return null,
+            .end = sharedPosition(translator.generatedPositionToSource(range.end)) orelse return null,
+        };
+    }
+
+    fn containsGeneratedRange(translator: *const SpanTranslator, range: types.Range) bool {
+        return translator.containsGeneratedPosition(range.start, false) and
+            translator.containsGeneratedPosition(range.end, true);
+    }
+
+    fn containsGeneratedPosition(translator: *const SpanTranslator, position: types.Position, allow_end: bool) bool {
+        if (position.line < translator.gen_span.generated_line) return false;
+        if (position.line > translator.gen_span.generatedEnd()) return false;
+        if (position.line == translator.gen_span.generatedEnd()) {
+            return allow_end and position.character == 0;
+        }
+        return true;
+    }
+
+    fn sourceOffsetToGenerated(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
+        return sourceOffsetThroughDiff(translator, rel, translator.difference.edits.items);
+    }
+
+    fn generatedOffsetToSource(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
+        return generatedOffsetThroughDiff(translator, rel, translator.difference.edits.items);
+    }
+
+    fn generatedIntervalShared(translator: *const SpanTranslator, start: usize, end: usize) bool {
+        if (start == end) return translator.generatedOffsetToSource(start) == .shared;
+        return generatedDiffIntervalShared(start, end, translator.difference.edits.items);
+    }
+
+    fn sourceOffsetThroughDiff(translator: *const SpanTranslator, rel: usize, edits: []const Edit) OffsetTranslation {
+        var source_cursor: usize = 0;
+        var generated_cursor: usize = 0;
+        var index: usize = 0;
+        while (index < edits.len) {
+            const edit = edits[index];
+            switch (edit.operation) {
+                .equal => {
+                    const source_end = source_cursor + edit.text.len;
+                    if (rel < source_end or (rel == source_end and source_end == translator.sourceLength())) {
+                        return .{ .shared = generated_cursor + (rel - source_cursor) };
+                    }
+                    source_cursor = source_end;
+                    generated_cursor += edit.text.len;
+                    index += 1;
+                },
+                .delete, .insert => {
+                    const mutation_start_source = source_cursor;
+                    const mutation_start_generated = generated_cursor;
+                    while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
+                        switch (edits[index].operation) {
+                            .delete => source_cursor += edits[index].text.len,
+                            .insert => generated_cursor += edits[index].text.len,
+                            .equal => unreachable,
+                        }
+                    }
+                    if (mutation_start_source <= rel and rel < source_cursor) {
+                        return .{ .mutant = translator.sourceMutation(
+                            mutation_start_source,
+                            source_cursor,
+                            mutation_start_generated,
+                            generated_cursor,
+                        ) };
+                    }
+                },
+            }
+        }
+        return .{ .mutant = translator.sourceMutation(0, translator.sourceLength(), 0, translator.generatedLength()) };
+    }
+
+    fn generatedOffsetThroughDiff(translator: *const SpanTranslator, rel: usize, edits: []const Edit) OffsetTranslation {
+        var source_cursor: usize = 0;
+        var generated_cursor: usize = 0;
+        var index: usize = 0;
+        while (index < edits.len) {
+            const edit = edits[index];
+            switch (edit.operation) {
+                .equal => {
+                    const generated_end = generated_cursor + edit.text.len;
+                    if (rel < generated_end or (rel == generated_end and generated_end == translator.generatedLength())) {
+                        return .{ .shared = source_cursor + (rel - generated_cursor) };
+                    }
+                    source_cursor += edit.text.len;
+                    generated_cursor = generated_end;
+                    index += 1;
+                },
+                .delete, .insert => {
+                    const mutation_start_source = source_cursor;
+                    const mutation_start_generated = generated_cursor;
+                    while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
+                        switch (edits[index].operation) {
+                            .delete => source_cursor += edits[index].text.len,
+                            .insert => generated_cursor += edits[index].text.len,
+                            .equal => unreachable,
+                        }
+                    }
+                    if (mutation_start_generated <= rel and rel < generated_cursor) {
+                        return .{ .mutant = translator.sourceMutation(
+                            mutation_start_source,
+                            source_cursor,
+                            mutation_start_generated,
+                            generated_cursor,
+                        ) };
+                    }
+                },
+            }
+        }
+        return .{ .mutant = translator.sourceMutation(0, translator.sourceLength(), 0, translator.generatedLength()) };
+    }
+
+    fn sourceMutation(
+        translator: *const SpanTranslator,
+        source_start: usize,
+        source_end: usize,
+        generated_start: usize,
+        generated_end: usize,
+    ) CodeMap.Mutation {
+        return .{
+            .source = rangeFromByteRange(
+                translator.source_text,
+                @as(usize, translator.src_range.start_byte) + source_start,
+                @as(usize, translator.src_range.start_byte) + source_end,
+            ),
+            .generated = rangeFromByteRange(
+                translator.generated_text,
+                translator.gen_span.generated_range.start + generated_start,
+                translator.gen_span.generated_range.start + generated_end,
+            ),
+        };
+    }
+
+    fn sourceLength(translator: *const SpanTranslator) usize {
+        return translator.src_range.end_byte - translator.src_range.start_byte;
+    }
+
+    fn generatedLength(translator: *const SpanTranslator) usize {
+        return translator.gen_span.generated_range.end - translator.gen_span.generated_range.start;
+    }
+};
+
+const RequestTranslationContext = struct {
+    allocator: std.mem.Allocator,
+    map: *const CodeMap,
+    source_text: []const u8,
+    generated_text: []const u8,
+    active: SpanTranslator,
+    generated_translators: std.ArrayList(GeneratedTranslator) = .empty,
+
+    const GeneratedTranslator = struct {
+        span_index: usize,
+        translator: SpanTranslator,
+    };
+
+    fn deinit(context: *RequestTranslationContext) void {
+        context.active.deinit(context.allocator);
+        for (context.generated_translators.items) |*entry| {
+            entry.translator.deinit(context.allocator);
+        }
+        context.generated_translators.deinit(context.allocator);
+    }
+
+    fn generatedRangeToSource(context: *RequestTranslationContext, range: types.Range) OOM!?types.Range {
+        if (context.active.containsGeneratedRange(range)) {
+            return context.active.generatedRangeToSource(range);
+        }
+        const translator = try context.translatorForGeneratedRange(range) orelse return null;
+        return translator.generatedRangeToSource(range);
+    }
+
+    fn translatorForGeneratedRange(context: *RequestTranslationContext, range: types.Range) OOM!?*SpanTranslator {
+        const span_index = context.map.findGeneratedIndex(range.start.line) orelse return null;
+        const span = context.map.gen_span.items[span_index];
+        if (span.orderGenerated(range.end.line) != .eq and !(range.end.line == span.generatedEnd() and range.end.character == 0)) {
+            return null;
+        }
+
+        for (context.generated_translators.items) |*entry| {
+            if (entry.span_index == span_index) return &entry.translator;
+        }
+
+        try context.generated_translators.append(context.allocator, .{
+            .span_index = span_index,
+            .translator = try SpanTranslator.init(
+                context.allocator,
+                span,
+                context.map.src_range.items[span_index],
+                context.source_text,
+                context.generated_text,
+            ),
+        });
+        return &context.generated_translators.items[context.generated_translators.items.len - 1].translator;
+    }
+};
+
+fn sharedPosition(translated: CodeMap.TranslatedPosition) ?types.Position {
+    return switch (translated) {
+        .shared => |position| position,
+        .mutant => null,
+    };
+}
+
+fn generatedDiffIntervalShared(start: usize, end: usize, edits: []const Edit) bool {
+    var index: usize = 0;
+    var generated_cursor: usize = 0;
+    while (index < edits.len) {
+        switch (edits[index].operation) {
+            .equal => {
+                generated_cursor += edits[index].text.len;
+                index += 1;
+            },
+            .delete, .insert => {
+                const mutation_start = generated_cursor;
+                while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
+                    if (edits[index].operation == .insert) generated_cursor += edits[index].text.len;
+                }
+                if (rangesOverlap(start, end, mutation_start, generated_cursor)) return false;
+                if (mutation_start == generated_cursor and start < mutation_start and mutation_start < end) return false;
+            },
+        }
+    }
+    return true;
+}
+
+fn rangesOverlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
+    return a_start < b_end and b_start < a_end;
+}
+
+fn rangeFromByteRange(text: []const u8, start: usize, end: usize) types.Range {
+    return .{
+        .start = lsp.offsets.indexToPosition(text, start, .@"utf-8"),
+        .end = lsp.offsets.indexToPosition(text, end, .@"utf-8"),
+    };
+}
+
 fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?ts.Range {
     const line_start: ts.Point = .{ .row = line, .column = 0 };
     var node = source_root.descendantForPointRange(line_start, lineEndPoint(source_root, line)) orelse return null;
@@ -800,16 +1220,16 @@ fn trimLeft(slice: []const u8, values_to_strip: []const u8) []const u8 {
     return slice[index..];
 }
 
-pub fn translateHover(hover_result: *types.Hover, map: *const CodeMap) void {
+pub fn translateHover(hover_result: *types.Hover, map: *RequestTranslationContext) OOM!void {
     if (hover_result.range) |range| {
-        hover_result.range = map.generatedRangeToSource(range);
+        hover_result.range = try map.generatedRangeToSource(range);
     }
 }
 
 pub fn translateDefinition(
     arena: std.mem.Allocator,
     definition_result: lsp.types.Definition.Result,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?lsp.types.Definition.Result {
@@ -821,7 +1241,7 @@ pub fn translateDefinition(
         .definition_links => |links| blk: {
             var translated: std.ArrayList(types.DefinitionLink) = .empty;
             for (links) |link| {
-                if (translateDefinitionLink(link, map, generated_uri, source_uri)) |mapped| {
+                if (try translateDefinitionLink(link, map, generated_uri, source_uri)) |mapped| {
                     try translated.append(arena, mapped);
                 }
             }
@@ -835,19 +1255,19 @@ pub fn translateDefinition(
 pub fn translateDefinitionValue(
     arena: std.mem.Allocator,
     definition_result: types.Definition,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.Definition {
     return switch (definition_result) {
-        .location => |location| if (translateLocation(location, map, generated_uri, source_uri)) |translated|
+        .location => |location| if (try translateLocation(location, map, generated_uri, source_uri)) |translated|
             .{ .location = translated }
         else
             null,
         .locations => |locations| blk: {
             var translated: std.ArrayList(types.Location) = .empty;
             for (locations) |location| {
-                if (translateLocation(location, map, generated_uri, source_uri)) |mapped| {
+                if (try translateLocation(location, map, generated_uri, source_uri)) |mapped| {
                     try translated.append(arena, mapped);
                 }
             }
@@ -860,29 +1280,29 @@ pub fn translateDefinitionValue(
 
 fn translateDefinitionLink(
     link: types.DefinitionLink,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
-) ?types.DefinitionLink {
+) OOM!?types.DefinitionLink {
     if (!std.mem.eql(u8, link.targetUri, generated_uri)) return link;
     return .{
-        .originSelectionRange = if (link.originSelectionRange) |range| map.generatedRangeToSource(range) else null,
+        .originSelectionRange = if (link.originSelectionRange) |range| try map.generatedRangeToSource(range) else null,
         .targetUri = source_uri,
-        .targetRange = map.generatedRangeToSource(link.targetRange) orelse return null,
-        .targetSelectionRange = map.generatedRangeToSource(link.targetSelectionRange) orelse return null,
+        .targetRange = (try map.generatedRangeToSource(link.targetRange)) orelse return null,
+        .targetSelectionRange = (try map.generatedRangeToSource(link.targetSelectionRange)) orelse return null,
     };
 }
 
 pub fn translateLocations(
     arena: std.mem.Allocator,
     locations: []const types.Location,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?[]const types.Location {
     var translated: std.ArrayList(types.Location) = .empty;
     for (locations) |location| {
-        if (translateLocation(location, map, generated_uri, source_uri)) |mapped| {
+        if (try translateLocation(location, map, generated_uri, source_uri)) |mapped| {
             try translated.append(arena, mapped);
         }
     }
@@ -893,7 +1313,7 @@ pub fn translateLocations(
 pub fn translateCompletionResult(
     arena: std.mem.Allocator,
     result: *lsp.ResultType("textDocument/completion"),
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM!void {
     const completion_result = result.* orelse return;
     switch (completion_result) {
@@ -905,7 +1325,7 @@ pub fn translateCompletionResult(
             translated_list.items = try translateCompletionItems(arena, list.items, map);
             if (translated_list.itemDefaults) |*defaults| {
                 if (defaults.editRange) |*edit_range| {
-                    edit_range.* = translateCompletionDefaultEditRange(edit_range.*, map) orelse return;
+                    edit_range.* = (try translateCompletionDefaultEditRange(edit_range.*, map)) orelse return;
                 }
             }
             result.* = .{ .completion_list = translated_list };
@@ -927,7 +1347,7 @@ pub fn translateDocumentSymbols(
 pub fn translateWorkspaceEdit(
     arena: std.mem.Allocator,
     workspace_edit: types.WorkspaceEdit,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.WorkspaceEdit {
@@ -982,11 +1402,11 @@ pub fn translateWorkspaceEdit(
     return if (has_changes) translated else null;
 }
 
-fn translateLocation(location: types.Location, map: *const CodeMap, generated_uri: []const u8, source_uri: []const u8) ?types.Location {
+fn translateLocation(location: types.Location, map: *RequestTranslationContext, generated_uri: []const u8, source_uri: []const u8) OOM!?types.Location {
     if (!std.mem.eql(u8, location.uri, generated_uri)) return location;
     return .{
         .uri = source_uri,
-        .range = map.generatedRangeToSource(location.range) orelse return null,
+        .range = (try map.generatedRangeToSource(location.range)) orelse return null,
     };
 }
 
@@ -1024,8 +1444,8 @@ fn translateDocumentSymbol(
         .kind = symbol.kind,
         .tags = symbol.tags,
         .deprecated = symbol.deprecated,
-        .range = map.generatedRangeToSource(symbol.range) orelse return null,
-        .selectionRange = map.generatedRangeToSource(symbol.selectionRange) orelse return null,
+        .range = (try map.generatedRangeToSource(symbol.range)) orelse return null,
+        .selectionRange = (try map.generatedRangeToSource(symbol.selectionRange)) orelse return null,
         .children = if (symbol.children) |children| try translateDocumentSymbolSlice(arena, children, map) else null,
     };
 }
@@ -1039,12 +1459,12 @@ fn startsWithYy(name: []const u8) bool {
 fn translateCompletionItems(
     arena: std.mem.Allocator,
     items_const: []const types.CompletionItem,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM![]const types.CompletionItem {
     const items = try arena.dupe(types.CompletionItem, items_const);
     for (items) |*item| {
         if (item.textEdit) |text_edit| {
-            item.textEdit = translateCompletionTextEdit(text_edit, map) orelse {
+            item.textEdit = (try translateCompletionTextEdit(text_edit, map)) orelse {
                 item.textEdit = null;
                 continue;
             };
@@ -1053,7 +1473,7 @@ fn translateCompletionItems(
         if (item.additionalTextEdits) |edits| {
             var translated_edits: std.ArrayList(types.TextEdit) = .empty;
             for (edits) |edit| {
-                if (translateTextEdit(edit, map)) |translated_edit| {
+                if (try translateTextEdit(edit, map)) |translated_edit| {
                     try translated_edits.append(arena, translated_edit);
                 }
             }
@@ -1064,33 +1484,33 @@ fn translateCompletionItems(
     return items;
 }
 
-fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *const CodeMap) ?types.CompletionItem.TextEdit {
+fn translateCompletionTextEdit(text_edit: types.CompletionItem.TextEdit, map: *RequestTranslationContext) OOM!?types.CompletionItem.TextEdit {
     return switch (text_edit) {
-        .text_edit => |edit| .{ .text_edit = translateTextEdit(edit, map) orelse return null },
+        .text_edit => |edit| .{ .text_edit = (try translateTextEdit(edit, map)) orelse return null },
         .insert_replace_edit => |edit| .{ .insert_replace_edit = .{
             .newText = edit.newText,
-            .insert = map.generatedRangeToSource(edit.insert) orelse return null,
-            .replace = map.generatedRangeToSource(edit.replace) orelse return null,
+            .insert = (try map.generatedRangeToSource(edit.insert)) orelse return null,
+            .replace = (try map.generatedRangeToSource(edit.replace)) orelse return null,
         } },
     };
 }
 
 fn translateCompletionDefaultEditRange(
     edit_range: lsp.types.ClientCapabilities.TextDocument.Completion.EditRange,
-    map: *const CodeMap,
-) ?lsp.types.ClientCapabilities.TextDocument.Completion.EditRange {
+    map: *RequestTranslationContext,
+) OOM!?lsp.types.ClientCapabilities.TextDocument.Completion.EditRange {
     return switch (edit_range) {
-        .range => |range| .{ .range = map.generatedRangeToSource(range) orelse return null },
+        .range => |range| .{ .range = (try map.generatedRangeToSource(range)) orelse return null },
         .edit_range_with_insert_replace => |ranges| .{ .edit_range_with_insert_replace = .{
-            .insert = map.generatedRangeToSource(ranges.insert) orelse return null,
-            .replace = map.generatedRangeToSource(ranges.replace) orelse return null,
+            .insert = (try map.generatedRangeToSource(ranges.insert)) orelse return null,
+            .replace = (try map.generatedRangeToSource(ranges.replace)) orelse return null,
         } },
     };
 }
 
-fn translateTextEdit(edit: types.TextEdit, map: *const CodeMap) ?types.TextEdit {
+fn translateTextEdit(edit: types.TextEdit, map: *RequestTranslationContext) OOM!?types.TextEdit {
     return .{
-        .range = map.generatedRangeToSource(edit.range) orelse return null,
+        .range = (try map.generatedRangeToSource(edit.range)) orelse return null,
         .newText = edit.newText,
     };
 }
@@ -1098,11 +1518,11 @@ fn translateTextEdit(edit: types.TextEdit, map: *const CodeMap) ?types.TextEdit 
 fn translateTextEdits(
     arena: std.mem.Allocator,
     edits: []const types.TextEdit,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM![]const types.TextEdit {
     var translated: std.ArrayList(types.TextEdit) = .empty;
     for (edits) |edit| {
-        if (translateTextEdit(edit, map)) |mapped| {
+        if (try translateTextEdit(edit, map)) |mapped| {
             try translated.append(arena, mapped);
         }
     }
@@ -1112,7 +1532,7 @@ fn translateTextEdits(
 fn translateTextDocumentEdit(
     arena: std.mem.Allocator,
     edit: types.TextDocumentEdit,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
     generated_uri: []const u8,
     source_uri: []const u8,
 ) OOM!?types.TextDocumentEdit {
@@ -1122,17 +1542,17 @@ fn translateTextDocumentEdit(
     for (edit.edits) |document_edit| {
         switch (document_edit) {
             .text_edit => |text_edit| {
-                if (translateTextEdit(text_edit, map)) |translated| {
+                if (try translateTextEdit(text_edit, map)) |translated| {
                     try translated_edits.append(arena, .{ .text_edit = translated });
                 }
             },
             .annotated_text_edit => |annotated| {
-                if (translateAnnotatedTextEdit(annotated, map)) |translated| {
+                if (try translateAnnotatedTextEdit(annotated, map)) |translated| {
                     try translated_edits.append(arena, .{ .annotated_text_edit = translated });
                 }
             },
             .snippet_text_edit => |snippet| {
-                if (translateSnippetTextEdit(snippet, map)) |translated| {
+                if (try translateSnippetTextEdit(snippet, map)) |translated| {
                     try translated_edits.append(arena, .{ .snippet_text_edit = translated });
                 }
             },
@@ -1149,17 +1569,17 @@ fn translateTextDocumentEdit(
     };
 }
 
-fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *const CodeMap) ?types.TextEdit.Annotated {
+fn translateAnnotatedTextEdit(edit: types.TextEdit.Annotated, map: *RequestTranslationContext) OOM!?types.TextEdit.Annotated {
     return .{
         .annotationId = edit.annotationId,
-        .range = map.generatedRangeToSource(edit.range) orelse return null,
+        .range = (try map.generatedRangeToSource(edit.range)) orelse return null,
         .newText = edit.newText,
     };
 }
 
-fn translateSnippetTextEdit(edit: types.TextDocumentEdit.Snippet, map: *const CodeMap) ?types.TextDocumentEdit.Snippet {
+fn translateSnippetTextEdit(edit: types.TextDocumentEdit.Snippet, map: *RequestTranslationContext) OOM!?types.TextDocumentEdit.Snippet {
     return .{
-        .range = map.generatedRangeToSource(edit.range) orelse return null,
+        .range = (try map.generatedRangeToSource(edit.range)) orelse return null,
         .snippet = edit.snippet,
         .annotationId = edit.annotationId,
     };
@@ -1451,6 +1871,28 @@ fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: 
     try map.update(testing_allocator, tree.rootNode(), generated_text, source_path);
 }
 
+fn requestTranslationContextForTest(
+    map: *const CodeMap,
+    source_text: []const u8,
+    generated_text: []const u8,
+    position: types.Position,
+) !RequestTranslationContext {
+    const active = try map.translatorForSourcePosition(
+        testing_allocator,
+        source_text,
+        generated_text,
+        position,
+    ) orelse return error.UnexpectedCodeMap;
+
+    return .{
+        .allocator = testing_allocator,
+        .map = map,
+        .source_text = source_text,
+        .generated_text = generated_text,
+        .active = active,
+    };
+}
+
 fn genericZigCodeSourceForGeneratedTest(generated_text: []const u8) OOM![]u8 {
     var max_source_line: u32 = 0;
     var generated_line_count: u32 = 0;
@@ -1526,12 +1968,12 @@ test "code map translates only fully mapped generated ranges" {
     try expectEqual(types.Range{
         .start = .{ .line = 19, .character = 2 },
         .end = .{ .line = 20, .character = 7 },
-    }, map.generatedRangeToSource(.{
+    }, (try map.generatedRangeToSource(.{
         .start = .{ .line = 1, .character = 2 },
         .end = .{ .line = 2, .character = 7 },
-    }).?);
+    })).?);
 
-    try expectEqual(@as(?types.Range, null), map.generatedRangeToSource(.{
+    try expectEqual(@as(?types.Range, null), try map.generatedRangeToSource(.{
         .start = .{ .line = 1, .character = 0 },
         .end = .{ .line = 4, .character = 0 },
     }));
@@ -1694,13 +2136,220 @@ test "code map stores source and generated byte ranges" {
     try expectEqual(generated.len, action_gen_span.generated_range.end);
 }
 
-test "translates hover and definition results back to source ranges" {
+test "request span translator applies source column offset" {
+    const source =
+        \\rule ::= TOKEN.   { result = token; }
+    ;
     const generated =
-        \\// #line 5 source.zy
+        \\// #line 1 source.zy
+        \\ result = token;
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var translator = try map.translatorForSourcePosition(
+        testing_allocator,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "result").?, .@"utf-8"),
+    ) orelse return error.UnexpectedCodeMap;
+    defer translator.deinit(testing_allocator);
+
+    try expectEqual(types.Position{
+        .line = 1,
+        .character = @intCast(std.mem.indexOf(u8, " result = token;", "result").?),
+    }, sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
+        source,
+        std.mem.indexOf(u8, source, "result").?,
+        .@"utf-8",
+    ))) orelse return error.UnexpectedCodeMap);
+}
+
+test "request span translator nulls mutated generated aliases" {
+    const source =
+        \\statement_list(A) ::= statement(X).   { A = pik_elist_append(p, null, X); }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ yygotominor.yy0 = pik_elist_append(p, null, yymsp[0].minor.yy42);
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var translator = try map.translatorForSourcePosition(
+        testing_allocator,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8"),
+    ) orelse return error.UnexpectedCodeMap;
+    defer translator.deinit(testing_allocator);
+
+    try expectEqual(types.Position{
+        .line = 1,
+        .character = @intCast(std.mem.indexOf(u8, generated, "pik_elist_append").? - std.mem.lastIndexOfScalar(u8, generated[0..std.mem.indexOf(u8, generated, "pik_elist_append").?], '\n').? - 1),
+    }, sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
+        source,
+        std.mem.indexOf(u8, source, "pik_elist_append").?,
+        .@"utf-8",
+    ))) orelse return error.UnexpectedCodeMap);
+
+    try std.testing.expect(sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
+        source,
+        std.mem.indexOf(u8, source, "A =").?,
+        .@"utf-8",
+    ))) == null);
+
+    try std.testing.expect(translator.generatedRangeToSource(.{
+        .start = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, "yygotominor").?, .@"utf-8"),
+        .end = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, " =").?, .@"utf-8"),
+    }) == null);
+}
+
+test "request span translator handles generated line directive after action" {
+    const source =
+        \\statement_list(A) ::= statement(X).   { A = pik_elist_append(p, null, X); }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ yygotominor.yy0 = pik_elist_append(p, null, yymsp[0].minor.yy42);
+        \\// #line 200 source.zig
+        \\generated_only();
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+    try expectEqual(@as(usize, 1), map.len());
+    try expectEqual(std.mem.indexOf(u8, generated, "// #line 200").?, map.gen_span.items[0].generated_range.end);
+
+    var translator = try map.translatorForSourcePosition(
+        testing_allocator,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8"),
+    ) orelse return error.UnexpectedCodeMap;
+    defer translator.deinit(testing_allocator);
+
+    try expectEqual(lsp.offsets.indexToPosition(
+        generated,
+        std.mem.indexOf(u8, generated, "pik_elist_append").?,
+        .@"utf-8",
+    ), sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
+        source,
+        std.mem.indexOf(u8, source, "pik_elist_append").?,
+        .@"utf-8",
+    ))) orelse return error.UnexpectedCodeMap);
+}
+
+test "request translation context maps reference ranges in other spans" {
+    const source =
+        \\document ::= statement_list(X).  { pik_render(p, X); }
+        \\statement_list(A) ::= statement(X).   { A = pik_elist_append(p, null, X); }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ pik_render(p, yymsp[0].minor.yy0);
+        \\// #line 2 source.zy
+        \\ yygotominor.yy0 = pik_elist_append(p, null, yymsp[0].minor.yy42);
+        \\// #line 200 source.zig
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const active = try map.translatorForSourcePosition(
+        testing_allocator,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_render").?, .@"utf-8"),
+    ) orelse return error.UnexpectedCodeMap;
+
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .active = active,
+    };
+    defer context.deinit();
+
+    const generated_call = std.mem.indexOf(u8, generated, "pik_elist_append").?;
+    const locations = [_]types.Location{.{
+        .uri = "file:///source.zitron.zig",
+        .range = .{
+            .start = lsp.offsets.indexToPosition(generated, generated_call, .@"utf-8"),
+            .end = lsp.offsets.indexToPosition(generated, generated_call + "pik_elist_append".len, .@"utf-8"),
+        },
+    }};
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = (try translateLocations(
+        arena_state.allocator(),
+        &locations,
+        &context,
+        "file:///source.zitron.zig",
+        "file:///source.zy",
+    )) orelse return error.UnexpectedCodeMap;
+
+    const source_call = std.mem.indexOf(u8, source, "pik_elist_append").?;
+    try expectEqual(lsp.offsets.indexToPosition(source, source_call, .@"utf-8"), translated[0].range.start);
+    try expectEqual(lsp.offsets.indexToPosition(source, source_call + "pik_elist_append".len, .@"utf-8"), translated[0].range.end);
+}
+
+test "request span translator handles one leading newline edit" {
+    const source = "\nconst answer = 42;";
+    const generated = "const answer = 42;";
+    var translator = try SpanTranslator.init(
+        testing_allocator,
+        .{
+            .source_line = 0,
+            .generated_line = 0,
+            .line_count = 1,
+            .generated_range = .{ .start = 0, .end = generated.len },
+        },
+        .{
+            .start_byte = 0,
+            .end_byte = @intCast(source.len),
+            .start_point = .{ .row = 0, .column = 0 },
+            .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
+        },
+        source,
+        generated,
+    );
+    defer translator.deinit(testing_allocator);
+
+    try expectEqual(types.Position{ .line = 0, .character = 6 }, sharedPosition(translator.sourcePositionToGenerated(.{
+        .line = 1,
+        .character = 6,
+    })) orelse return error.UnexpectedCodeMap);
+    try std.testing.expect(sharedPosition(translator.sourcePositionToGenerated(.{
+        .line = 0,
+        .character = 0,
+    })) == null);
+}
+
+test "translates hover and definition results back to source ranges" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
         \\const answer = 42;
     ;
-    var map = try parseCodeMapForTest(generated, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var context = try requestTranslationContextForTest(
+        &map,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "answer").?, .@"utf-8"),
+    );
+    defer context.deinit();
 
     var hover_result = types.Hover{
         .contents = .{ .markup_content = .{ .kind = .markdown, .value = "answer" } },
@@ -1709,10 +2358,10 @@ test "translates hover and definition results back to source ranges" {
             .end = .{ .line = 1, .character = 12 },
         },
     };
-    translateHover(&hover_result, &map);
+    try translateHover(&hover_result, &context);
     try expectEqual(types.Range{
-        .start = .{ .line = 4, .character = 6 },
-        .end = .{ .line = 4, .character = 12 },
+        .start = .{ .line = 1, .character = 6 },
+        .end = .{ .line = 1, .character = 12 },
     }, hover_result.range.?);
 
     const definition = types.Definition{ .location = .{
@@ -1725,7 +2374,7 @@ test "translates hover and definition results back to source ranges" {
     const translated = try translateDefinition(
         testing_allocator,
         .{ .definition = definition },
-        &map,
+        &context,
         "file:///source.zitron.zig",
         "file:///source.zy",
     );
@@ -1733,7 +2382,7 @@ test "translates hover and definition results back to source ranges" {
         .definition => |translated_definition| switch (translated_definition) {
             .location => |location| {
                 try expectEqualStrings("file:///source.zy", location.uri);
-                try expectEqual(@as(u32, 4), location.range.start.line);
+                try expectEqual(@as(u32, 1), location.range.start.line);
                 try expectEqual(@as(u32, 6), location.range.start.character);
             },
             else => return error.UnexpectedDefinition,
@@ -1743,13 +2392,25 @@ test "translates hover and definition results back to source ranges" {
 }
 
 test "translates completion edits back to source ranges" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
     const generated =
-        \\// #line 5 source.zy
+        \\// #line 2 source.zy
         \\const answer = 42;
     ;
-    var map = try parseCodeMapForTest(generated, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
-    try expectEqual(@as(u32, 4), map.generatedPositionToSource(.{
+    var context = try requestTranslationContextForTest(
+        &map,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "answer").?, .@"utf-8"),
+    );
+    defer context.deinit();
+    try expectEqual(@as(u32, 1), map.generatedPositionToSource(.{
         .line = 1,
         .character = 0,
     }).?.line);
@@ -1769,11 +2430,11 @@ test "translates completion edits back to source ranges" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try translateCompletionResult(arena_state.allocator(), &result, &map);
+    try translateCompletionResult(arena_state.allocator(), &result, &context);
     switch (result.?) {
         .completion_items => |translated| switch (translated[0].textEdit.?) {
             .text_edit => |edit| {
-                try expectEqual(@as(u32, 4), edit.range.start.line);
+                try expectEqual(@as(u32, 1), edit.range.start.line);
                 try expectEqual(@as(u32, 6), edit.range.start.character);
             },
             else => return error.UnexpectedCompletionEdit,
@@ -1783,12 +2444,24 @@ test "translates completion edits back to source ranges" {
 }
 
 test "translates workspace edit changes back to source ranges" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
     const generated =
-        \\// #line 5 source.zy
+        \\// #line 2 source.zy
         \\const answer = 42;
     ;
-    var map = try parseCodeMapForTest(generated, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var context = try requestTranslationContextForTest(
+        &map,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "answer").?, .@"utf-8"),
+    );
+    defer context.deinit();
 
     const generated_edits = [_]types.TextEdit{
         .{
@@ -1825,7 +2498,7 @@ test "translates workspace edit changes back to source ranges" {
     const translated = (try translateWorkspaceEdit(
         arena_state.allocator(),
         .{ .changes = changes },
-        &map,
+        &context,
         "file:///source.zitron.zig",
         "file:///source.zy",
     )) orelse return error.UnexpectedWorkspaceEdit;
@@ -1834,8 +2507,8 @@ test "translates workspace edit changes back to source ranges" {
     const source_edits = translated_changes.map.get("file:///source.zy") orelse return error.UnexpectedWorkspaceEdit;
     try expectEqual(@as(usize, 1), source_edits.len);
     try expectEqual(types.Range{
-        .start = .{ .line = 4, .character = 6 },
-        .end = .{ .line = 4, .character = 12 },
+        .start = .{ .line = 1, .character = 6 },
+        .end = .{ .line = 1, .character = 12 },
     }, source_edits[0].range);
     try expectEqualStrings("solution", source_edits[0].newText);
 
@@ -1974,10 +2647,13 @@ test "translates document symbols and drops generated yy symbols" {
 
 const std = @import("std");
 const diff = @import("diff.zig");
+const dmp = @import("dmp");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
 const ts = @import("tree-sitter");
 const zitron_grammar = @import("tree_sitter_zitron");
+const Diff = dmp.Diff;
+const Edit = dmp.Edit;
 const JsonParseError = std.json.ParseFromValueError || error{
     BufferUnderrun,
     SyntaxError,
