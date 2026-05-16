@@ -316,6 +316,7 @@ pub const Server = struct {
                         ),
                     },
                 } else null,
+                .terminal_reference => null,
                 .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
                     .definition = .{
                         .location = doc.locationForNode(
@@ -462,6 +463,11 @@ pub const Server = struct {
                 "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
                 .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
             ),
+            .terminal_reference => std.fmt.allocPrint(
+                arena,
+                "terminal reference `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
             .action_definition => std.fmt.allocPrint(
                 arena,
                 "named action definition `{s}`\n\ncapture `{s}` on `{s}`",
@@ -586,7 +592,7 @@ test "embedded tags query compiles for the zitron grammar" {
     const query = try ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
     defer query.destroy();
 
-    try expectEqual(@as(u32, 6), query.patternCount());
+    try expectEqual(@as(u32, 13), query.patternCount());
     try expect(query.captureCount() >= 3);
 }
 
@@ -908,6 +914,37 @@ test "query resolution finds rule definitions and references in calc" {
     }
 }
 
+test "query resolution finds directive grammar symbols" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
+    defer testing_allocator.free(sample);
+
+    try server.putDocument("file:///samples/calc.zy", 1, sample);
+    const doc = server.getDocument("file:///samples/calc.zy").?;
+
+    const expr_type_index = try byteIndexOf(sample, "%type expr f64");
+    const expr_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfTextAfter(sample, expr_type_index, "expr"));
+    switch (expr_resolution) {
+        .symbol => |symbol| {
+            try expectEqual(Document.SemanticKind.rule_reference, symbol.kind);
+            try expectEqualStrings("expr", symbol.symbol_name);
+        },
+        else => return error.UnexpectedResolution,
+    }
+
+    const number_type_index = try byteIndexOf(sample, "%type NUMBER {f64}");
+    const number_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfTextAfter(sample, number_type_index, "NUMBER"));
+    switch (number_resolution) {
+        .symbol => |symbol| {
+            try expectEqual(Document.SemanticKind.terminal_reference, symbol.kind);
+            try expectEqualStrings("NUMBER", symbol.symbol_name);
+        },
+        else => return error.UnexpectedResolution,
+    }
+}
+
 test "query resolution returns no match on punctuation" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1027,13 +1064,31 @@ test "hover definition and references operate on stored live document state" {
         else => return error.UnexpectedDefinitionTarget,
     }
 
+    const expr_type_index = try byteIndexOf(sample, "%type expr f64");
+    const directive_definition = (try server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, expr_type_index, "expr"),
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (directive_definition) {
+        .definition => |target| switch (target) {
+            .location => |location| {
+                try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                try expectEqual(@as(u32, 48), location.range.start.line);
+                try expectEqual(@as(u32, 0), location.range.start.character);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
     const references = (try server.@"textDocument/references"(arena_state.allocator(), .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = false },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 4), references.len);
+    try expectEqual(@as(usize, 5), references.len);
     try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, expr_type_index, "expr")));
 
     const first_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) PLUS|FOO(O) term(C).");
     try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index + 1, "expr")));
@@ -1049,12 +1104,24 @@ test "hover definition and references operate on stored live document state" {
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = true },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 7), references_with_declaration.len);
+    try expectEqual(@as(usize, 8), references_with_declaration.len);
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
 
     const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
+
+    const number_type_index = try byteIndexOf(sample, "%type NUMBER {f64}");
+    const number_references = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, number_type_index, "NUMBER"),
+        .context = .{ .includeDeclaration = false },
+    })) orelse return error.UnexpectedDefinitionTarget;
+    try expectEqual(@as(usize, 2), number_references.len);
+    try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_type_index, "NUMBER")));
+
+    const number_rhs_index = try byteIndexOf(sample, "factor(A) ::= NUMBER(N).");
+    try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_rhs_index, "NUMBER")));
 }
 
 test "document symbols operate on stored live document state" {

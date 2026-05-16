@@ -599,7 +599,7 @@ test "apply content changes with edits handles last full text and trailing parti
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const OOM = std.mem.Allocator.Error;
+const OOM = std.mem.Allocator.Error || error{TooManySegments};
 const lsp = @import("lsp");
 const types = lsp.types.flat;
 const dmp = @import("dmp");

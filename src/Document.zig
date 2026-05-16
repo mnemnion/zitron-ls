@@ -17,6 +17,7 @@ pub const ParseSummary = struct {
 pub const SemanticKind = enum {
     rule_definition,
     rule_reference,
+    terminal_reference,
     action_definition,
     action_implementation,
 };
@@ -57,6 +58,7 @@ pub const Error = OOM || ts.Query.Error || error{
     IncompatibleLanguage,
     InvalidParams,
     ParseFailed,
+    TooManySegments,
 };
 
 /// Creates a live document from source text and parses it immediately.
@@ -291,6 +293,15 @@ pub fn findReferences(
                     ));
                 }
             },
+            .terminal_reference => {
+                if (candidate.kind == .terminal_reference) {
+                    try references.append(arena, document.locationForNode(
+                        uri,
+                        candidate.name_node,
+                        offset_encoding,
+                    ));
+                }
+            },
             .action_definition, .action_implementation => {
                 if (candidate.kind == .action_definition or candidate.kind == .action_implementation) {
                     try references.append(arena, document.locationForNode(
@@ -321,7 +332,7 @@ pub fn documentSymbols(
 
     while (cursor.nextMatch()) |match| {
         const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
-        if (candidate.kind == .rule_reference) continue;
+        if (candidate.kind == .rule_reference or candidate.kind == .terminal_reference) continue;
 
         try symbols.append(arena, .{
             .name = candidate.symbol_name,
@@ -371,6 +382,7 @@ fn documentSymbolKind(kind: SemanticKind) types.SymbolKind {
     return switch (kind) {
         .rule_definition => .Class,
         .rule_reference => .Class,
+        .terminal_reference => .EnumMember,
         .action_definition => .Interface,
         .action_implementation => .Function,
     };
@@ -380,6 +392,7 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
     return switch (kind) {
         .rule_definition => "rule",
         .rule_reference => "rule reference",
+        .terminal_reference => "terminal reference",
         .action_definition => "named action",
         .action_implementation => "named action implementation",
     };
@@ -474,6 +487,7 @@ fn renameSymbolForMatch(
 fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
     if (std.mem.eql(u8, capture_name, "definition.class")) return .rule_definition;
     if (std.mem.eql(u8, capture_name, "reference.class")) return .rule_reference;
+    if (std.mem.eql(u8, capture_name, "reference.enum")) return .terminal_reference;
     if (std.mem.eql(u8, capture_name, "definition.interface")) return .action_definition;
     if (std.mem.eql(u8, capture_name, "reference.implementation")) return .action_implementation;
     return null;

@@ -2660,7 +2660,7 @@ const JsonParseError = std.json.ParseFromValueError || error{
     UnexpectedEndOfInput,
     ValueTooLong,
 };
-const OOM = std.mem.Allocator.Error;
+const OOM = std.mem.Allocator.Error || error{TooManySegments};
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
