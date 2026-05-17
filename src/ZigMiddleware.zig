@@ -28,6 +28,7 @@ const Middleware = struct {
     const forwardCompletion = middlewareForwardCompletion;
     const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
     const forwardRename = middlewareForwardRename;
+    const aliasCodeBlockRenameEdits = middlewareAliasCodeBlockRenameEdits;
     const initializeZls = middlewareInitializeZls;
     const shutdownZls = middlewareShutdownZls;
     const request = middlewareRequest;
@@ -216,6 +217,28 @@ pub fn forwardRename(
     return switch (middleware.mode) {
         .disabled => null,
         .enabled => |*mware| try mware.forwardRename(arena, source_uri, params),
+    };
+}
+
+pub fn aliasCodeBlockRenameEdits(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    alias_name: []const u8,
+    new_name: []const u8,
+    source_ranges: []const ts.Range,
+    offset_encoding: lsp.offsets.Encoding,
+) Error!?[]const types.TextEdit {
+    return switch (middleware.mode) {
+        .disabled => &.{},
+        .enabled => |*mware| try mware.aliasCodeBlockRenameEdits(
+            arena,
+            source_uri,
+            alias_name,
+            new_name,
+            source_ranges,
+            offset_encoding,
+        ),
     };
 }
 
@@ -517,6 +540,50 @@ fn middlewareForwardRename(
     return try translateWorkspaceEdit(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
 }
 
+fn middlewareAliasCodeBlockRenameEdits(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    alias_name: []const u8,
+    new_name: []const u8,
+    source_ranges: []const ts.Range,
+    offset_encoding: lsp.offsets.Encoding,
+) Error!?[]const types.TextEdit {
+    const doc = try middleware.documentReady(source_uri);
+    var edits: std.ArrayList(types.TextEdit) = .empty;
+    errdefer edits.deinit(arena);
+    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_starts.deinit(arena);
+
+    for (source_ranges) |source_range| {
+        const span_index = doc.code_map.indexForSourceRange(source_range) orelse return null;
+        var translator = try SpanTranslator.init(
+            middleware.allocator,
+            doc.code_map.gen_span.items[span_index],
+            doc.code_map.src_range.items[span_index],
+            doc.source_text,
+            doc.generated_text,
+        );
+        defer translator.deinit(middleware.allocator);
+
+        try appendAliasRenameEditsFromDiff(
+            arena,
+            &edits,
+            &seen_starts,
+            doc.source_text,
+            source_range,
+            doc.generated_text,
+            doc.code_map.gen_span.items[span_index].generated_range,
+            translator.difference.edits.items,
+            alias_name,
+            new_name,
+            offset_encoding,
+        );
+    }
+
+    return try edits.toOwnedSlice(arena);
+}
+
 /// Mapping between original Zitron code blocks and generated Zig code.
 pub const CodeMap = struct {
     /// Generated spans are stored in generated-line order, which is the order encountered
@@ -758,6 +825,15 @@ pub const CodeMap = struct {
     /// that multi-line ranges stay coalesced instead of becoming per-line nodes.
     fn len(map: *const CodeMap) usize {
         return map.gen_span.items.len;
+    }
+
+    fn indexForSourceRange(map: *const CodeMap, range: ts.Range) ?usize {
+        for (map.src_range.items, 0..) |candidate, index| {
+            if (candidate.start_byte == range.start_byte and candidate.end_byte == range.end_byte) {
+                return index;
+            }
+        }
+        return null;
     }
 
     /// Finds a generated-order span containing a generated line.
@@ -1139,6 +1215,197 @@ fn rangeFromByteRange(text: []const u8, start: usize, end: usize) types.Range {
         .start = lsp.offsets.indexToPosition(text, start, .@"utf-8"),
         .end = lsp.offsets.indexToPosition(text, end, .@"utf-8"),
     };
+}
+
+fn appendAliasRenameEditsFromDiff(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(types.TextEdit),
+    seen_starts: *std.AutoHashMapUnmanaged(usize, void),
+    source_text: []const u8,
+    source_range: ts.Range,
+    generated_text: []const u8,
+    generated_range: CodeMap.ByteRange,
+    diff_edits: []const Edit,
+    alias_name: []const u8,
+    new_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!void {
+    var source_cursor: usize = 0;
+    var generated_cursor: usize = 0;
+    for (diff_edits) |edit| {
+        switch (edit.operation) {
+            .equal => {
+                try appendAliasRenameEditsFromEqual(
+                    arena,
+                    edits,
+                    seen_starts,
+                    source_text,
+                    @as(usize, source_range.start_byte) + source_cursor,
+                    generated_text,
+                    generated_range.start + generated_cursor,
+                    edit.text,
+                    alias_name,
+                    new_name,
+                    offset_encoding,
+                );
+                source_cursor += edit.text.len;
+                generated_cursor += edit.text.len;
+            },
+            .insert => generated_cursor += edit.text.len,
+            .delete => {
+                try appendAliasRenameEditsFromDelete(
+                    arena,
+                    edits,
+                    seen_starts,
+                    source_text,
+                    @as(usize, source_range.start_byte) + source_cursor,
+                    edit.text,
+                    alias_name,
+                    new_name,
+                    offset_encoding,
+                );
+                source_cursor += edit.text.len;
+            },
+        }
+    }
+}
+
+fn appendAliasRenameEditsFromEqual(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(types.TextEdit),
+    seen_starts: *std.AutoHashMapUnmanaged(usize, void),
+    source_text: []const u8,
+    source_start: usize,
+    generated_text: []const u8,
+    generated_start: usize,
+    equal_text: []const u8,
+    alias_name: []const u8,
+    new_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!void {
+    // TODO: Drop this when alias rename uses token-based diffing instead of string diffing.
+    var index: usize = 0;
+    while (index < equal_text.len) : (index += 1) {
+        const source_absolute = source_start + index;
+        const generated_absolute = generated_start + index;
+        if (equal_text[index] == '@' and
+            std.mem.startsWith(u8, equal_text[index + 1 ..], alias_name) and
+            isAliasBoundary(source_text, source_absolute + 1, alias_name.len) and
+            !isAliasBoundary(generated_text, generated_absolute + 1, alias_name.len))
+        {
+            try appendAliasCodeEdit(
+                arena,
+                edits,
+                seen_starts,
+                source_text,
+                source_absolute,
+                source_absolute + 1 + alias_name.len,
+                try std.fmt.allocPrint(arena, "@{s}", .{new_name}),
+                offset_encoding,
+            );
+            index += alias_name.len;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, equal_text[index..], alias_name) and
+            isAliasBoundary(source_text, source_absolute, alias_name.len) and
+            !isAliasBoundary(generated_text, generated_absolute, alias_name.len))
+        {
+            try appendAliasCodeEdit(
+                arena,
+                edits,
+                seen_starts,
+                source_text,
+                source_absolute,
+                source_absolute + alias_name.len,
+                new_name,
+                offset_encoding,
+            );
+            index += alias_name.len - 1;
+        }
+    }
+}
+
+fn appendAliasRenameEditsFromDelete(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(types.TextEdit),
+    seen_starts: *std.AutoHashMapUnmanaged(usize, void),
+    source_text: []const u8,
+    delete_start: usize,
+    deleted_text: []const u8,
+    alias_name: []const u8,
+    new_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!void {
+    var index: usize = 0;
+    while (index < deleted_text.len) : (index += 1) {
+        const absolute = delete_start + index;
+        if (deleted_text[index] == '@' and
+            std.mem.startsWith(u8, deleted_text[index + 1 ..], alias_name) and
+            isAliasBoundary(source_text, absolute + 1, alias_name.len))
+        {
+            try appendAliasCodeEdit(
+                arena,
+                edits,
+                seen_starts,
+                source_text,
+                absolute,
+                absolute + 1 + alias_name.len,
+                try std.fmt.allocPrint(arena, "@{s}", .{new_name}),
+                offset_encoding,
+            );
+            index += alias_name.len;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, deleted_text[index..], alias_name) and
+            isAliasBoundary(source_text, absolute, alias_name.len))
+        {
+            try appendAliasCodeEdit(
+                arena,
+                edits,
+                seen_starts,
+                source_text,
+                absolute,
+                absolute + alias_name.len,
+                new_name,
+                offset_encoding,
+            );
+            index += alias_name.len - 1;
+        }
+    }
+}
+
+fn appendAliasCodeEdit(
+    arena: std.mem.Allocator,
+    edits: *std.ArrayList(types.TextEdit),
+    seen_starts: *std.AutoHashMapUnmanaged(usize, void),
+    source_text: []const u8,
+    start: usize,
+    end: usize,
+    new_text: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!void {
+    const gop = try seen_starts.getOrPut(arena, start);
+    if (gop.found_existing) return;
+
+    try edits.append(arena, .{
+        .range = lsp.offsets.locToRange(source_text, .{
+            .start = start,
+            .end = end,
+        }, offset_encoding),
+        .newText = new_text,
+    });
+}
+
+fn isAliasBoundary(source_text: []const u8, start: usize, len: usize) bool {
+    if (start > 0 and isAliasByte(source_text[start - 1])) return false;
+    const end = start + len;
+    return end >= source_text.len or !isAliasByte(source_text[end]);
+}
+
+fn isAliasByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
 fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?ts.Range {
@@ -2136,6 +2403,103 @@ test "code map stores source and generated byte ranges" {
     try expectEqual(generated.len, action_gen_span.generated_range.end);
 }
 
+test "code map reports optimized-away code blocks as unmapped" {
+    const source =
+        \\%impl @first(A) {
+        \\    A = B;
+        \\}
+        \\%impl @second(B) {
+        \\    B = C;
+        \\}
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\    yygotominor.yy0 = yymsp[0].minor.yy42;
+    ;
+
+    const tree = try parseZitronTreeForTest(source);
+    defer tree.destroy();
+    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    const mapped_range = zigCodeRangeForLine(tree.rootNode(), 1) orelse return error.UnexpectedCodeMap;
+    const unmapped_range = zigCodeRangeForLine(tree.rootNode(), 4) orelse return error.UnexpectedCodeMap;
+    try std.testing.expect(map.indexForSourceRange(mapped_range) != null);
+    try expectEqual(@as(?usize, null), map.indexForSourceRange(unmapped_range));
+}
+
+test "alias code block rename refuses unmapped source blocks" {
+    const source =
+        \\%impl @first(A) {
+        \\    A = B;
+        \\}
+        \\%impl @second(B) {
+        \\    B = C;
+        \\}
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\    yygotominor.yy0 = yymsp[0].minor.yy42;
+    ;
+    const uri = "file:///source.zy";
+
+    const tree = try parseZitronTreeForTest(source);
+    defer tree.destroy();
+    const mapped_range = zigCodeRangeForLine(tree.rootNode(), 1) orelse return error.UnexpectedCodeMap;
+    const unmapped_range = zigCodeRangeForLine(tree.rootNode(), 4) orelse return error.UnexpectedCodeMap;
+    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), generated, "source.zy");
+    errdefer map.deinit(testing_allocator);
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = undefined,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_request_id = 1,
+    };
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, .{
+        .source_uri = try testing_allocator.dupe(u8, uri),
+        .source_path = try testing_allocator.dupe(u8, "source.zy"),
+        .source_text = source,
+        .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+        .generated_text = try testing_allocator.dupe(u8, generated),
+        .code_map = map,
+        .generation_error = null,
+        .version = 1,
+        .opened = false,
+    });
+    errdefer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var doc = removed.value;
+        doc.deinit(testing_allocator);
+        middleware.documents.deinit(testing_allocator);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const edits = try middleware.aliasCodeBlockRenameEdits(
+        arena_state.allocator(),
+        uri,
+        "A",
+        "Alias",
+        &.{ mapped_range, unmapped_range },
+        .@"utf-8",
+    );
+    try expectEqual(@as(?[]const types.TextEdit, null), edits);
+
+    const removed = middleware.documents.fetchRemove(uri).?;
+    testing_allocator.free(removed.key);
+    var doc = removed.value;
+    doc.deinit(testing_allocator);
+    middleware.documents.deinit(testing_allocator);
+}
+
 test "request span translator applies source column offset" {
     const source =
         \\rule ::= TOKEN.   { result = token; }
@@ -2205,6 +2569,106 @@ test "request span translator nulls mutated generated aliases" {
         .start = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, "yygotominor").?, .@"utf-8"),
         .end = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, " =").?, .@"utf-8"),
     }) == null);
+}
+
+test "alias code block rename edits come from source-side deletes" {
+    const source =
+        \\statement_list(A) ::= statement(X).   { A = pik_elist_append(p, @X, local_X); }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ yygotominor.yy0 = pik_elist_append(p, yymsp[0].minor.yy42, local_X);
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_range = map.src_range.items[0];
+    const generated_range = map.gen_span.items[0].generated_range;
+    var difference = Diff.init(.default);
+    defer difference.deinit(testing_allocator);
+    _ = try difference.diff(
+        testing_allocator,
+        source[source_range.start_byte..source_range.end_byte],
+        generated[generated_range.start..generated_range.end],
+    );
+
+    var edits: std.ArrayList(types.TextEdit) = .empty;
+    defer edits.deinit(arena);
+    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_starts.deinit(arena);
+    try appendAliasRenameEditsFromDiff(
+        arena,
+        &edits,
+        &seen_starts,
+        source,
+        source_range,
+        generated,
+        generated_range,
+        difference.edits.items,
+        "X",
+        "Item",
+        .@"utf-8",
+    );
+
+    try expectEqual(@as(usize, 1), edits.items.len);
+    try expectEqualStrings("@X", lsp.offsets.rangeToSlice(source, edits.items[0].range, .@"utf-8"));
+    try expectEqualStrings("@Item", edits.items[0].newText);
+}
+
+test "alias code block rename catches lhs aliases matched inside generated types" {
+    const source =
+        \\form(F) ::= list(L).   { F = L; // F-overwrites-L }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ (yymsp - 1)[1].minor.@"?Form" = (yymsp - 1)[1].minor.@"Form"; // F-overwrites-L
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_range = map.src_range.items[0];
+    const generated_range = map.gen_span.items[0].generated_range;
+    var difference = Diff.init(.default);
+    defer difference.deinit(testing_allocator);
+    _ = try difference.diff(
+        testing_allocator,
+        source[source_range.start_byte..source_range.end_byte],
+        generated[generated_range.start..generated_range.end],
+    );
+
+    var edits: std.ArrayList(types.TextEdit) = .empty;
+    defer edits.deinit(arena);
+    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_starts.deinit(arena);
+    try appendAliasRenameEditsFromDiff(
+        arena,
+        &edits,
+        &seen_starts,
+        source,
+        source_range,
+        generated,
+        generated_range,
+        difference.edits.items,
+        "F",
+        "FormValue",
+        .@"utf-8",
+    );
+
+    try expectEqual(@as(usize, 1), edits.items.len);
+    try expectEqualStrings("F", lsp.offsets.rangeToSlice(source, edits.items[0].range, .@"utf-8"));
+    try expectEqualStrings("FormValue", edits.items[0].newText);
+    try expectEqual(
+        std.mem.indexOf(u8, source, "F =").?,
+        lsp.offsets.positionToIndex(source, edits.items[0].range.start, .@"utf-8"),
+    );
 }
 
 test "request span translator handles generated line directive after action" {

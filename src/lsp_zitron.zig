@@ -396,10 +396,31 @@ pub const Server = struct {
             params.newName,
             server.offset_encoding,
         );
-        if (edits.len == 0) return null;
+        var all_edits: std.ArrayList(types.TextEdit) = .empty;
+        try all_edits.appendSlice(arena, edits);
+        if (symbol.kind == .alias) {
+            const code_ranges = try doc.aliasCodeBlockRangesForRename(arena, symbol);
+            const code_edits = (try server.zig_middleware.aliasCodeBlockRenameEdits(
+                arena,
+                params.textDocument.uri,
+                symbol.symbol_name,
+                params.newName,
+                code_ranges,
+                server.offset_encoding,
+            )) orelse return null;
+            const magic_comment_edits = try doc.aliasMagicCommentEditsForRename(
+                arena,
+                symbol,
+                params.newName,
+                server.offset_encoding,
+            );
+            try all_edits.appendSlice(arena, magic_comment_edits);
+            try all_edits.appendSlice(arena, code_edits);
+        }
+        if (all_edits.items.len == 0) return null;
 
         var changes = std.json.ArrayHashMap([]const types.TextEdit){};
-        try changes.map.put(arena, params.textDocument.uri, edits);
+        try changes.map.put(arena, params.textDocument.uri, try all_edits.toOwnedSlice(arena));
         return .{ .changes = changes };
     }
 
@@ -1306,6 +1327,156 @@ test "rename returns grammar-side edits without including aliases" {
     try expectRenamePreservesAliasText(sample, action_edit, "(A; N)");
 }
 
+test "rename returns scoped alias grammar edits" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/alias_rename.zy";
+    const sample =
+        \\expr(A) ::= term(A) NUMBER(N). @on_expr(A; N)
+        \\sum(A) ::= term(A) NUMBER(N). @on_expr(A; N)
+        \\%impl @on_expr(A; N) { _ = .{ A, N }; }
+        \\%impl @on_expr(A; N) { _ = .{ N, A }; }
+        \\term(A) ::= NUMBER(A).
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const first_alias = try byteIndexOf(sample, "expr(A)");
+    const rule_alias_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, first_alias + "expr(".len, "A"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, rule_alias_edit, uri, "A", "Value", 8);
+    try expectRenameDoesNotTouchText(sample, rule_alias_edit, "term(A) ::= NUMBER(A)");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_alias = try byteIndexOf(sample, "%impl @on_expr(A; N)");
+    const impl_alias_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_alias + "%impl @on_expr(".len, "A"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, impl_alias_edit, uri, "A", "Value", 8);
+    try expectRenameDoesNotTouchText(sample, impl_alias_edit, "term(A) ::= NUMBER(A)");
+}
+
+test "rename rewrites magic overwrite comments for special aliases" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/magic_comment_rename.zy";
+    const sample =
+        \\form(F) ::= list(L). @f_list(F; L)
+        \\%impl @f_list(F; L) {
+        \\    F = L; // F-overwrites-L
+        \\}
+        \\pair(P) ::= ONE(A) TWO(B). @pair(P; A, B)
+        \\%impl @pair(P; A, B) {
+        \\    // P-overwrites-A
+        \\}
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const lhs_alias = try byteIndexOf(sample, "form(F)");
+    const lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, lhs_alias + "form(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(lhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_rhs_alias = try byteIndexOf(sample, "%impl @f_list(F; L)");
+    const rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_rhs_alias + "%impl @f_list(F; ".len, "L"),
+        .newName = "List",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(rhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, rhs_edit, "// F-overwrites-L\n", "// F-overwrites-List\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const second_rhs_alias = try byteIndexOf(sample, "B). @pair");
+    const second_rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, second_rhs_alias, "B"),
+        .newName = "Bee",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(second_rhs_edit, uri, 3);
+    try expectRenameDoesNotTouchText(sample, second_rhs_edit, "// P-overwrites-A\n");
+}
+
+test "rename follows ditto aliases from master and named actions" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/ditto_alias_rename.zy";
+    const sample =
+        \\form(F) ::= list(L). @f_list(F; L)
+        \\%type ignored void
+        \\  `` map(M). @f_map(F; M)
+        \\next(N) ::= atom(A). @next(N; A)
+        \\  `` other(O). @other(N; O)
+        \\%impl @f_list(F; L) {
+        \\    F = L; // F-overwrites-L
+        \\}
+        \\%impl @f_map(F; M) {
+        \\    F = M; // F-overwrites-M
+        \\}
+        \\%impl @other(N; O) {
+        \\    N = O; // N-overwrites-O
+        \\}
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const lhs_alias = try byteIndexOf(sample, "form(F)");
+    const lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, lhs_alias + "form(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(lhs_edit, uri, 7);
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-M\n", "// Value-overwrites-M\n");
+    try expectRenameDoesNotTouchText(sample, lhs_edit, "// N-overwrites-O\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_ditto_lhs = try byteIndexOf(sample, "%impl @f_map(F; M)");
+    const impl_lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_ditto_lhs + "%impl @f_map(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(impl_lhs_edit, uri, 7);
+    try expectRenameHasEdit(sample, impl_lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+    try expectRenameHasEdit(sample, impl_lhs_edit, "// F-overwrites-M\n", "// Value-overwrites-M\n");
+    try expectRenameDoesNotTouchText(sample, impl_lhs_edit, "// N-overwrites-O\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const ditto_rhs = try byteIndexOf(sample, "map(M)");
+    const rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, ditto_rhs + "map(".len, "M"),
+        .newName = "MapValue",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(rhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, rhs_edit, "// F-overwrites-M\n", "// F-overwrites-MapValue\n");
+    try expectRenameDoesNotTouchText(sample, rhs_edit, "// F-overwrites-L\n");
+}
+
 test "initialize negotiates position encoding" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1353,6 +1524,54 @@ fn expectRenamePreservesAliasText(
         }
     }
     return error.UnexpectedRenameResult;
+}
+
+fn expectRenameEditCount(
+    workspace_edit: types.WorkspaceEdit,
+    uri: []const u8,
+    expected_count: usize,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    const edits = changes.map.get(uri) orelse return error.UnexpectedRenameResult;
+    try expectEqual(expected_count, edits.len);
+}
+
+fn expectRenameHasEdit(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    old_text: []const u8,
+    new_text: []const u8,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    var it = changes.map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |edit| {
+            if (std.mem.eql(u8, old_text, lsp.offsets.rangeToSlice(source, edit.range, test_offset_encoding)) and
+                std.mem.eql(u8, new_text, edit.newText))
+            {
+                return;
+            }
+        }
+    }
+    return error.UnexpectedRenameResult;
+}
+
+fn expectRenameDoesNotTouchText(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    preserved_text: []const u8,
+) !void {
+    const preserved_start = try byteIndexOf(source, preserved_text);
+    const preserved_end = preserved_start + preserved_text.len;
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    var it = changes.map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |edit| {
+            const start = lsp.offsets.positionToIndex(source, edit.range.start, test_offset_encoding);
+            const end = lsp.offsets.positionToIndex(source, edit.range.end, test_offset_encoding);
+            try expect(end <= preserved_start or preserved_end <= start);
+        }
+    }
 }
 
 const std = @import("std");
