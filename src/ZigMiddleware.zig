@@ -2063,7 +2063,7 @@ fn runZitron(
     source_text: []const u8,
 ) Error!ZitronResult {
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "zitron", "-Fl", source_path },
+        .argv = &.{ "zitron", "-Ful", source_path },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
