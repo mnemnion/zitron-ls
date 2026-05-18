@@ -497,7 +497,7 @@ fn expectReferencesResponse(
     defer references.deinit();
 
     const resolved = references.value orelse return error_set.UnexpectedResponse;
-    try expectEqual(@as(usize, 4), resolved.len);
+    try expectEqual(@as(usize, 5), resolved.len);
     for (resolved) |location| {
         try expectEqualStrings(fixture_uri, location.uri);
     }

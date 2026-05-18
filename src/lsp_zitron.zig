@@ -180,10 +180,12 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
             params.textDocument.version,
-            params.textDocument.text,
+            doc.source,
+            doc.tree.rootNode(),
         );
     }
 
@@ -204,6 +206,7 @@ pub const Server = struct {
             params.textDocument.uri,
             params.textDocument.version,
             doc.source,
+            doc.tree.rootNode(),
         );
     }
 
@@ -313,6 +316,7 @@ pub const Server = struct {
                         ),
                     },
                 } else null,
+                .terminal_reference => null,
                 .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
                     .definition = .{
                         .location = doc.locationForNode(
@@ -392,10 +396,31 @@ pub const Server = struct {
             params.newName,
             server.offset_encoding,
         );
-        if (edits.len == 0) return null;
+        var all_edits: std.ArrayList(types.TextEdit) = .empty;
+        try all_edits.appendSlice(arena, edits);
+        if (symbol.kind == .alias) {
+            const code_ranges = try doc.aliasCodeBlockRangesForRename(arena, symbol);
+            const code_edits = (try server.zig_middleware.aliasCodeBlockRenameEdits(
+                arena,
+                params.textDocument.uri,
+                symbol.symbol_name,
+                params.newName,
+                code_ranges,
+                server.offset_encoding,
+            )) orelse return null;
+            const magic_comment_edits = try doc.aliasMagicCommentEditsForRename(
+                arena,
+                symbol,
+                params.newName,
+                server.offset_encoding,
+            );
+            try all_edits.appendSlice(arena, magic_comment_edits);
+            try all_edits.appendSlice(arena, code_edits);
+        }
+        if (all_edits.items.len == 0) return null;
 
         var changes = std.json.ArrayHashMap([]const types.TextEdit){};
-        try changes.map.put(arena, params.textDocument.uri, edits);
+        try changes.map.put(arena, params.textDocument.uri, try all_edits.toOwnedSlice(arena));
         return .{ .changes = changes };
     }
 
@@ -457,6 +482,11 @@ pub const Server = struct {
             .rule_reference => std.fmt.allocPrint(
                 arena,
                 "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+            .terminal_reference => std.fmt.allocPrint(
+                arena,
+                "terminal reference `{s}`\n\ncapture `{s}` on `{s}`",
                 .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
             ),
             .action_definition => std.fmt.allocPrint(
@@ -583,7 +613,7 @@ test "embedded tags query compiles for the zitron grammar" {
     const query = try ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
     defer query.destroy();
 
-    try expectEqual(@as(u32, 6), query.patternCount());
+    try expectEqual(@as(u32, 13), query.patternCount());
     try expect(query.captureCount() >= 3);
 }
 
@@ -905,6 +935,37 @@ test "query resolution finds rule definitions and references in calc" {
     }
 }
 
+test "query resolution finds directive grammar symbols" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+
+    const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
+    defer testing_allocator.free(sample);
+
+    try server.putDocument("file:///samples/calc.zy", 1, sample);
+    const doc = server.getDocument("file:///samples/calc.zy").?;
+
+    const expr_type_index = try byteIndexOf(sample, "%type expr f64");
+    const expr_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfTextAfter(sample, expr_type_index, "expr"));
+    switch (expr_resolution) {
+        .symbol => |symbol| {
+            try expectEqual(Document.SemanticKind.rule_reference, symbol.kind);
+            try expectEqualStrings("expr", symbol.symbol_name);
+        },
+        else => return error.UnexpectedResolution,
+    }
+
+    const number_type_index = try byteIndexOf(sample, "%type NUMBER {f64}");
+    const number_resolution = doc.resolveAtPosition(server.tags_query, server.offset_encoding, try positionOfTextAfter(sample, number_type_index, "NUMBER"));
+    switch (number_resolution) {
+        .symbol => |symbol| {
+            try expectEqual(Document.SemanticKind.terminal_reference, symbol.kind);
+            try expectEqualStrings("NUMBER", symbol.symbol_name);
+        },
+        else => return error.UnexpectedResolution,
+    }
+}
+
 test "query resolution returns no match on punctuation" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1024,13 +1085,31 @@ test "hover definition and references operate on stored live document state" {
         else => return error.UnexpectedDefinitionTarget,
     }
 
+    const expr_type_index = try byteIndexOf(sample, "%type expr f64");
+    const directive_definition = (try server.@"textDocument/definition"(testing_allocator, .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, expr_type_index, "expr"),
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (directive_definition) {
+        .definition => |target| switch (target) {
+            .location => |location| {
+                try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                try expectEqual(@as(u32, 48), location.range.start.line);
+                try expectEqual(@as(u32, 0), location.range.start.character);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
     const references = (try server.@"textDocument/references"(arena_state.allocator(), .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = false },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 4), references.len);
+    try expectEqual(@as(usize, 5), references.len);
     try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index + 1, "expr")));
+    try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, expr_type_index, "expr")));
 
     const first_expr_rhs_rule_index = try byteIndexOf(sample, "expr(A) ::= expr(B) PLUS|FOO(O) term(C).");
     try expect(Server.hasLocationAt(references, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index + 1, "expr")));
@@ -1046,12 +1125,24 @@ test "hover definition and references operate on stored live document state" {
         .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
         .context = .{ .includeDeclaration = true },
     })) orelse return error.UnexpectedDefinitionTarget;
-    try expectEqual(@as(usize, 7), references_with_declaration.len);
+    try expectEqual(@as(usize, 8), references_with_declaration.len);
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, calc_rule_index, "expr(A)")));
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, first_expr_rhs_rule_index, "expr(A)")));
 
     const third_expr_rule_index = try byteIndexOf(sample, "expr(A) ::= term(A).");
     try expect(Server.hasLocationAt(references_with_declaration, "file:///samples/calc.zy", try positionOfTextAfter(sample, third_expr_rule_index, "expr(A)")));
+
+    const number_type_index = try byteIndexOf(sample, "%type NUMBER {f64}");
+    const number_references = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .position = try positionOfTextAfter(sample, number_type_index, "NUMBER"),
+        .context = .{ .includeDeclaration = false },
+    })) orelse return error.UnexpectedDefinitionTarget;
+    try expectEqual(@as(usize, 2), number_references.len);
+    try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_type_index, "NUMBER")));
+
+    const number_rhs_index = try byteIndexOf(sample, "factor(A) ::= NUMBER(N).");
+    try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_rhs_index, "NUMBER")));
 }
 
 test "document symbols operate on stored live document state" {
@@ -1236,6 +1327,156 @@ test "rename returns grammar-side edits without including aliases" {
     try expectRenamePreservesAliasText(sample, action_edit, "(A; N)");
 }
 
+test "rename returns scoped alias grammar edits" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/alias_rename.zy";
+    const sample =
+        \\expr(A) ::= term(A) NUMBER(N). @on_expr(A; N)
+        \\sum(A) ::= term(A) NUMBER(N). @on_expr(A; N)
+        \\%impl @on_expr(A; N) { _ = .{ A, N }; }
+        \\%impl @on_expr(A; N) { _ = .{ N, A }; }
+        \\term(A) ::= NUMBER(A).
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const first_alias = try byteIndexOf(sample, "expr(A)");
+    const rule_alias_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, first_alias + "expr(".len, "A"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, rule_alias_edit, uri, "A", "Value", 8);
+    try expectRenameDoesNotTouchText(sample, rule_alias_edit, "term(A) ::= NUMBER(A)");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_alias = try byteIndexOf(sample, "%impl @on_expr(A; N)");
+    const impl_alias_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_alias + "%impl @on_expr(".len, "A"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, impl_alias_edit, uri, "A", "Value", 8);
+    try expectRenameDoesNotTouchText(sample, impl_alias_edit, "term(A) ::= NUMBER(A)");
+}
+
+test "rename rewrites magic overwrite comments for special aliases" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/magic_comment_rename.zy";
+    const sample =
+        \\form(F) ::= list(L). @f_list(F; L)
+        \\%impl @f_list(F; L) {
+        \\    F = L; // F-overwrites-L
+        \\}
+        \\pair(P) ::= ONE(A) TWO(B). @pair(P; A, B)
+        \\%impl @pair(P; A, B) {
+        \\    // P-overwrites-A
+        \\}
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const lhs_alias = try byteIndexOf(sample, "form(F)");
+    const lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, lhs_alias + "form(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(lhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_rhs_alias = try byteIndexOf(sample, "%impl @f_list(F; L)");
+    const rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_rhs_alias + "%impl @f_list(F; ".len, "L"),
+        .newName = "List",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(rhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, rhs_edit, "// F-overwrites-L\n", "// F-overwrites-List\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const second_rhs_alias = try byteIndexOf(sample, "B). @pair");
+    const second_rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, second_rhs_alias, "B"),
+        .newName = "Bee",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(second_rhs_edit, uri, 3);
+    try expectRenameDoesNotTouchText(sample, second_rhs_edit, "// P-overwrites-A\n");
+}
+
+test "rename follows ditto aliases from master and named actions" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/ditto_alias_rename.zy";
+    const sample =
+        \\form(F) ::= list(L). @f_list(F; L)
+        \\%type ignored void
+        \\  `` map(M). @f_map(F; M)
+        \\next(N) ::= atom(A). @next(N; A)
+        \\  `` other(O). @other(N; O)
+        \\%impl @f_list(F; L) {
+        \\    F = L; // F-overwrites-L
+        \\}
+        \\%impl @f_map(F; M) {
+        \\    F = M; // F-overwrites-M
+        \\}
+        \\%impl @other(N; O) {
+        \\    N = O; // N-overwrites-O
+        \\}
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const lhs_alias = try byteIndexOf(sample, "form(F)");
+    const lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, lhs_alias + "form(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(lhs_edit, uri, 7);
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+    try expectRenameHasEdit(sample, lhs_edit, "// F-overwrites-M\n", "// Value-overwrites-M\n");
+    try expectRenameDoesNotTouchText(sample, lhs_edit, "// N-overwrites-O\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const impl_ditto_lhs = try byteIndexOf(sample, "%impl @f_map(F; M)");
+    const impl_lhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, impl_ditto_lhs + "%impl @f_map(".len, "F"),
+        .newName = "Value",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(impl_lhs_edit, uri, 7);
+    try expectRenameHasEdit(sample, impl_lhs_edit, "// F-overwrites-L\n", "// Value-overwrites-L\n");
+    try expectRenameHasEdit(sample, impl_lhs_edit, "// F-overwrites-M\n", "// Value-overwrites-M\n");
+    try expectRenameDoesNotTouchText(sample, impl_lhs_edit, "// N-overwrites-O\n");
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const ditto_rhs = try byteIndexOf(sample, "map(M)");
+    const rhs_edit = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfTextAfter(sample, ditto_rhs + "map(".len, "M"),
+        .newName = "MapValue",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEditCount(rhs_edit, uri, 4);
+    try expectRenameHasEdit(sample, rhs_edit, "// F-overwrites-M\n", "// F-overwrites-MapValue\n");
+    try expectRenameDoesNotTouchText(sample, rhs_edit, "// F-overwrites-L\n");
+}
+
 test "initialize negotiates position encoding" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1283,6 +1524,54 @@ fn expectRenamePreservesAliasText(
         }
     }
     return error.UnexpectedRenameResult;
+}
+
+fn expectRenameEditCount(
+    workspace_edit: types.WorkspaceEdit,
+    uri: []const u8,
+    expected_count: usize,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    const edits = changes.map.get(uri) orelse return error.UnexpectedRenameResult;
+    try expectEqual(expected_count, edits.len);
+}
+
+fn expectRenameHasEdit(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    old_text: []const u8,
+    new_text: []const u8,
+) !void {
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    var it = changes.map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |edit| {
+            if (std.mem.eql(u8, old_text, lsp.offsets.rangeToSlice(source, edit.range, test_offset_encoding)) and
+                std.mem.eql(u8, new_text, edit.newText))
+            {
+                return;
+            }
+        }
+    }
+    return error.UnexpectedRenameResult;
+}
+
+fn expectRenameDoesNotTouchText(
+    source: []const u8,
+    workspace_edit: types.WorkspaceEdit,
+    preserved_text: []const u8,
+) !void {
+    const preserved_start = try byteIndexOf(source, preserved_text);
+    const preserved_end = preserved_start + preserved_text.len;
+    const changes = workspace_edit.changes orelse return error.UnexpectedRenameResult;
+    var it = changes.map.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.*) |edit| {
+            const start = lsp.offsets.positionToIndex(source, edit.range.start, test_offset_encoding);
+            const end = lsp.offsets.positionToIndex(source, edit.range.end, test_offset_encoding);
+            try expect(end <= preserved_start or preserved_end <= start);
+        }
+    }
 }
 
 const std = @import("std");
