@@ -92,6 +92,45 @@ pub fn logFn(
     }
 }
 
+pub fn panic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    recordPanic(msg, first_trace_addr);
+    std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+fn recordPanic(msg: []const u8, first_trace_addr: ?usize) void {
+    const io = std.Options.debug_io;
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writePanicRecord(&writer, msg, first_trace_addr) catch {};
+
+    const stderr = io.lockStderr(&.{}, null) catch |err| switch (err) {
+        error.Canceled => null,
+    };
+    if (stderr) |locked_stderr| {
+        defer io.unlockStderr();
+        locked_stderr.file_writer.interface.writeAll(writer.buffered()) catch {};
+    }
+
+    if (log_file) |file| {
+        const is_locked = if (file.lock(io, .exclusive)) |_| true else |_| false;
+        defer if (is_locked) file.unlock(io);
+        if (file.length(io)) |length| {
+            file.writePositionalAll(io, writer.buffered(), length) catch {};
+        } else |_| {
+            file.writeStreamingAll(io, writer.buffered()) catch {};
+        }
+    }
+}
+
+fn writePanicRecord(writer: *std.Io.Writer, msg: []const u8, first_trace_addr: ?usize) std.Io.Writer.Error!void {
+    try writer.print("panic (panic): {s}", .{msg});
+    if (first_trace_addr) |addr| try writer.print(" at 0x{x}", .{addr});
+    try writer.writeByte('\n');
+}
+
 pub fn parseLevel(name: []const u8) ?std.log.Level {
     return std.meta.stringToEnum(std.log.Level, name);
 }
@@ -188,6 +227,15 @@ test "log level names parse like ZLS flags" {
     try expectEqual(std.log.Level.info, parseLevel("info").?);
     try expectEqual(std.log.Level.debug, parseLevel("debug").?);
     try expect(parseLevel("trace") == null);
+}
+
+test "panic records are formatted outside normal log filtering" {
+    var buffer: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+
+    try writePanicRecord(&writer, "smoke panic", 0x1234);
+
+    try expectEqualStrings("panic (panic): smoke panic at 0x1234\n", writer.buffered());
 }
 
 const std = @import("std");

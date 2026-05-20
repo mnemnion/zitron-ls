@@ -5,6 +5,8 @@ pub const std_options: std.Options = .{
     .logFn = logging.logFn,
 };
 
+pub const panic = std.debug.FullPanic(logging.panic);
+
 pub fn main(init: std.process.Init) Error!void {
     const args = try parseArgs(init.gpa, init.minimal.args);
     defer args.deinit(init.gpa);
@@ -18,6 +20,7 @@ pub fn main(init: std.process.Init) Error!void {
     } else {
         log.info("Log File: none", .{});
     }
+    if (args.panic_smoke_test) @panic("panic-smoke-test");
 
     var server = try zitron.Server.initProduction(init.io, init.gpa);
     defer server.deinit();
@@ -52,6 +55,7 @@ const usage =
 const Args = struct {
     logging: logging.Options = .{},
     exe_path: []const u8 = "",
+    panic_smoke_test: bool = false,
 
     fn deinit(args: Args, allocator: std.mem.Allocator) void {
         if (args.logging.log_file_path) |path| allocator.free(path);
@@ -98,6 +102,8 @@ fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Args
             };
         } else if (std.mem.eql(u8, arg, "--enable-stderr-logs")) {
             result.logging.enable_stderr_logs = true;
+        } else if (std.mem.eql(u8, arg, "--panic-smoke-test")) {
+            result.panic_smoke_test = true;
         } else {
             std.log.err("Unrecognized argument: '{s}'.", .{arg});
             std.process.exit(1);
