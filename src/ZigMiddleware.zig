@@ -81,11 +81,15 @@ pub fn disabled() ZigMiddleware {
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     return initImpl(io, allocator) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => disabled(),
+        else => {
+            log.warn("Zig middleware disabled: {}", .{err});
+            return disabled();
+        },
     };
 }
 
 fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
+    log.info("Starting ZLS middleware", .{});
     try checkZitron(allocator, io);
 
     const read_buffer = try allocator.alloc(u8, 4096);
@@ -112,6 +116,7 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     errdefer mware.deinit();
 
     try mware.initializeZls();
+    log.info("ZLS middleware enabled", .{});
     return .{ .mode = .{ .enabled = mware } };
 }
 
@@ -296,6 +301,7 @@ fn middlewareSyncDocument(
     }
 
     const generated = runZitron(middleware.allocator, middleware.io, doc.source_path, source_text) catch |err| {
+        log.warn("Zitron generation failed for '{s}': {}", .{ doc.source_path, err });
         doc.generation_error = try middleware.allocator.dupe(u8, @errorName(err));
         return;
     };
@@ -305,6 +311,7 @@ fn middlewareSyncDocument(
         else => false,
     };
     if (!generated_success) {
+        log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ doc.source_path, generated.stderr });
         middleware.allocator.free(generated.stdout);
         doc.generation_error = try middleware.allocator.dupe(u8, generated.stderr);
         return;
@@ -1956,6 +1963,7 @@ fn freeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) vo
 }
 
 fn middlewareShutdownZls(middleware: *Middleware) Error!void {
+    log.info("Stopping ZLS middleware", .{});
     const id = middleware.nextRequestId();
     try middleware.zls_transport.transport.writeRequest(
         middleware.io,
@@ -2006,7 +2014,10 @@ fn middlewareRequest(
     const result_value = switch (parsed.value) {
         .response => |response| switch (response.result_or_error) {
             .result => |maybe_result| maybe_result,
-            .@"error" => return error.RequestFailed,
+            .@"error" => {
+                log.warn("ZLS '{s}' request failed", .{method});
+                return error.RequestFailed;
+            },
         },
         else => return error.UnexpectedResponse,
     };
@@ -3128,3 +3139,4 @@ const OOM = std.mem.Allocator.Error || error{TooManySegments};
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
+const log = std.log.scoped(.zig_middleware);

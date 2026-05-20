@@ -136,6 +136,9 @@ pub const Server = struct {
         allocator: std.mem.Allocator,
         params: types.InitializeParams,
     ) types.InitializeResult {
+        if (params.clientInfo) |client_info| {
+            log.info("Client: {s} {s}", .{ client_info.name, client_info.version orelse "" });
+        }
         if (params.capabilities.general) |general| {
             for (general.positionEncodings orelse &.{}) |encoding| {
                 server.offset_encoding = switch (encoding) {
@@ -180,6 +183,7 @@ pub const Server = struct {
             params.textDocument.version,
             params.textDocument.text,
         );
+        log.debug("Opened document: {s}", .{params.textDocument.uri});
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
@@ -202,6 +206,7 @@ pub const Server = struct {
             params.contentChanges,
             server.offset_encoding,
         );
+        log.debug("Changed document: {s}", .{params.textDocument.uri});
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
             params.textDocument.version,
@@ -1587,6 +1592,7 @@ const tags_query_source = @embedFile("zitron-tags-query");
 const rename_query_source = @embedFile("zitron-rename-query");
 const zitron_grammar = @import("tree_sitter_zitron");
 const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";
+const log = std.log.scoped(.lsp_zitron);
 
 comptime {
     std.testing.refAllDecls(Document);
