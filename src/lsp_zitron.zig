@@ -89,6 +89,7 @@ pub const Server = struct {
     rename_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
     zig_middleware: ZigMiddleware,
+    io: ?std.Io,
 
     /// Creates a server instance and compiles the grammar tag query.
     pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
@@ -106,6 +107,7 @@ pub const Server = struct {
             .rename_query = rename_query,
             .offset_encoding = .@"utf-16",
             .zig_middleware = ZigMiddleware.disabled(),
+            .io = null,
         };
     }
 
@@ -114,6 +116,7 @@ pub const Server = struct {
         var server = try init(allocator);
         errdefer server.deinit();
         server.zig_middleware = try ZigMiddleware.init(io, allocator);
+        server.io = io;
         return server;
     }
 
@@ -131,12 +134,32 @@ pub const Server = struct {
         server.tags_query.destroy();
     }
 
+    fn logStart(server: *const Server) ?std.Io.Timestamp {
+        const io = server.io orelse return null;
+        return std.Io.Clock.awake.now(io);
+    }
+
+    fn logElapsedNs(server: *const Server, start: ?std.Io.Timestamp) i96 {
+        const io = server.io orelse return 0;
+        const started = start orelse return 0;
+        return started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    }
+
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         server: *Server,
         allocator: std.mem.Allocator,
         params: types.InitializeParams,
     ) types.InitializeResult {
+        const start = server.logStart();
+        const encoding_count = if (params.capabilities.general) |general|
+            if (general.positionEncodings) |encodings| encodings.len else 0
+        else
+            0;
+        log.debug("LSP <- initialize client={s} encodings={}", .{
+            if (params.clientInfo) |client_info| client_info.name else "",
+            encoding_count,
+        });
         if (params.clientInfo) |client_info| {
             log.info("Client: {s} {s}", .{ client_info.name, client_info.version orelse "" });
         }
@@ -152,7 +175,7 @@ pub const Server = struct {
             }
         }
 
-        return .{
+        const result: types.InitializeResult = .{
             .capabilities = serverCapabilities(
                 allocator,
                 server.offset_encoding,
@@ -163,10 +186,18 @@ pub const Server = struct {
                 .version = server_version,
             },
         };
+        log.debug("LSP -> initialize encoding={t} elapsed_ns={}", .{
+            server.offset_encoding,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `initialized` handler required by `lsp-kit`.
-    pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {}
+    pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {
+        log.debug("LSP <- initialized", .{});
+        log.debug("LSP -> initialized", .{});
+    }
 
     //| Handlers
     //|
@@ -179,12 +210,17 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidOpenTextDocumentParams,
     ) Error!void {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/didOpen uri={s} version={} bytes={}", .{
+            params.textDocument.uri,
+            params.textDocument.version,
+            params.textDocument.text.len,
+        });
         try server.putDocument(
             params.textDocument.uri,
             params.textDocument.version,
             params.textDocument.text,
         );
-        log.debug("Opened document: {s}", .{params.textDocument.uri});
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
@@ -192,6 +228,11 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
+        log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            doc.source.len,
+            server.logElapsedNs(start),
+        });
     }
 
     /// LSP `textDocument/didChange` handler that applies incremental document changes.
@@ -200,6 +241,12 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidChangeTextDocumentParams,
     ) Error!void {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/didChange uri={s} version={} changes={}", .{
+            params.textDocument.uri,
+            params.textDocument.version,
+            params.contentChanges.len,
+        });
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
         try doc.updateIncremental(
             server.allocator,
@@ -207,13 +254,17 @@ pub const Server = struct {
             params.contentChanges,
             server.offset_encoding,
         );
-        log.debug("Changed document: {s}", .{params.textDocument.uri});
         try server.zig_middleware.syncDocument(
             params.textDocument.uri,
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
         );
+        log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            doc.source.len,
+            server.logElapsedNs(start),
+        });
     }
 
     /// LSP `textDocument/didClose` handler that drops cached document state.
@@ -222,8 +273,14 @@ pub const Server = struct {
         _: std.mem.Allocator,
         params: types.DidCloseTextDocumentParams,
     ) void {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/didClose uri={s}", .{params.textDocument.uri});
         server.zig_middleware.closeDocument(params.textDocument.uri);
         server.removeDocument(params.textDocument.uri);
+        log.debug("LSP -> textDocument/didClose uri={s} elapsed_ns={}", .{
+            params.textDocument.uri,
+            server.logElapsedNs(start),
+        });
     }
 
     /// LSP `textDocument/completion` handler for directive completions.
@@ -232,9 +289,27 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.CompletionParams,
     ) Error!lsp.ResultType("textDocument/completion") {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/completion uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/completion uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
         if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
-            return try server.zig_middleware.forwardCompletion(arena, params.textDocument.uri, params);
+            const result = try server.zig_middleware.forwardCompletion(arena, params.textDocument.uri, params);
+            log.debug("LSP -> textDocument/completion uri={s} route=zig result_count={} null={} elapsed_ns={}", .{
+                params.textDocument.uri,
+                completionResultCount(result),
+                result == null,
+                server.logElapsedNs(start),
+            });
+            return result;
         }
 
         const root = doc.tree.rootNode();
@@ -262,9 +337,21 @@ pub const Server = struct {
             root,
             params.position,
             server.offset_encoding,
-        ) orelse return null;
+        ) orelse {
+            log.debug("LSP -> textDocument/completion uri={s} route=zitron result=null elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
 
-        return .{ .completion_items = items };
+        const result: lsp.ResultType("textDocument/completion") = .{ .completion_items = items };
+        log.debug("LSP -> textDocument/completion uri={s} route=zitron result_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            items.len,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/hover` handler for Zitron grammar symbols.
@@ -273,14 +360,39 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.HoverParams,
     ) Error!?types.Hover {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/hover uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/hover uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
         const value = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
-            .no_match => return null,
-            .unsupported_zig_code => return try server.zig_middleware.forwardHover(arena, params.textDocument.uri, params),
+            .no_match => {
+                log.debug("LSP -> textDocument/hover uri={s} result=null reason=no_match elapsed_ns={}", .{
+                    params.textDocument.uri,
+                    server.logElapsedNs(start),
+                });
+                return null;
+            },
+            .unsupported_zig_code => {
+                const result = try server.zig_middleware.forwardHover(arena, params.textDocument.uri, params);
+                log.debug("LSP -> textDocument/hover uri={s} route=zig null={} elapsed_ns={}", .{
+                    params.textDocument.uri,
+                    result == null,
+                    server.logElapsedNs(start),
+                });
+                return result;
+            },
             .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol),
         };
 
-        return .{
+        const result: ?types.Hover = .{
             .contents = .{
                 .markup_content = .{
                     .kind = .markdown,
@@ -288,6 +400,11 @@ pub const Server = struct {
                 },
             },
         };
+        log.debug("LSP -> textDocument/hover uri={s} route=zitron null=false elapsed_ns={}", .{
+            params.textDocument.uri,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/definition` handler for grammar symbol lookups.
@@ -296,8 +413,19 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.DefinitionParams,
     ) Error!lsp.ResultType("textDocument/definition") {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
-        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/definition uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/definition uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        const result: lsp.ResultType("textDocument/definition") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => try server.zig_middleware.forwardDefinition(arena, params.textDocument.uri, params),
             .symbol => |symbol| switch (symbol.kind) {
@@ -334,6 +462,13 @@ pub const Server = struct {
                 } else null,
             },
         };
+        log.debug("LSP -> textDocument/definition uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            definitionResultCount(result),
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/references` handler for same-document grammar symbol lookups.
@@ -342,8 +477,20 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.ReferenceParams,
     ) Error!lsp.ResultType("textDocument/references") {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
-        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/references uri={s} position={any} include_declaration={}", .{
+            params.textDocument.uri,
+            params.position,
+            params.context.includeDeclaration,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/references uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        const result: lsp.ResultType("textDocument/references") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => try server.zig_middleware.forwardReferences(arena, params.textDocument.uri, params),
             .symbol => |symbol| try doc.findReferences(
@@ -355,6 +502,13 @@ pub const Server = struct {
                 server.offset_encoding,
             ),
         };
+        log.debug("LSP -> textDocument/references uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (result) |locations| locations.len else 0,
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/inlayHint` handler for embedded Zig inlay hints.
@@ -363,8 +517,26 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.InlayHintParams,
     ) Error!lsp.ResultType("textDocument/inlayHint") {
-        _ = server.getDocument(params.textDocument.uri) orelse return null;
-        return try server.zig_middleware.forwardInlayHint(arena, params.textDocument.uri, params);
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/inlayHint uri={s} range={any}", .{
+            params.textDocument.uri,
+            params.range,
+        });
+        _ = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/inlayHint uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        const result = try server.zig_middleware.forwardInlayHint(arena, params.textDocument.uri, params);
+        log.debug("LSP -> textDocument/inlayHint uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (result) |hints| hints.len else 0,
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/documentSymbol` handler for document-local grammar symbols.
@@ -373,7 +545,15 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.DocumentSymbolParams,
     ) Error!lsp.ResultType("textDocument/documentSymbol") {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/documentSymbol uri={s}", .{params.textDocument.uri});
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/documentSymbol uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
         const local_symbols = try doc.documentSymbols(
             server.tags_query,
             arena,
@@ -384,9 +564,17 @@ pub const Server = struct {
         if (try server.zig_middleware.forwardDocumentSymbols(arena, params.textDocument.uri)) |zig_symbols| {
             try symbols.appendSlice(arena, zig_symbols);
         }
-        return .{
-            .document_symbols = try symbols.toOwnedSlice(arena),
+        const owned_symbols = try symbols.toOwnedSlice(arena);
+        const result: lsp.ResultType("textDocument/documentSymbol") = .{
+            .document_symbols = owned_symbols,
         };
+        log.debug("LSP -> textDocument/documentSymbol uri={s} local_count={} total_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            local_symbols.len,
+            owned_symbols.len,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `textDocument/rename` handler for document-local grammar symbols.
@@ -395,16 +583,41 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         params: types.RenameParams,
     ) Error!lsp.ResultType("textDocument/rename") {
-        const doc = server.getDocument(params.textDocument.uri) orelse return null;
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/rename uri={s} position={any} new_name_len={}", .{
+            params.textDocument.uri,
+            params.position,
+            params.newName.len,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/rename uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
         if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
-            return try server.zig_middleware.forwardRename(arena, params.textDocument.uri, params);
+            const result = try server.zig_middleware.forwardRename(arena, params.textDocument.uri, params);
+            log.debug("LSP -> textDocument/rename uri={s} route=zig edit_count={} null={} elapsed_ns={}", .{
+                params.textDocument.uri,
+                workspaceEditResultCount(result),
+                result == null,
+                server.logElapsedNs(start),
+            });
+            return result;
         }
 
         const symbol = doc.renameSymbolAtPosition(
             server.rename_query,
             server.offset_encoding,
             params.position,
-        ) orelse return null;
+        ) orelse {
+            log.debug("LSP -> textDocument/rename uri={s} route=zitron result=null reason=no_symbol elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
         const edits = try doc.renameEdits(
             server.rename_query,
             arena,
@@ -433,23 +646,47 @@ pub const Server = struct {
             try all_edits.appendSlice(arena, magic_comment_edits);
             try all_edits.appendSlice(arena, code_edits);
         }
-        if (all_edits.items.len == 0) return null;
+        if (all_edits.items.len == 0) {
+            log.debug("LSP -> textDocument/rename uri={s} route=zitron result=null reason=no_edits elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        }
 
         var changes = std.json.ArrayHashMap([]const types.TextEdit){};
-        try changes.map.put(arena, params.textDocument.uri, try all_edits.toOwnedSlice(arena));
-        return .{ .changes = changes };
+        const owned_edits = try all_edits.toOwnedSlice(arena);
+        try changes.map.put(arena, params.textDocument.uri, owned_edits);
+        const result: lsp.ResultType("textDocument/rename") = .{ .changes = changes };
+        log.debug("LSP -> textDocument/rename uri={s} route=zitron edit_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            owned_edits.len,
+            server.logElapsedNs(start),
+        });
+        return result;
     }
 
     /// LSP `shutdown` handler required by `lsp-kit`.
-    pub fn shutdown(_: *Server, _: std.mem.Allocator, _: void) ?void {
+    pub fn shutdown(server: *Server, _: std.mem.Allocator, _: void) ?void {
+        const start = server.logStart();
+        log.debug("LSP <- shutdown", .{});
+        log.debug("LSP -> shutdown elapsed_ns={}", .{server.logElapsedNs(start)});
         return null;
     }
 
     /// LSP `exit` handler required by `lsp-kit`.
-    pub fn exit(_: *Server, _: std.mem.Allocator, _: void) void {}
+    pub fn exit(server: *Server, _: std.mem.Allocator, _: void) void {
+        const start = server.logStart();
+        log.debug("LSP <- exit", .{});
+        log.debug("LSP -> exit elapsed_ns={}", .{server.logElapsedNs(start)});
+    }
 
     /// LSP response hook; ignored because this server does not initiate requests yet.
-    pub fn onResponse(_: *Server, _: std.mem.Allocator, _: lsp.JsonRPCMessage.Response) void {}
+    pub fn onResponse(server: *Server, _: std.mem.Allocator, response: lsp.JsonRPCMessage.Response) void {
+        const start = server.logStart();
+        log.debug("LSP <- response id_present={}", .{response.id != null});
+        log.debug("LSP -> response elapsed_ns={}", .{server.logElapsedNs(start)});
+    }
 
     //| Internal
 
@@ -477,6 +714,45 @@ pub const Server = struct {
 
     fn getDocument(server: *Server, uri: []const u8) ?*Document {
         return server.documents.getPtr(uri);
+    }
+
+    fn completionResultCount(result: lsp.ResultType("textDocument/completion")) usize {
+        const value = result orelse return 0;
+        return switch (value) {
+            .completion_items => |items| items.len,
+            .completion_list => |list| list.items.len,
+        };
+    }
+
+    fn definitionResultCount(result: lsp.ResultType("textDocument/definition")) usize {
+        const value = result orelse return 0;
+        return switch (value) {
+            .definition => |definition| switch (definition) {
+                .location => 1,
+                .locations => |locations| locations.len,
+            },
+            .definition_links => |links| links.len,
+        };
+    }
+
+    fn workspaceEditResultCount(result: lsp.ResultType("textDocument/rename")) usize {
+        const value = result orelse return 0;
+        var count: usize = 0;
+        if (value.changes) |changes| {
+            var it = changes.map.iterator();
+            while (it.next()) |entry| {
+                count += entry.value_ptr.*.len;
+            }
+        }
+        if (value.documentChanges) |document_changes| {
+            for (document_changes) |change| {
+                switch (change) {
+                    .text_document_edit => |edit| count += edit.edits.len,
+                    else => {},
+                }
+            }
+        }
+        return count;
     }
 
     fn hasLocationAt(locations: []const types.Location, uri: []const u8, position: types.Position) bool {
