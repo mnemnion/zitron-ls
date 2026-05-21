@@ -124,6 +124,7 @@ pub const Server = struct {
 
     pub fn setClientTransport(server: *Server, transport: *lsp.Transport) void {
         server.client_transport = transport;
+        server.zig_middleware.setDiagnosticsPublisher(server, publishZlsDiagnostics);
     }
 
     /// Releases all document state and query resources owned by the server.
@@ -151,9 +152,25 @@ pub const Server = struct {
         return started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     }
 
-    fn publishGrammarDiagnostics(server: *Server, uri: []const u8, version: i32) Error!void {
-        const diagnostics = server.zig_middleware.grammarDiagnostics(uri);
-        try server.publishDiagnostics(uri, version, diagnostics);
+    fn publishMergedDiagnostics(server: *Server, uri: []const u8, version: i32) Error!void {
+        if (server.client_transport == null or server.io == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(server.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const grammar_diagnostics = server.zig_middleware.grammarDiagnostics(uri);
+        const zls_diagnostics = server.zig_middleware.zlsDiagnostics(uri);
+        var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+        try diagnostics.appendSlice(arena, grammar_diagnostics);
+        try diagnostics.appendSlice(arena, zls_diagnostics);
+        try server.publishDiagnostics(uri, version, diagnostics.items);
+    }
+
+    fn publishZlsDiagnostics(context: *anyopaque, source_uri: []const u8, version: i32) void {
+        const server: *Server = @ptrCast(@alignCast(context));
+        server.publishMergedDiagnostics(source_uri, version) catch |err| {
+            log.warn("LSP publish diagnostics failed for uri={s}: {}", .{ source_uri, err });
+        };
     }
 
     fn publishDiagnostics(
@@ -266,7 +283,7 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
-        try server.publishGrammarDiagnostics(params.textDocument.uri, params.textDocument.version);
+        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,
@@ -299,7 +316,7 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
-        try server.publishGrammarDiagnostics(params.textDocument.uri, params.textDocument.version);
+        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,

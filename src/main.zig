@@ -31,16 +31,37 @@ pub fn main(init: std.process.Init) Error!void {
         std.Io.File.stdin(),
         std.Io.File.stdout(),
     );
-    server.setClientTransport(&transport.transport);
+    var safe_transport = lsp.ThreadSafeTransport(.{
+        .thread_safe_read = false,
+        .thread_safe_write = true,
+        .MutexType = SpinMutex,
+    }).init(&transport.transport);
+    server.setClientTransport(&safe_transport.transport);
 
     try lsp.basic_server.run(
         init.io,
         init.gpa,
-        &transport.transport,
+        &safe_transport.transport,
         &server,
         log.err,
     );
 }
+
+const SpinMutex = struct {
+    locked: std.atomic.Value(bool) = .init(false),
+
+    pub const init: SpinMutex = .{};
+
+    pub fn lock(mutex: *SpinMutex, _: std.Io) !void {
+        while (mutex.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    pub fn unlock(mutex: *SpinMutex, _: std.Io) void {
+        mutex.locked.store(false, .release);
+    }
+};
 
 const usage =
     \\lsp_zitron
