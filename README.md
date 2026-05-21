@@ -17,6 +17,7 @@ for in a sophisticated grammar DSL:
 - [⚡️] Hover
 - [⚡️] Rename
 - [⚡️] Completions
+- [⚡️] Inlay hints
 
 Oh, and they work for the grammar, and the Zig code[^1] as well.
 
@@ -44,7 +45,8 @@ Straightforward enough, I would hope: clone the repo and `zig build`.
 ### Integrate
 
 If you use Neovim, you're in luck: so do I, and I can show you how to
-get this stood up accordingly.
+get this stood up accordingly.  This is [Lazy]-flavored setup code,
+for the record.
 
 Drop this into the `lsp-mason` section of your `init.lua`:
 
@@ -61,7 +63,7 @@ Drop this into the `lsp-mason` section of your `init.lua`:
             'github:mason-org/mason-registry',
           },
         },
-      }, -- NOTE: Must be loaded before dependants
+      },
 ```
 
 With this block inside the `config` function of `neovim/nvim-lspconfig`:
@@ -125,5 +127,6 @@ apply.  `lsp_zitron` comes with NO WARRANTY
 [zitron]: https://github.com/mnemnion/zitron
 [yacc]: https://en.wikipedia.org/wiki/Yacc
 [ts-zitron]: https://github.com/mnemnion/tree-sitter-zitron
+[lazy]: https://github.com/folke/lazy.nvim
 [zls]: https://github.com/zigtools/zls
 [zitron-examples]: https://github.com/mnemnion/zitron-examples/
