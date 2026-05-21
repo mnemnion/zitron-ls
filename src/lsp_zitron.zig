@@ -48,6 +48,7 @@ fn serverCapabilities(
         .referencesProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
         .renameProvider = .{ .bool = true },
+        .inlayHintProvider = .{ .inlay_hint_options = .{} },
     };
 }
 
@@ -354,6 +355,16 @@ pub const Server = struct {
                 server.offset_encoding,
             ),
         };
+    }
+
+    /// LSP `textDocument/inlayHint` handler for embedded Zig inlay hints.
+    pub fn @"textDocument/inlayHint"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.InlayHintParams,
+    ) Error!lsp.ResultType("textDocument/inlayHint") {
+        _ = server.getDocument(params.textDocument.uri) orelse return null;
+        return try server.zig_middleware.forwardInlayHint(arena, params.textDocument.uri, params);
     }
 
     /// LSP `textDocument/documentSymbol` handler for document-local grammar symbols.
@@ -1042,6 +1053,15 @@ test "disabled Zig middleware returns null for Zig-code requests" {
         .position = position,
     });
     try expect(completion_result == null);
+
+    const inlay_hints = try server.@"textDocument/inlayHint"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/calc.zy" },
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 100, .character = 0 },
+        },
+    });
+    try expect(inlay_hints == null);
 }
 
 test "hover definition and references operate on stored live document state" {

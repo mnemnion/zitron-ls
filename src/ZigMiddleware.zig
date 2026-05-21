@@ -26,6 +26,7 @@ const Middleware = struct {
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
+    const forwardInlayHint = middlewareForwardInlayHint;
     const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
     const forwardRename = middlewareForwardRename;
     const aliasCodeBlockRenameEdits = middlewareAliasCodeBlockRenameEdits;
@@ -60,6 +61,7 @@ const GeneratedDocument = struct {
     generated_uri: []u8,
     generated_text: []u8,
     code_map: CodeMap,
+    translator_cache: SpanTranslatorCache,
     generation_error: ?[]u8,
     version: i32,
     opened: bool,
@@ -70,6 +72,7 @@ const GeneratedDocument = struct {
         allocator.free(doc.generated_uri);
         allocator.free(doc.generated_text);
         doc.code_map.deinit(allocator);
+        doc.translator_cache.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
     }
 };
@@ -202,6 +205,18 @@ pub fn forwardCompletion(
     };
 }
 
+pub fn forwardInlayHint(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.InlayHintParams,
+) Error!lsp.ResultType("textDocument/inlayHint") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |*mware| try mware.forwardInlayHint(arena, source_uri, params),
+    };
+}
+
 pub fn forwardDocumentSymbols(
     middleware: *ZigMiddleware,
     arena: std.mem.Allocator,
@@ -286,6 +301,7 @@ fn middlewareSyncDocument(
             .generated_uri = generated_uri,
             .generated_text = try middleware.allocator.alloc(u8, 0),
             .code_map = .{},
+            .translator_cache = .{},
             .generation_error = null,
             .version = version,
             .opened = false,
@@ -318,6 +334,7 @@ fn middlewareSyncDocument(
     }
     errdefer middleware.allocator.free(generated.stdout);
 
+    doc.translator_cache.reset(middleware.allocator);
     try doc.code_map.update(middleware.allocator, source_root, generated.stdout, doc.source_path);
 
     if (doc.opened) {
@@ -385,24 +402,20 @@ fn middlewareForwardHover(
 ) Error!?types.Hover {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_translator = try code_map.translatorForSourcePosition(
-        middleware.allocator,
-        doc.source_text,
-        doc.generated_text,
-        params.position,
-    ) orelse return null;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse return null;
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .active = span_translator,
+        .cache = &doc.translator_cache,
+        .active_span_index = span_index,
     };
     defer translation_context.deinit();
 
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/hover", mapped);
     if (result) |*hover_result| try translateHover(hover_result, &translation_context);
@@ -417,24 +430,20 @@ fn middlewareForwardDefinition(
 ) Error!lsp.ResultType("textDocument/definition") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_translator = try code_map.translatorForSourcePosition(
-        middleware.allocator,
-        doc.source_text,
-        doc.generated_text,
-        params.position,
-    ) orelse return null;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse return null;
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .active = span_translator,
+        .cache = &doc.translator_cache,
+        .active_span_index = span_index,
     };
     defer translation_context.deinit();
 
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/definition", mapped)) orelse return null;
     return try translateDefinition(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
@@ -448,24 +457,20 @@ fn middlewareForwardReferences(
 ) Error!lsp.ResultType("textDocument/references") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_translator = try code_map.translatorForSourcePosition(
-        middleware.allocator,
-        doc.source_text,
-        doc.generated_text,
-        params.position,
-    ) orelse return null;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse return null;
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .active = span_translator,
+        .cache = &doc.translator_cache,
+        .active_span_index = span_index,
     };
     defer translation_context.deinit();
 
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse return null;
     return try translateLocations(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
@@ -479,28 +484,75 @@ fn middlewareForwardCompletion(
 ) Error!lsp.ResultType("textDocument/completion") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_translator = try code_map.translatorForSourcePosition(
-        middleware.allocator,
-        doc.source_text,
-        doc.generated_text,
-        params.position,
-    ) orelse return null;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse return null;
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .active = span_translator,
+        .cache = &doc.translator_cache,
+        .active_span_index = span_index,
     };
     defer translation_context.deinit();
 
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse return null;
 
     var result = try middleware.request(arena, "textDocument/completion", mapped);
     try translateCompletionResult(arena, &result, &translation_context);
     return result;
+}
+
+fn middlewareForwardInlayHint(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.InlayHintParams,
+) Error!lsp.ResultType("textDocument/inlayHint") {
+    const doc = try middleware.documentReady(source_uri);
+    const code_map = &doc.code_map;
+    var mapped_range: ?types.Range = null;
+    var active_span_index: ?usize = null;
+
+    var source_order_index = code_map.firstSourceIndexPossiblyIntersecting(params.range);
+    while (source_order_index < code_map.src_order.items.len) : (source_order_index += 1) {
+        const span_index = code_map.src_order.items[source_order_index];
+        const source_range = sourceRangeFromTsRange(code_map.src_range.items[span_index]);
+        if (!positionLessThan(source_range.start, params.range.end)) break;
+
+        const request_range = rangeIntersection(params.range, source_range) orelse continue;
+        const span = code_map.gen_span.items[span_index];
+        const mapped_start = span.sourcePositionToGenerated(request_range.start);
+        const mapped_end = span.sourcePositionToGenerated(request_range.end);
+        mapped_range = rangeUnion(mapped_range, .{
+            .start = mapped_start,
+            .end = mapped_end,
+        });
+        active_span_index = active_span_index orelse span_index;
+    }
+
+    const resolved_range = mapped_range orelse return null;
+    const resolved_active_span_index = active_span_index orelse return null;
+    var mapped = params;
+    mapped.textDocument = .{ .uri = doc.generated_uri };
+    mapped.range = resolved_range;
+
+    const result = (try middleware.request(arena, "textDocument/inlayHint", mapped)) orelse return null;
+    if (result.len == 0) return null;
+
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .cache = &doc.translator_cache,
+        .active_span_index = resolved_active_span_index,
+    };
+    defer translation_context.deinit();
+
+    const translated = try translateInlayHints(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
+    return if (translated.len == 0) null else translated;
 }
 
 fn middlewareForwardDocumentSymbols(
@@ -513,7 +565,16 @@ fn middlewareForwardDocumentSymbols(
     const result = (try middleware.request(arena, "textDocument/documentSymbol", .{
         .textDocument = .{ .uri = doc.generated_uri },
     })) orelse return null;
-    return try translateDocumentSymbols(arena, result, code_map);
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .cache = &doc.translator_cache,
+        .active_span_index = null,
+    };
+    defer translation_context.deinit();
+    return try translateDocumentSymbols(arena, result, &translation_context);
 }
 
 fn middlewareForwardRename(
@@ -524,24 +585,20 @@ fn middlewareForwardRename(
 ) Error!lsp.ResultType("textDocument/rename") {
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_translator = try code_map.translatorForSourcePosition(
-        middleware.allocator,
-        doc.source_text,
-        doc.generated_text,
-        params.position,
-    ) orelse return null;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse return null;
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .active = span_translator,
+        .cache = &doc.translator_cache,
+        .active_span_index = span_index,
     };
     defer translation_context.deinit();
 
     var mapped = params;
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = sharedPosition(translation_context.active.sourcePositionToGenerated(params.position)) orelse return null;
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse return null;
 
     const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse return null;
     return try translateWorkspaceEdit(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
@@ -564,14 +621,13 @@ fn middlewareAliasCodeBlockRenameEdits(
 
     for (source_ranges) |source_range| {
         const span_index = doc.code_map.indexForSourceRange(source_range) orelse return null;
-        var translator = try SpanTranslator.init(
+        const translator = try doc.translator_cache.get(
             middleware.allocator,
-            doc.code_map.gen_span.items[span_index],
-            doc.code_map.src_range.items[span_index],
+            &doc.code_map,
             doc.source_text,
             doc.generated_text,
+            span_index,
         );
-        defer translator.deinit(middleware.allocator);
 
         try appendAliasRenameEditsFromDiff(
             arena,
@@ -655,6 +711,20 @@ pub const CodeMap = struct {
             if (line < span.generatedEnd()) return .eq;
             return .gt;
         }
+
+        fn sourcePositionToGenerated(span: GenSpan, position: types.Position) types.Position {
+            return .{
+                .line = span.generated_line + (position.line - span.source_line),
+                .character = position.character,
+            };
+        }
+
+        fn generatedPositionToSource(span: GenSpan, position: types.Position) types.Position {
+            return .{
+                .line = span.source_line + (position.line - span.generated_line),
+                .character = position.character,
+            };
+        }
     };
 
     const ActiveSpan = struct {
@@ -706,38 +776,19 @@ pub const CodeMap = struct {
     /// earliest span that contains the source line and preserving the column.
     pub fn sourcePositionToGenerated(map: *const CodeMap, position: types.Position) ?types.Position {
         const span = map.findSource(position.line) orelse return null;
-        return .{
-            .line = span.generated_line + (position.line - span.source_line),
-            .character = position.character,
-        };
+        return span.sourcePositionToGenerated(position);
     }
 
     /// Translates a generated position back to source coordinates by finding the
     /// generated-order span containing the generated line and preserving column.
     pub fn generatedPositionToSource(map: *const CodeMap, position: types.Position) ?types.Position {
         const span = map.findGenerated(position.line) orelse return null;
-        return .{
-            .line = span.source_line + (position.line - span.generated_line),
-            .character = position.character,
-        };
+        return span.generatedPositionToSource(position);
     }
 
-    fn translatorForSourcePosition(
-        map: *const CodeMap,
-        allocator: std.mem.Allocator,
-        source_text: []const u8,
-        generated_text: []const u8,
-        position: types.Position,
-    ) OOM!?SpanTranslator {
+    fn sourceSpanIndexForPosition(map: *const CodeMap, position: types.Position) ?usize {
         const source_order_index = map.findSourceIndex(position.line) orelse return null;
-        const span_index = map.src_order.items[source_order_index];
-        return try SpanTranslator.init(
-            allocator,
-            map.gen_span.items[span_index],
-            map.src_range.items[span_index],
-            source_text,
-            generated_text,
-        );
+        return map.src_order.items[source_order_index];
     }
 
     /// Translates a generated range only when every generated line in the range is
@@ -873,6 +924,21 @@ pub const CodeMap = struct {
 
     fn spanInSourceOrder(map: *const CodeMap, index: usize) GenSpan {
         return map.gen_span.items[map.src_order.items[index]];
+    }
+
+    fn firstSourceIndexPossiblyIntersecting(map: *const CodeMap, range: types.Range) usize {
+        var low: usize = 0;
+        var high: usize = map.src_order.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const span = map.spanInSourceOrder(mid);
+            if (span.sourceEnd() <= range.start.line) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return low;
     }
 
     /// Finds the source-order index of the earliest generated span containing a
@@ -1130,33 +1196,85 @@ const SpanTranslator = struct {
     }
 };
 
+const SpanTranslatorCache = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct {
+        span_index: usize,
+        translator: SpanTranslator,
+    };
+
+    fn get(
+        cache: *SpanTranslatorCache,
+        allocator: std.mem.Allocator,
+        map: *const CodeMap,
+        source_text: []const u8,
+        generated_text: []const u8,
+        span_index: usize,
+    ) OOM!*SpanTranslator {
+        for (cache.entries.items) |*entry| {
+            if (entry.span_index == span_index) return &entry.translator;
+        }
+
+        var translator = try SpanTranslator.init(
+            allocator,
+            map.gen_span.items[span_index],
+            map.src_range.items[span_index],
+            source_text,
+            generated_text,
+        );
+        errdefer translator.deinit(allocator);
+        try cache.entries.append(allocator, .{
+            .span_index = span_index,
+            .translator = translator,
+        });
+        return &cache.entries.items[cache.entries.items.len - 1].translator;
+    }
+
+    fn reset(cache: *SpanTranslatorCache, allocator: std.mem.Allocator) void {
+        for (cache.entries.items) |*entry| {
+            entry.translator.deinit(allocator);
+        }
+        cache.entries.clearRetainingCapacity();
+    }
+
+    fn deinit(cache: *SpanTranslatorCache, allocator: std.mem.Allocator) void {
+        cache.reset(allocator);
+        cache.entries.deinit(allocator);
+        cache.* = .{};
+    }
+
+    fn len(cache: *const SpanTranslatorCache) usize {
+        return cache.entries.items.len;
+    }
+};
+
 const RequestTranslationContext = struct {
     allocator: std.mem.Allocator,
     map: *const CodeMap,
     source_text: []const u8,
     generated_text: []const u8,
-    active: SpanTranslator,
-    generated_translators: std.ArrayList(GeneratedTranslator) = .empty,
-
-    const GeneratedTranslator = struct {
-        span_index: usize,
-        translator: SpanTranslator,
-    };
+    cache: *SpanTranslatorCache,
+    active_span_index: ?usize,
 
     fn deinit(context: *RequestTranslationContext) void {
-        context.active.deinit(context.allocator);
-        for (context.generated_translators.items) |*entry| {
-            entry.translator.deinit(context.allocator);
-        }
-        context.generated_translators.deinit(context.allocator);
+        _ = context;
+    }
+
+    fn sourcePositionToGenerated(context: *RequestTranslationContext, position: types.Position) OOM!?types.Position {
+        const span_index = context.active_span_index orelse context.map.sourceSpanIndexForPosition(position) orelse return null;
+        const translator = try context.translatorForSpanIndex(span_index);
+        return sharedPosition(translator.sourcePositionToGenerated(position));
     }
 
     fn generatedRangeToSource(context: *RequestTranslationContext, range: types.Range) OOM!?types.Range {
-        if (context.active.containsGeneratedRange(range)) {
-            return context.active.generatedRangeToSource(range);
-        }
         const translator = try context.translatorForGeneratedRange(range) orelse return null;
         return translator.generatedRangeToSource(range);
+    }
+
+    fn generatedPositionToSource(context: *RequestTranslationContext, position: types.Position) OOM!?types.Position {
+        const translator = try context.translatorForGeneratedPosition(position) orelse return null;
+        return sharedPosition(translator.generatedPositionToSource(position));
     }
 
     fn translatorForGeneratedRange(context: *RequestTranslationContext, range: types.Range) OOM!?*SpanTranslator {
@@ -1166,21 +1284,24 @@ const RequestTranslationContext = struct {
             return null;
         }
 
-        for (context.generated_translators.items) |*entry| {
-            if (entry.span_index == span_index) return &entry.translator;
-        }
+        return try context.translatorForSpanIndex(span_index);
+    }
 
-        try context.generated_translators.append(context.allocator, .{
-            .span_index = span_index,
-            .translator = try SpanTranslator.init(
-                context.allocator,
-                span,
-                context.map.src_range.items[span_index],
-                context.source_text,
-                context.generated_text,
-            ),
-        });
-        return &context.generated_translators.items[context.generated_translators.items.len - 1].translator;
+    fn translatorForGeneratedPosition(context: *RequestTranslationContext, position: types.Position) OOM!?*SpanTranslator {
+        const span_index = context.map.findGeneratedIndex(position.line) orelse return null;
+        const span = context.map.gen_span.items[span_index];
+        if (position.line == span.generatedEnd() and position.character != 0) return null;
+        return try context.translatorForSpanIndex(span_index);
+    }
+
+    fn translatorForSpanIndex(context: *RequestTranslationContext, span_index: usize) OOM!*SpanTranslator {
+        return try context.cache.get(
+            context.allocator,
+            context.map,
+            context.source_text,
+            context.generated_text,
+            span_index,
+        );
     }
 };
 
@@ -1215,6 +1336,48 @@ fn generatedDiffIntervalShared(start: usize, end: usize, edits: []const Edit) bo
 
 fn rangesOverlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
     return a_start < b_end and b_start < a_end;
+}
+
+fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
+    return lhs.line < rhs.line or (lhs.line == rhs.line and lhs.character < rhs.character);
+}
+
+fn positionMax(lhs: types.Position, rhs: types.Position) types.Position {
+    return if (positionLessThan(lhs, rhs)) rhs else lhs;
+}
+
+fn positionMin(lhs: types.Position, rhs: types.Position) types.Position {
+    return if (positionLessThan(lhs, rhs)) lhs else rhs;
+}
+
+fn rangeIntersection(lhs: types.Range, rhs: types.Range) ?types.Range {
+    const start = positionMax(lhs.start, rhs.start);
+    const end = positionMin(lhs.end, rhs.end);
+    return if (positionLessThan(start, end)) .{
+        .start = start,
+        .end = end,
+    } else null;
+}
+
+fn rangeUnion(maybe_lhs: ?types.Range, rhs: types.Range) types.Range {
+    const lhs = maybe_lhs orelse return rhs;
+    return .{
+        .start = positionMin(lhs.start, rhs.start),
+        .end = positionMax(lhs.end, rhs.end),
+    };
+}
+
+fn sourceRangeFromTsRange(range: ts.Range) types.Range {
+    return .{
+        .start = .{
+            .line = range.start_point.row,
+            .character = range.start_point.column,
+        },
+        .end = .{
+            .line = range.end_point.row,
+            .character = range.end_point.column,
+        },
+    };
 }
 
 fn rangeFromByteRange(text: []const u8, start: usize, end: usize) types.Range {
@@ -1607,10 +1770,55 @@ pub fn translateCompletionResult(
     }
 }
 
+pub fn translateInlayHints(
+    arena: std.mem.Allocator,
+    hints: []const types.InlayHint,
+    map: *RequestTranslationContext,
+    generated_uri: []const u8,
+    source_uri: []const u8,
+) OOM![]const types.InlayHint {
+    var translated: std.ArrayList(types.InlayHint) = .empty;
+    for (hints) |hint| {
+        if (try translateInlayHint(arena, hint, map, generated_uri, source_uri)) |mapped| {
+            try translated.append(arena, mapped);
+        }
+    }
+    return try translated.toOwnedSlice(arena);
+}
+
+fn translateInlayHint(
+    arena: std.mem.Allocator,
+    hint: types.InlayHint,
+    map: *RequestTranslationContext,
+    generated_uri: []const u8,
+    source_uri: []const u8,
+) OOM!?types.InlayHint {
+    var translated = hint;
+    translated.position = (try map.generatedPositionToSource(hint.position)) orelse return null;
+    translated.label = switch (hint.label) {
+        .string => hint.label,
+        .inlay_hint_label_parts => |parts| blk: {
+            const translated_parts = try arena.alloc(types.InlayHintLabelPart, parts.len);
+            for (parts, translated_parts) |part, *translated_part| {
+                translated_part.* = part;
+                if (part.location) |location| {
+                    translated_part.location = try translateLocation(location, map, generated_uri, source_uri);
+                }
+            }
+            break :blk .{ .inlay_hint_label_parts = translated_parts };
+        },
+    };
+    if (hint.textEdits) |edits| {
+        const translated_edits = try translateTextEdits(arena, edits, map);
+        translated.textEdits = if (translated_edits.len == edits.len) translated_edits else null;
+    }
+    return translated;
+}
+
 pub fn translateDocumentSymbols(
     arena: std.mem.Allocator,
     result: lsp.types.DocumentSymbol.Result,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentSymbol {
     return switch (result) {
         .document_symbols => |symbols| translateDocumentSymbolSlice(arena, symbols, map),
@@ -1687,7 +1895,7 @@ fn translateLocation(location: types.Location, map: *RequestTranslationContext, 
 fn translateDocumentSymbolSlice(
     arena: std.mem.Allocator,
     symbols: []const types.DocumentSymbol,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentSymbol {
     var translated: std.ArrayList(types.DocumentSymbol) = .empty;
     for (symbols) |symbol| {
@@ -1710,7 +1918,7 @@ fn translateDocumentSymbolSlice(
 fn translateDocumentSymbol(
     arena: std.mem.Allocator,
     symbol: types.DocumentSymbol,
-    map: *const CodeMap,
+    map: *RequestTranslationContext,
 ) OOM!?types.DocumentSymbol {
     return .{
         .name = symbol.name,
@@ -1896,6 +2104,7 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
                     .documentSymbol = .{
                         .hierarchicalDocumentSymbolSupport = true,
                     },
+                    .inlayHint = .{},
                 },
             },
         },
@@ -2150,24 +2359,19 @@ fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: 
 }
 
 fn requestTranslationContextForTest(
+    cache: *SpanTranslatorCache,
     map: *const CodeMap,
     source_text: []const u8,
     generated_text: []const u8,
     position: types.Position,
 ) !RequestTranslationContext {
-    const active = try map.translatorForSourcePosition(
-        testing_allocator,
-        source_text,
-        generated_text,
-        position,
-    ) orelse return error.UnexpectedCodeMap;
-
     return .{
         .allocator = testing_allocator,
         .map = map,
         .source_text = source_text,
         .generated_text = generated_text,
-        .active = active,
+        .cache = cache,
+        .active_span_index = map.sourceSpanIndexForPosition(position) orelse return error.UnexpectedCodeMap,
     };
 }
 
@@ -2480,6 +2684,7 @@ test "alias code block rename refuses unmapped source blocks" {
         .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
         .generated_text = try testing_allocator.dupe(u8, generated),
         .code_map = map,
+        .translator_cache = .{},
         .generation_error = null,
         .version = 1,
         .opened = false,
@@ -2523,22 +2728,21 @@ test "request span translator applies source column offset" {
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
-    var translator = try map.translatorForSourcePosition(
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const source_position = lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "result").?, .@"utf-8");
+    const translator = try cache.get(
         testing_allocator,
+        &map,
         source,
         generated,
-        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "result").?, .@"utf-8"),
-    ) orelse return error.UnexpectedCodeMap;
-    defer translator.deinit(testing_allocator);
+        map.sourceSpanIndexForPosition(source_position) orelse return error.UnexpectedCodeMap,
+    );
 
     try expectEqual(types.Position{
         .line = 1,
         .character = @intCast(std.mem.indexOf(u8, " result = token;", "result").?),
-    }, sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
-        source,
-        std.mem.indexOf(u8, source, "result").?,
-        .@"utf-8",
-    ))) orelse return error.UnexpectedCodeMap);
+    }, sharedPosition(translator.sourcePositionToGenerated(source_position)) orelse return error.UnexpectedCodeMap);
 }
 
 test "request span translator nulls mutated generated aliases" {
@@ -2553,22 +2757,21 @@ test "request span translator nulls mutated generated aliases" {
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
-    var translator = try map.translatorForSourcePosition(
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const source_position = lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8");
+    const translator = try cache.get(
         testing_allocator,
+        &map,
         source,
         generated,
-        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8"),
-    ) orelse return error.UnexpectedCodeMap;
-    defer translator.deinit(testing_allocator);
+        map.sourceSpanIndexForPosition(source_position) orelse return error.UnexpectedCodeMap,
+    );
 
     try expectEqual(types.Position{
         .line = 1,
         .character = @intCast(std.mem.indexOf(u8, generated, "pik_elist_append").? - std.mem.lastIndexOfScalar(u8, generated[0..std.mem.indexOf(u8, generated, "pik_elist_append").?], '\n').? - 1),
-    }, sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
-        source,
-        std.mem.indexOf(u8, source, "pik_elist_append").?,
-        .@"utf-8",
-    ))) orelse return error.UnexpectedCodeMap);
+    }, sharedPosition(translator.sourcePositionToGenerated(source_position)) orelse return error.UnexpectedCodeMap);
 
     try std.testing.expect(sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
         source,
@@ -2698,13 +2901,16 @@ test "request span translator handles generated line directive after action" {
     try expectEqual(@as(usize, 1), map.len());
     try expectEqual(std.mem.indexOf(u8, generated, "// #line 200").?, map.gen_span.items[0].generated_range.end);
 
-    var translator = try map.translatorForSourcePosition(
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const source_position = lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8");
+    const translator = try cache.get(
         testing_allocator,
+        &map,
         source,
         generated,
-        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_elist_append").?, .@"utf-8"),
-    ) orelse return error.UnexpectedCodeMap;
-    defer translator.deinit(testing_allocator);
+        map.sourceSpanIndexForPosition(source_position) orelse return error.UnexpectedCodeMap,
+    );
 
     try expectEqual(lsp.offsets.indexToPosition(
         generated,
@@ -2733,19 +2939,16 @@ test "request translation context maps reference ranges in other spans" {
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
-    const active = try map.translatorForSourcePosition(
-        testing_allocator,
-        source,
-        generated,
-        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_render").?, .@"utf-8"),
-    ) orelse return error.UnexpectedCodeMap;
-
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const active_position = lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "pik_render").?, .@"utf-8");
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .source_text = source,
         .generated_text = generated,
-        .active = active,
+        .cache = &cache,
+        .active_span_index = map.sourceSpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
     };
     defer context.deinit();
 
@@ -2777,24 +2980,24 @@ test "request translation context maps reference ranges in other spans" {
 test "request span translator handles one leading newline edit" {
     const source = "\nconst answer = 42;";
     const generated = "const answer = 42;";
-    var translator = try SpanTranslator.init(
-        testing_allocator,
-        .{
-            .source_line = 0,
-            .generated_line = 0,
-            .line_count = 1,
-            .generated_range = .{ .start = 0, .end = generated.len },
-        },
-        .{
-            .start_byte = 0,
-            .end_byte = @intCast(source.len),
-            .start_point = .{ .row = 0, .column = 0 },
-            .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
-        },
-        source,
-        generated,
-    );
-    defer translator.deinit(testing_allocator);
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.gen_span.append(testing_allocator, .{
+        .source_line = 0,
+        .generated_line = 0,
+        .line_count = 1,
+        .generated_range = .{ .start = 0, .end = generated.len },
+    });
+    try map.src_range.append(testing_allocator, .{
+        .start_byte = 0,
+        .end_byte = @intCast(source.len),
+        .start_point = .{ .row = 0, .column = 0 },
+        .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
+    });
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const translator = try cache.get(testing_allocator, &map, source, generated, 0);
 
     try expectEqual(types.Position{ .line = 0, .character = 6 }, sharedPosition(translator.sourcePositionToGenerated(.{
         .line = 1,
@@ -2818,7 +3021,10 @@ test "translates hover and definition results back to source ranges" {
     ;
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
+        &cache,
         &map,
         source,
         generated,
@@ -2878,7 +3084,10 @@ test "translates completion edits back to source ranges" {
     ;
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
+        &cache,
         &map,
         source,
         generated,
@@ -2918,6 +3127,189 @@ test "translates completion edits back to source ranges" {
     }
 }
 
+test "translates inlay hints back to source positions" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\const answer = 42;
+    ;
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = try requestTranslationContextForTest(
+        &cache,
+        &map,
+        source,
+        generated,
+        lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "answer").?, .@"utf-8"),
+    );
+    defer context.deinit();
+
+    var label_parts = [_]types.InlayHintLabelPart{.{
+        .value = ": i32",
+        .location = .{
+            .uri = "file:///generated.zig",
+            .range = .{
+                .start = .{ .line = 1, .character = 6 },
+                .end = .{ .line = 1, .character = 12 },
+            },
+        },
+    }};
+    const hints = [_]types.InlayHint{.{
+        .position = .{ .line = 1, .character = 12 },
+        .label = .{ .inlay_hint_label_parts = &label_parts },
+        .kind = .Type,
+        .textEdits = &.{.{
+            .range = .{
+                .start = .{ .line = 1, .character = 12 },
+                .end = .{ .line = 1, .character = 12 },
+            },
+            .newText = ": i32",
+        }},
+    }};
+    const other_hints = [_]types.InlayHint{
+        hints[0],
+        .{
+            .position = .{ .line = 1, .character = 17 },
+            .label = .{ .string = ": comptime_int" },
+            .kind = .Type,
+            .textEdits = &.{.{
+                .range = .{
+                    .start = .{ .line = 1, .character = 17 },
+                    .end = .{ .line = 1, .character = 17 },
+                },
+                .newText = ": comptime_int",
+            }},
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    try expectEqual(@as(usize, 0), cache.len());
+    const translated = try translateInlayHints(
+        arena_state.allocator(),
+        &other_hints,
+        &context,
+        "file:///generated.zig",
+        "file:///source.zy",
+    );
+
+    try expectEqual(@as(usize, 1), cache.len());
+    try expectEqual(@as(usize, 2), translated.len);
+    try expectEqual(@as(u32, 1), translated[0].position.line);
+    try expectEqual(@as(u32, 12), translated[0].position.character);
+    try expectEqual(@as(u32, 1), translated[0].textEdits.?[0].range.start.line);
+    switch (translated[0].label) {
+        .inlay_hint_label_parts => |parts| {
+            try expectEqualStrings("file:///source.zy", parts[0].location.?.uri);
+            try expectEqual(@as(u32, 1), parts[0].location.?.range.start.line);
+            try expectEqual(@as(u32, 6), parts[0].location.?.range.start.character);
+        },
+        else => return error.UnexpectedInlayHint,
+    }
+}
+
+test "translates inlay hints with one cached diff per touched block" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+        \\%code {
+        \\const other = answer;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\const answer = 42;
+        \\// #line 5 source.zy
+        \\const other = answer;
+    ;
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+    try expectEqual(@as(usize, 2), map.len());
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    const hints = [_]types.InlayHint{
+        .{
+            .position = .{ .line = 1, .character = 12 },
+            .label = .{ .string = ": i32" },
+            .kind = .Type,
+        },
+        .{
+            .position = .{ .line = 3, .character = 11 },
+            .label = .{ .string = ": i32" },
+            .kind = .Type,
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    try expectEqual(@as(usize, 0), cache.len());
+    const translated = try translateInlayHints(
+        arena_state.allocator(),
+        &hints,
+        &context,
+        "file:///generated.zig",
+        "file:///source.zy",
+    );
+
+    try expectEqual(@as(usize, 2), translated.len);
+    try expectEqual(@as(usize, 2), cache.len());
+    try expectEqual(@as(u32, 1), translated[0].position.line);
+    try expectEqual(@as(u32, 4), translated[1].position.line);
+}
+
+test "span translator cache is lazy and resets across regeneration" {
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\const answer = 42;
+    ;
+    const updated_generated =
+        \\// #line 2 source.zy
+        \\const answer = 43;
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+
+    try expectEqual(@as(usize, 0), cache.len());
+    _ = try cache.get(testing_allocator, &map, source, generated, 0);
+    try expectEqual(@as(usize, 1), cache.len());
+
+    cache.reset(testing_allocator);
+    try updateCodeMapForTest(&map, source, updated_generated, "source.zy");
+    try expectEqual(@as(usize, 0), cache.len());
+
+    _ = try cache.get(testing_allocator, &map, source, updated_generated, 0);
+    try expectEqual(@as(usize, 1), cache.len());
+}
+
 test "translates workspace edit changes back to source ranges" {
     const source =
         \\%code {
@@ -2930,7 +3322,10 @@ test "translates workspace edit changes back to source ranges" {
     ;
     var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
+        &cache,
         &map,
         source,
         generated,
@@ -2993,6 +3388,29 @@ test "translates workspace edit changes back to source ranges" {
 }
 
 test "translates document symbols and drops generated yy symbols" {
+    const source =
+        \\%code {
+        \\
+        \\
+        \\
+        \\pub const Token = struct {
+        \\    pub fn lit() void {}
+        \\};
+        \\}
+        \\%code {
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\
+        \\const yyFallback = 1;
+        \\}
+    ;
     const generated =
         \\// #line 5 source.zy
         \\pub const Token = struct {
@@ -3003,8 +3421,19 @@ test "translates document symbols and drops generated yy symbols" {
         \\// #line 20 source.zy
         \\const yyFallback = 1;
     ;
-    var map = try parseCodeMapForTest(generated, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
 
     const children = [_]types.DocumentSymbol{
         .{
@@ -3104,7 +3533,7 @@ test "translates document symbols and drops generated yy symbols" {
     const translated = (try translateDocumentSymbols(
         arena_state.allocator(),
         .{ .document_symbols = &symbols },
-        &map,
+        &context,
     )) orelse return error.UnexpectedDocumentSymbols;
     try expectEqual(@as(usize, 2), translated.len);
     try expectEqualStrings("Token", translated[0].name);
