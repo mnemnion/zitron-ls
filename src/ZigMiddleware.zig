@@ -165,7 +165,10 @@ pub fn forwardHover(
 ) Error!?types.Hover {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardHover(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardHover(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("hover", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -177,7 +180,10 @@ pub fn forwardDefinition(
 ) Error!lsp.ResultType("textDocument/definition") {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardDefinition(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardDefinition(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("definition", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -189,7 +195,10 @@ pub fn forwardReferences(
 ) Error!lsp.ResultType("textDocument/references") {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardReferences(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardReferences(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("references", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -201,7 +210,10 @@ pub fn forwardCompletion(
 ) Error!lsp.ResultType("textDocument/completion") {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardCompletion(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardCompletion(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("completion", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -213,7 +225,10 @@ pub fn forwardInlayHint(
 ) Error!lsp.ResultType("textDocument/inlayHint") {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardInlayHint(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardInlayHint(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("inlayHint", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -224,7 +239,10 @@ pub fn forwardDocumentSymbols(
 ) Error!?[]const types.DocumentSymbol {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardDocumentSymbols(arena, source_uri),
+        .enabled => |*mware| mware.forwardDocumentSymbols(arena, source_uri) catch |err| {
+            try suppressForwardRequestFailure("documentSymbol", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -236,7 +254,10 @@ pub fn forwardRename(
 ) Error!lsp.ResultType("textDocument/rename") {
     return switch (middleware.mode) {
         .disabled => null,
-        .enabled => |*mware| try mware.forwardRename(arena, source_uri, params),
+        .enabled => |*mware| mware.forwardRename(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("rename", source_uri, err);
+            return null;
+        },
     };
 }
 
@@ -251,15 +272,28 @@ pub fn aliasCodeBlockRenameEdits(
 ) Error!?[]const types.TextEdit {
     return switch (middleware.mode) {
         .disabled => &.{},
-        .enabled => |*mware| try mware.aliasCodeBlockRenameEdits(
+        .enabled => |*mware| mware.aliasCodeBlockRenameEdits(
             arena,
             source_uri,
             alias_name,
             new_name,
             source_ranges,
             offset_encoding,
-        ),
+        ) catch |err| {
+            try suppressForwardRequestFailure("aliasRename", source_uri, err);
+            return null;
+        },
     };
+}
+
+fn suppressForwardRequestFailure(comptime operation: []const u8, source_uri: []const u8, err: Error) Error!void {
+    switch (err) {
+        error.RequestFailed => log.debug("Zig forward {s} -> uri={s} result=null reason=request_failed", .{
+            operation,
+            source_uri,
+        }),
+        else => return err,
+    }
 }
 
 fn middlewareDeinit(middleware: *Middleware) void {
@@ -326,15 +360,17 @@ fn middlewareSyncDocument(
         return;
     };
     defer middleware.allocator.free(generated.stderr);
-    const generated_success = switch (generated.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!generated_success) {
+    if (zitronOutputFailedWithoutStdout(generated.term, generated.stdout.len)) {
         log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ doc.source_path, generated.stderr });
         middleware.allocator.free(generated.stdout);
         doc.generation_error = try middleware.allocator.dupe(u8, generated.stderr);
         return;
+    }
+    if (zitronTermFailed(generated.term)) {
+        log.warn("Zitron generation exited unsuccessfully for '{s}' but produced stdout; continuing optimistically: {s}", .{
+            doc.source_path,
+            generated.stderr,
+        });
     }
     errdefer middleware.allocator.free(generated.stdout);
     log.debug("Zig sync generated uri={s} generated_bytes={} stderr_bytes={} elapsed_ns={}", .{
@@ -410,6 +446,17 @@ fn middlewareSyncDocument(
         doc.code_map.len(),
         elapsedNs(middleware.io, start),
     });
+}
+
+fn zitronOutputFailedWithoutStdout(term: std.process.Child.Term, stdout_len: usize) bool {
+    return zitronTermFailed(term) and stdout_len == 0;
+}
+
+fn zitronTermFailed(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
 }
 
 fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
@@ -3351,6 +3398,76 @@ test "alias code block rename refuses unmapped source blocks" {
     var doc = removed.value;
     doc.deinit(testing_allocator);
     middleware.documents.deinit(testing_allocator);
+}
+
+test "forward requests return null while generation has errors" {
+    const uri = "file:///source.zy";
+    const source = "%code { broken }";
+    var zig_middleware: ZigMiddleware = .{ .mode = .{ .enabled = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_request_id = 1,
+    } } };
+
+    switch (zig_middleware.mode) {
+        .disabled => unreachable,
+        .enabled => |*middleware| {
+            const key = try testing_allocator.dupe(u8, uri);
+            errdefer testing_allocator.free(key);
+            try middleware.documents.put(testing_allocator, key, .{
+                .source_uri = try testing_allocator.dupe(u8, uri),
+                .source_path = try testing_allocator.dupe(u8, "source.zy"),
+                .source_text = source,
+                .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+                .generated_text = try testing_allocator.dupe(u8, ""),
+                .code_map = .{},
+                .translator_cache = .{},
+                .generation_error = try testing_allocator.dupe(u8, "generation failed"),
+                .version = 1,
+                .opened = false,
+            });
+        },
+    }
+    defer switch (zig_middleware.mode) {
+        .disabled => unreachable,
+        .enabled => |*middleware| {
+            const removed = middleware.documents.fetchRemove(uri).?;
+            testing_allocator.free(removed.key);
+            var doc = removed.value;
+            doc.deinit(testing_allocator);
+            middleware.documents.deinit(testing_allocator);
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const completion_result = try zig_middleware.forwardCompletion(arena_state.allocator(), uri, .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = 0, .character = 0 },
+    });
+    try std.testing.expect(completion_result == null);
+
+    const inlay_result = try zig_middleware.forwardInlayHint(arena_state.allocator(), uri, .{
+        .textDocument = .{ .uri = uri },
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 16 },
+        },
+    });
+    try std.testing.expect(inlay_result == null);
+}
+
+test "nonzero Zitron exit can continue with stdout" {
+    try std.testing.expect(!zitronOutputFailedWithoutStdout(.{ .exited = 0 }, 0));
+    try std.testing.expect(zitronOutputFailedWithoutStdout(.{ .exited = 1 }, 0));
+    try std.testing.expect(!zitronOutputFailedWithoutStdout(.{ .exited = 1 }, 1));
+    try std.testing.expect(!zitronOutputFailedWithoutStdout(.{ .signal = .KILL }, 1));
 }
 
 test "request span translator applies source column offset" {
