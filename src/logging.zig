@@ -102,27 +102,52 @@ fn recordPanic(msg: []const u8, first_trace_addr: ?usize) void {
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
 
-    var buffer: [4096]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    writePanicRecord(&writer, msg, first_trace_addr) catch {};
-
-    const stderr = io.lockStderr(&.{}, null) catch |err| switch (err) {
-        error.Canceled => null,
-    };
-    if (stderr) |locked_stderr| {
-        defer io.unlockStderr();
-        locked_stderr.file_writer.interface.writeAll(writer.buffered()) catch {};
-    }
+    const stack_trace_addr = first_trace_addr orelse @returnAddress();
+    const stderr = std.debug.lockStderr(&.{}).terminal();
+    defer std.debug.unlockStderr();
+    writePanicReport(stderr, msg, first_trace_addr, stack_trace_addr) catch {};
 
     if (log_file) |file| {
-        const is_locked = if (file.lock(io, .exclusive)) |_| true else |_| false;
-        defer if (is_locked) file.unlock(io);
-        if (file.length(io)) |length| {
-            file.writePositionalAll(io, writer.buffered(), length) catch {};
-        } else |_| {
-            file.writeStreamingAll(io, writer.buffered()) catch {};
-        }
+        writePanicReportToFile(io, file, msg, first_trace_addr, stack_trace_addr);
     }
+}
+
+fn writePanicReportToFile(
+    io: std.Io,
+    file: std.Io.File,
+    msg: []const u8,
+    first_trace_addr: ?usize,
+    stack_trace_addr: usize,
+) void {
+    const is_locked = if (file.lock(io, .exclusive)) |_| true else |_| false;
+    defer if (is_locked) file.unlock(io);
+
+    var buffer: [4096]u8 = undefined;
+    var file_writer = file.writer(io, &buffer);
+    if (file.length(io)) |length| {
+        file_writer.seekTo(length) catch {};
+    } else |_| {}
+
+    writePanicReport(.{
+        .writer = &file_writer.interface,
+        .mode = .no_color,
+    }, msg, first_trace_addr, stack_trace_addr) catch {};
+    file_writer.flush() catch {};
+}
+
+fn writePanicReport(
+    terminal: std.Io.Terminal,
+    msg: []const u8,
+    first_trace_addr: ?usize,
+    stack_trace_addr: usize,
+) std.Io.Writer.Error!void {
+    const writer = terminal.writer;
+    try writePanicRecord(writer, msg, first_trace_addr);
+    try writer.writeAll("stack trace:\n");
+    try std.debug.writeCurrentStackTrace(.{
+        .first_address = stack_trace_addr,
+        .allow_unsafe_unwind = true,
+    }, terminal);
 }
 
 fn writePanicRecord(writer: *std.Io.Writer, msg: []const u8, first_trace_addr: ?usize) std.Io.Writer.Error!void {
