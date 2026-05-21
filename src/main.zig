@@ -31,6 +31,7 @@ pub fn main(init: std.process.Init) Error!void {
         std.Io.File.stdin(),
         std.Io.File.stdout(),
     );
+    server.setClientTransport(&transport.transport);
 
     try lsp.basic_server.run(
         init.io,

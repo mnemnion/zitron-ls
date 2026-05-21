@@ -63,6 +63,7 @@ const GeneratedDocument = struct {
     code_map: CodeMap,
     translator_cache: SpanTranslatorCache,
     generation_error: ?[]u8,
+    grammar_diagnostics: []types.Diagnostic,
     version: i32,
     opened: bool,
 
@@ -74,6 +75,7 @@ const GeneratedDocument = struct {
         doc.code_map.deinit(allocator);
         doc.translator_cache.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
+        freeGrammarDiagnostics(allocator, doc.grammar_diagnostics);
     }
 };
 
@@ -155,6 +157,13 @@ pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
         .disabled => {},
         .enabled => |*mware| mware.closeDocument(uri),
     }
+}
+
+pub fn grammarDiagnostics(middleware: *ZigMiddleware, uri: []const u8) []const types.Diagnostic {
+    return switch (middleware.mode) {
+        .disabled => &.{},
+        .enabled => |*mware| if (mware.documents.getPtr(uri)) |doc| doc.grammar_diagnostics else &.{},
+    };
 }
 
 pub fn forwardHover(
@@ -339,6 +348,7 @@ fn middlewareSyncDocument(
             .code_map = .{},
             .translator_cache = .{},
             .generation_error = null,
+            .grammar_diagnostics = &.{},
             .version = version,
             .opened = false,
         };
@@ -352,6 +362,8 @@ fn middlewareSyncDocument(
         middleware.allocator.free(message);
         doc.generation_error = null;
     }
+    freeGrammarDiagnostics(middleware.allocator, doc.grammar_diagnostics);
+    doc.grammar_diagnostics = &.{};
 
     const generation_start = logStart(middleware.io);
     const generated = runZitron(middleware.allocator, middleware.io, doc.source_path, source_text) catch |err| {
@@ -360,6 +372,7 @@ fn middlewareSyncDocument(
         return;
     };
     defer middleware.allocator.free(generated.stderr);
+    doc.grammar_diagnostics = try parseZitronDiagnostics(middleware.allocator, generated.stderr);
     if (zitronOutputFailedWithoutStdout(generated.term, generated.stdout.len)) {
         log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ doc.source_path, generated.stderr });
         middleware.allocator.free(generated.stdout);
@@ -457,6 +470,52 @@ fn zitronTermFailed(term: std.process.Child.Term) bool {
         .exited => |code| code != 0,
         else => true,
     };
+}
+
+fn parseZitronDiagnostics(allocator: std.mem.Allocator, stderr: []const u8) OOM![]types.Diagnostic {
+    var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer freeGrammarDiagnostics(allocator, diagnostics.items);
+
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const diagnostic = try parseZitronDiagnosticLine(allocator, line) orelse continue;
+        diagnostics.append(allocator, diagnostic) catch |err| {
+            allocator.free(diagnostic.message);
+            return err;
+        };
+    }
+
+    return diagnostics.toOwnedSlice(allocator);
+}
+
+fn parseZitronDiagnosticLine(allocator: std.mem.Allocator, line: []const u8) OOM!?types.Diagnostic {
+    const path_end = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const line_start = path_end + 1;
+    const line_end = std.mem.indexOfScalarPos(u8, line, line_start, ':') orelse return null;
+    if (line_start == line_end) return null;
+
+    const one_based_line = std.fmt.parseUnsigned(u32, line[line_start..line_end], 10) catch return null;
+    const zero_based_line = if (one_based_line == 0) 0 else one_based_line - 1;
+    var message = line[line_end + 1 ..];
+    if (std.mem.startsWith(u8, message, " ")) message = message[1..];
+    if (message.len == 0) return null;
+
+    return .{
+        .range = .{
+            .start = .{ .line = zero_based_line, .character = 0 },
+            .end = .{ .line = zero_based_line, .character = 0 },
+        },
+        .severity = .Error,
+        .source = "zitron",
+        .message = try allocator.dupe(u8, message),
+    };
+}
+
+fn freeGrammarDiagnostics(allocator: std.mem.Allocator, diagnostics: []const types.Diagnostic) void {
+    if (diagnostics.len == 0) return;
+    for (diagnostics) |diagnostic| allocator.free(diagnostic.message);
+    allocator.free(diagnostics);
 }
 
 fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
@@ -2935,7 +2994,14 @@ fn middlewareReadResponseForId(middleware: *Middleware, allocator: std.mem.Alloc
                 if (response.id != null and response.id.?.eql(id)) return json_message;
                 log.debug("ZLS ignored response target_id={any} response_has_id={}", .{ id, response.id != null });
             },
-            else => log.debug("ZLS ignored non-response target_id={any}", .{id}),
+            .request => |request| log.debug("ZLS ignored request method={s} target_id={any}", .{
+                request.method,
+                id,
+            }),
+            .notification => |notification| log.debug("ZLS ignored notification method={s} target_id={any}", .{
+                notification.method,
+                id,
+            }),
         }
 
         allocator.free(json_message);
@@ -3370,6 +3436,7 @@ test "alias code block rename refuses unmapped source blocks" {
         .code_map = map,
         .translator_cache = .{},
         .generation_error = null,
+        .grammar_diagnostics = &.{},
         .version = 1,
         .opened = false,
     });
@@ -3428,6 +3495,7 @@ test "forward requests return null while generation has errors" {
                 .code_map = .{},
                 .translator_cache = .{},
                 .generation_error = try testing_allocator.dupe(u8, "generation failed"),
+                .grammar_diagnostics = &.{},
                 .version = 1,
                 .opened = false,
             });
@@ -3468,6 +3536,33 @@ test "nonzero Zitron exit can continue with stdout" {
     try std.testing.expect(zitronOutputFailedWithoutStdout(.{ .exited = 1 }, 0));
     try std.testing.expect(!zitronOutputFailedWithoutStdout(.{ .exited = 1 }, 1));
     try std.testing.expect(!zitronOutputFailedWithoutStdout(.{ .signal = .KILL }, 1));
+}
+
+test "Zitron stderr diagnostics become line-start LSP diagnostics" {
+    const stderr =
+        \\src/edn/edn.zy:349: Rule RHS alias "Mcdr" does not match rule impl's "P".
+        \\src/edn/edn.zy:349: There is no prior rule upon which to attach the code fragment which begins on this line
+        \\not a diagnostic
+        \\src/edn/edn.zy:172: Alias P for "pair(P)" is never used.
+        \\
+    ;
+
+    const diagnostics = try parseZitronDiagnostics(testing_allocator, stderr);
+    defer freeGrammarDiagnostics(testing_allocator, diagnostics);
+
+    try expectEqual(@as(usize, 3), diagnostics.len);
+    try expectEqual(@as(u32, 348), diagnostics[0].range.start.line);
+    try expectEqual(@as(u32, 0), diagnostics[0].range.start.character);
+    try expectEqual(diagnostics[0].range.start, diagnostics[0].range.end);
+    try expectEqual(types.Diagnostic.Severity.Error, diagnostics[0].severity.?);
+    try expectEqualStrings("zitron", diagnostics[0].source.?);
+    try expectEqualStrings("Rule RHS alias \"Mcdr\" does not match rule impl's \"P\".", diagnostics[0].message);
+
+    try expectEqual(@as(u32, 348), diagnostics[1].range.start.line);
+    try expectEqualStrings("There is no prior rule upon which to attach the code fragment which begins on this line", diagnostics[1].message);
+
+    try expectEqual(@as(u32, 171), diagnostics[2].range.start.line);
+    try expectEqualStrings("Alias P for \"pair(P)\" is never used.", diagnostics[2].message);
 }
 
 test "request span translator applies source column offset" {
