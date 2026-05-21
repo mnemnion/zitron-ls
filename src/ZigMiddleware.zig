@@ -1405,7 +1405,13 @@ const SpanTranslator = struct {
                             .equal => unreachable,
                         }
                     }
-                    if (mutation_start_source <= rel and rel < source_cursor) {
+                    if (rel == mutation_start_source) {
+                        return .{ .shared = if (source_cursor == mutation_start_source)
+                            generated_cursor
+                        else
+                            mutation_start_generated };
+                    }
+                    if (mutation_start_source < rel and rel < source_cursor) {
                         return .{ .mutant = translator.sourceMutation(
                             mutation_start_source,
                             source_cursor,
@@ -1416,6 +1422,7 @@ const SpanTranslator = struct {
                 },
             }
         }
+        if (rel == source_cursor) return .{ .shared = generated_cursor };
         return .{ .mutant = translator.sourceMutation(0, translator.sourceLength(), 0, translator.generatedLength()) };
     }
 
@@ -1445,7 +1452,13 @@ const SpanTranslator = struct {
                             .equal => unreachable,
                         }
                     }
-                    if (mutation_start_generated <= rel and rel < generated_cursor) {
+                    if (rel == mutation_start_generated) {
+                        return .{ .shared = if (generated_cursor == mutation_start_generated)
+                            source_cursor
+                        else
+                            mutation_start_source };
+                    }
+                    if (mutation_start_generated < rel and rel < generated_cursor) {
                         return .{ .mutant = translator.sourceMutation(
                             mutation_start_source,
                             source_cursor,
@@ -1456,6 +1469,7 @@ const SpanTranslator = struct {
                 },
             }
         }
+        if (rel == generated_cursor) return .{ .shared = source_cursor };
         return .{ .mutant = translator.sourceMutation(0, translator.sourceLength(), 0, translator.generatedLength()) };
     }
 
@@ -1775,7 +1789,13 @@ const GeneratedPositionCursor = struct {
                         .source_cursor = mutation_start_source,
                         .generated_cursor = mutation_start_generated,
                     };
-                    if (mutation_start_generated <= rel and rel < generated_cursor) {
+                    if (rel == mutation_start_generated) {
+                        return .{ .shared = if (generated_cursor == mutation_start_generated)
+                            source_cursor
+                        else
+                            mutation_start_source };
+                    }
+                    if (mutation_start_generated < rel and rel < generated_cursor) {
                         return .{ .mutant = translator.sourceMutation(
                             mutation_start_source,
                             source_cursor,
@@ -1791,6 +1811,7 @@ const GeneratedPositionCursor = struct {
                 },
             }
         }
+        if (rel == generated_cursor) return .{ .shared = source_cursor };
         return .{ .mutant = translator.sourceMutation(0, translator.sourceLength(), 0, translator.generatedLength()) };
     }
 
@@ -3389,16 +3410,94 @@ test "request span translator nulls mutated generated aliases" {
         .character = @intCast(std.mem.indexOf(u8, generated, "pik_elist_append").? - std.mem.lastIndexOfScalar(u8, generated[0..std.mem.indexOf(u8, generated, "pik_elist_append").?], '\n').? - 1),
     }, sharedPosition(translator.sourcePositionToGenerated(source_position)) orelse return error.UnexpectedCodeMap);
 
-    try std.testing.expect(sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
-        source,
-        std.mem.indexOf(u8, source, "A =").?,
-        .@"utf-8",
-    ))) == null);
+    try expectEqual(
+        lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, "yygotominor").?, .@"utf-8"),
+        sharedPosition(translator.sourcePositionToGenerated(lsp.offsets.indexToPosition(
+            source,
+            std.mem.indexOf(u8, source, "A =").?,
+            .@"utf-8",
+        ))) orelse return error.UnexpectedCodeMap,
+    );
 
     try std.testing.expect(translator.generatedRangeToSource(.{
         .start = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, "yygotominor").?, .@"utf-8"),
         .end = lsp.offsets.indexToPosition(generated, std.mem.indexOf(u8, generated, " =").?, .@"utf-8"),
     }) == null);
+}
+
+test "request span translator maps generated alias boundary points" {
+    const source =
+        \\statement_list(A) ::= statement(X).   { A = pik_elist_append(p, null, X); }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\ yygotominor.yy0 = pik_elist_append(p, null, yymsp[0].minor.yy42);
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+
+    const source_call = std.mem.indexOf(u8, source, "pik_elist_append").?;
+    const source_alias = source_call + std.mem.indexOf(u8, source[source_call..], "X").?;
+    const generated_call = std.mem.indexOf(u8, generated, "pik_elist_append").?;
+    const generated_alias = generated_call + std.mem.indexOf(u8, generated[generated_call..], "yymsp").?;
+    const source_position = lsp.offsets.indexToPosition(source, source_alias, .@"utf-8");
+    const generated_position = lsp.offsets.indexToPosition(generated, generated_alias, .@"utf-8");
+
+    const translator = try cache.get(
+        testing_allocator,
+        &map,
+        source,
+        generated,
+        map.sourceSpanIndexForPosition(source_position) orelse return error.UnexpectedCodeMap,
+    );
+
+    try expectEqual(
+        source_position,
+        sharedPosition(translator.generatedPositionToSource(generated_position)) orelse return error.UnexpectedCodeMap,
+    );
+    try std.testing.expect(sharedPosition(translator.generatedPositionToSource(lsp.offsets.indexToPosition(
+        generated,
+        generated_alias + 1,
+        .@"utf-8",
+    ))) == null);
+    try std.testing.expect(translator.generatedRangeToSource(.{
+        .start = generated_position,
+        .end = lsp.offsets.indexToPosition(generated, generated_alias + "yymsp".len, .@"utf-8"),
+    }) == null);
+
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = map.sourceSpanIndexForPosition(source_position) orelse return error.UnexpectedCodeMap,
+    };
+    defer context.deinit();
+
+    const hints = [_]types.InlayHint{.{
+        .position = generated_position,
+        .label = .{ .string = "obj:" },
+        .kind = .Parameter,
+    }};
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = try translateInlayHints(
+        arena_state.allocator(),
+        &hints,
+        &context,
+        "file:///source.zitron.zig",
+        "file:///source.zy",
+    );
+
+    try expectEqual(@as(usize, 1), translated.len);
+    try expectEqual(source_position, translated[0].position);
 }
 
 test "alias code block rename edits come from source-side deletes" {
@@ -3619,10 +3718,10 @@ test "request span translator handles one leading newline edit" {
         .line = 1,
         .character = 6,
     })) orelse return error.UnexpectedCodeMap);
-    try std.testing.expect(sharedPosition(translator.sourcePositionToGenerated(.{
+    try expectEqual(types.Position{ .line = 0, .character = 0 }, sharedPosition(translator.sourcePositionToGenerated(.{
         .line = 0,
         .character = 0,
-    })) == null);
+    })) orelse return error.UnexpectedCodeMap);
 }
 
 test "translates hover and definition results back to source ranges" {
