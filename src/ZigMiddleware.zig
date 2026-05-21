@@ -465,7 +465,7 @@ fn middlewareSyncDocument(
         return;
     }
     if (zitronTermFailed(generated.term)) {
-        log.warn("Zitron generation exited unsuccessfully for '{s}' but produced stdout; continuing optimistically: {s}", .{
+        log.debug("Zitron generation exited with errors for '{s}' but produced stdout; continuing optimistically: {s}", .{
             doc.source_path,
             generated.stderr,
         });
