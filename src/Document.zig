@@ -204,6 +204,36 @@ pub fn containsZigCodeAtPosition(
     return containsUnsupportedCode(node);
 }
 
+/// Builds grammar-side inlay hints for aliases with known Zitron value types.
+pub fn inlayHints(
+    document: Document,
+    arena: std.mem.Allocator,
+    range: types.Range,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM![]const types.InlayHint {
+    var type_table = TypeTable{};
+    defer type_table.deinit(arena);
+    var action_signatures = ActionSignatureTable{};
+    defer action_signatures.deinit(arena);
+
+    const root = document.tree.rootNode();
+    try collectTypeFacts(document.source, root, arena, &type_table);
+    try collectActionSignatures(document.source, root, arena, &type_table, &action_signatures);
+
+    var hints: std.ArrayList(types.InlayHint) = .empty;
+    try collectAliasInlayHints(
+        document.source,
+        root,
+        range,
+        offset_encoding,
+        arena,
+        &type_table,
+        &action_signatures,
+        &hints,
+    );
+    return try hints.toOwnedSlice(arena);
+}
+
 /// Finds the definition symbol for a named rule in this document.
 pub fn findRuleDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
     return document.findDefinition(tags_query, symbol_name, .rule_definition);
@@ -474,6 +504,393 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
         .action_definition => "named action",
         .action_implementation => "named action implementation",
     };
+}
+
+const TypeTable = struct {
+    symbol_types: std.StringHashMapUnmanaged([]const u8) = .empty,
+    token_type: ?[]const u8 = null,
+    default_type: ?[]const u8 = null,
+
+    fn deinit(table: *TypeTable, allocator: std.mem.Allocator) void {
+        table.symbol_types.deinit(allocator);
+    }
+
+    fn putSymbolType(table: *TypeTable, allocator: std.mem.Allocator, symbol: []const u8, type_value: []const u8) OOM!void {
+        try table.symbol_types.put(allocator, symbol, type_value);
+    }
+
+    fn typeForParticle(table: *const TypeTable, source: []const u8, particle: ts.Node) ?[]const u8 {
+        if (table.symbol_types.get(sliceForNode(source, particle))) |type_value| return type_value;
+        return switch (grammarParticleKind(particle) orelse return null) {
+            .nonterminal => table.default_type,
+            .terminal, .multiterminal => table.token_type,
+        };
+    }
+};
+
+const GrammarParticleKind = enum {
+    nonterminal,
+    terminal,
+    multiterminal,
+};
+
+const DirectiveTypeKind = enum {
+    symbol_type,
+    token_type,
+    default_type,
+};
+
+const AliasTypeFact = struct {
+    alias_name: []const u8,
+    alias_node: ts.Node,
+    type_value: []const u8,
+};
+
+const ActionAliasType = struct {
+    action_name: []const u8,
+    slot_index: usize,
+    alias_name: []const u8,
+    type_value: []const u8,
+};
+
+const ActionSignatureTable = struct {
+    items: std.ArrayList(ActionAliasType) = .empty,
+
+    fn deinit(table: *ActionSignatureTable, allocator: std.mem.Allocator) void {
+        table.items.deinit(allocator);
+    }
+
+    fn put(
+        table: *ActionSignatureTable,
+        allocator: std.mem.Allocator,
+        action_name: []const u8,
+        slot_index: usize,
+        alias_name: []const u8,
+        type_value: []const u8,
+    ) OOM!void {
+        for (table.items.items) |*item| {
+            if (item.slot_index == slot_index and std.mem.eql(u8, item.action_name, action_name)) {
+                item.alias_name = alias_name;
+                item.type_value = type_value;
+                return;
+            }
+        }
+
+        try table.items.append(allocator, .{
+            .action_name = action_name,
+            .slot_index = slot_index,
+            .alias_name = alias_name,
+            .type_value = type_value,
+        });
+    }
+
+    fn get(table: *const ActionSignatureTable, action_name: []const u8, slot_index: usize) ?ActionAliasType {
+        for (table.items.items) |item| {
+            if (item.slot_index == slot_index and std.mem.eql(u8, item.action_name, action_name)) {
+                return item;
+            }
+        }
+        return null;
+    }
+};
+
+fn collectTypeFacts(
+    source: []const u8,
+    root: ts.Node,
+    allocator: std.mem.Allocator,
+    type_table: *TypeTable,
+) OOM!void {
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        if (!std.mem.eql(u8, directive.kind(), "directive")) continue;
+
+        const directive_kind = directiveTypeKind(source, directive) orelse continue;
+        const type_value = directiveTypePayload(source, directive) orelse continue;
+        switch (directive_kind) {
+            .symbol_type => {
+                const symbol = directiveSymbolTypeTarget(source, directive) orelse continue;
+                try type_table.putSymbolType(allocator, symbol, type_value);
+            },
+            .token_type => type_table.token_type = type_value,
+            .default_type => type_table.default_type = type_value,
+        }
+    }
+}
+
+fn collectActionSignatures(
+    source: []const u8,
+    root: ts.Node,
+    allocator: std.mem.Allocator,
+    type_table: *const TypeTable,
+    action_signatures: *ActionSignatureTable,
+) OOM!void {
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const rule = root.namedChild(index).?;
+        if (!isRuleNode(rule)) continue;
+
+        var rule_alias_types: std.ArrayList(AliasTypeFact) = .empty;
+        defer rule_alias_types.deinit(allocator);
+        try collectRuleAliasTypes(source, rule, allocator, type_table, &rule_alias_types);
+
+        const action = firstNamedChildOfKind(rule, "named_action") orelse continue;
+        const action_name = actionNameForNamedAction(source, action) orelse continue;
+
+        var slot_index: usize = 0;
+        const child_count_action = action.namedChildCount();
+        var child_index: u32 = 0;
+        while (child_index < child_count_action) : (child_index += 1) {
+            const child = action.namedChild(child_index).?;
+            if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
+            defer slot_index += 1;
+
+            if (slot_index >= rule_alias_types.items.len) continue;
+            const rule_alias = rule_alias_types.items[slot_index];
+            const action_alias = sliceForNode(source, child);
+            if (!std.mem.eql(u8, action_alias, rule_alias.alias_name)) continue;
+
+            try action_signatures.put(
+                allocator,
+                action_name,
+                slot_index,
+                action_alias,
+                rule_alias.type_value,
+            );
+        }
+    }
+}
+
+fn collectAliasInlayHints(
+    source: []const u8,
+    root: ts.Node,
+    range: types.Range,
+    offset_encoding: lsp.offsets.Encoding,
+    allocator: std.mem.Allocator,
+    type_table: *const TypeTable,
+    action_signatures: *const ActionSignatureTable,
+    hints: *std.ArrayList(types.InlayHint),
+) OOM!void {
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = root.namedChild(index).?;
+        if (isRuleNode(child)) {
+            try appendRuleInlayHints(source, child, range, offset_encoding, allocator, type_table, hints);
+        } else if (std.mem.eql(u8, child.kind(), "directive")) {
+            try appendImplInlayHints(source, child, range, offset_encoding, allocator, action_signatures, hints);
+        }
+    }
+}
+
+fn appendRuleInlayHints(
+    source: []const u8,
+    rule: ts.Node,
+    range: types.Range,
+    offset_encoding: lsp.offsets.Encoding,
+    allocator: std.mem.Allocator,
+    type_table: *const TypeTable,
+    hints: *std.ArrayList(types.InlayHint),
+) OOM!void {
+    var rule_alias_types: std.ArrayList(AliasTypeFact) = .empty;
+    defer rule_alias_types.deinit(allocator);
+    try collectRuleAliasTypes(source, rule, allocator, type_table, &rule_alias_types);
+
+    for (rule_alias_types.items) |alias_type| {
+        try appendInlayHint(source, alias_type.alias_node, alias_type.type_value, range, offset_encoding, allocator, hints);
+    }
+
+    const action = firstNamedChildOfKind(rule, "named_action") orelse return;
+    var slot_index: usize = 0;
+    const child_count = action.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = action.namedChild(index).?;
+        if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
+        defer slot_index += 1;
+
+        if (slot_index >= rule_alias_types.items.len) continue;
+        const rule_alias = rule_alias_types.items[slot_index];
+        if (!std.mem.eql(u8, sliceForNode(source, child), rule_alias.alias_name)) continue;
+
+        try appendInlayHint(source, child, rule_alias.type_value, range, offset_encoding, allocator, hints);
+    }
+}
+
+fn appendImplInlayHints(
+    source: []const u8,
+    directive: ts.Node,
+    range: types.Range,
+    offset_encoding: lsp.offsets.Encoding,
+    allocator: std.mem.Allocator,
+    action_signatures: *const ActionSignatureTable,
+    hints: *std.ArrayList(types.InlayHint),
+) OOM!void {
+    if (!hasDirectChildOfKind(directive, "impl_name")) return;
+    const action = firstNamedChildOfKind(directive, "named_action") orelse return;
+    const action_name = actionNameForNamedAction(source, action) orelse return;
+
+    var slot_index: usize = 0;
+    const child_count = action.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = action.namedChild(index).?;
+        if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
+        defer slot_index += 1;
+
+        const action_type = action_signatures.get(action_name, slot_index) orelse continue;
+        if (!std.mem.eql(u8, sliceForNode(source, child), action_type.alias_name)) continue;
+
+        try appendInlayHint(source, child, action_type.type_value, range, offset_encoding, allocator, hints);
+    }
+}
+
+fn collectRuleAliasTypes(
+    source: []const u8,
+    rule: ts.Node,
+    allocator: std.mem.Allocator,
+    type_table: *const TypeTable,
+    alias_types: *std.ArrayList(AliasTypeFact),
+) OOM!void {
+    const child_count = rule.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = rule.namedChild(index).?;
+        const kind = child.kind();
+        if (!std.mem.eql(u8, kind, "lhs") and !std.mem.eql(u8, kind, "rhs")) continue;
+        try collectParticleAliasTypes(source, child, allocator, type_table, alias_types);
+    }
+}
+
+fn collectParticleAliasTypes(
+    source: []const u8,
+    node: ts.Node,
+    allocator: std.mem.Allocator,
+    type_table: *const TypeTable,
+    alias_types: *std.ArrayList(AliasTypeFact),
+) OOM!void {
+    var pending_type: ?[]const u8 = null;
+    const child_count = node.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = node.namedChild(index).?;
+        if (grammarParticleKind(child) != null) {
+            pending_type = type_table.typeForParticle(source, child);
+            continue;
+        }
+
+        if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
+        const type_value = pending_type orelse continue;
+        try alias_types.append(allocator, .{
+            .alias_name = sliceForNode(source, child),
+            .alias_node = child,
+            .type_value = type_value,
+        });
+        pending_type = null;
+    }
+}
+
+fn appendInlayHint(
+    source: []const u8,
+    alias_node: ts.Node,
+    type_value: []const u8,
+    range: types.Range,
+    offset_encoding: lsp.offsets.Encoding,
+    allocator: std.mem.Allocator,
+    hints: *std.ArrayList(types.InlayHint),
+) OOM!void {
+    const position = lsp.offsets.indexToPosition(source, alias_node.endByte(), offset_encoding);
+    if (!positionInRange(position, range)) return;
+
+    try hints.append(allocator, .{
+        .position = position,
+        .label = .{ .string = try std.fmt.allocPrint(allocator, ": {s}", .{type_value}) },
+        .kind = .Type,
+    });
+}
+
+fn directiveTypeKind(source: []const u8, directive: ts.Node) ?DirectiveTypeKind {
+    const child_count = directive.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = directive.namedChild(index).?;
+        if (!isDirectiveNameNode(child)) continue;
+        const name = sliceForNode(source, child);
+        if (std.mem.eql(u8, name, "type")) return .symbol_type;
+        if (std.mem.eql(u8, name, "token_type")) return .token_type;
+        if (std.mem.eql(u8, name, "default_type")) return .default_type;
+        return null;
+    }
+    return null;
+}
+
+fn directiveSymbolTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8 {
+    const child_count = directive.namedChildCount();
+    var seen_name = false;
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = directive.namedChild(index).?;
+        if (!seen_name) {
+            if (isDirectiveNameNode(child)) seen_name = true;
+            continue;
+        }
+        if (grammarParticleKind(child) != null) return sliceForNode(source, child);
+    }
+    return null;
+}
+
+fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
+    var maybe_payload: ?ts.Node = null;
+    const child_count = directive.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        maybe_payload = directive.namedChild(index).?;
+    }
+
+    const payload = maybe_payload orelse return null;
+    const leaf = if (std.mem.eql(u8, payload.kind(), "code_block"))
+        firstNamedChildOfKind(payload, "zig_code") orelse return null
+    else
+        payload;
+
+    const value = sliceForNode(source, leaf);
+    if (std.mem.eql(u8, leaf.kind(), "string")) {
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            return value[1 .. value.len - 1];
+        }
+    }
+    if (std.mem.eql(u8, leaf.kind(), "zig_code") or
+        std.mem.eql(u8, leaf.kind(), "identifier") or
+        std.mem.eql(u8, leaf.kind(), "string"))
+    {
+        return value;
+    }
+    return null;
+}
+
+fn isDirectiveNameNode(node: ts.Node) bool {
+    const kind = node.kind();
+    return std.mem.eql(u8, kind, "arg_directive_name") or
+        std.mem.eql(u8, kind, "directive_name");
+}
+
+fn grammarParticleKind(node: ts.Node) ?GrammarParticleKind {
+    const kind = node.kind();
+    if (std.mem.eql(u8, kind, "nonterminal")) return .nonterminal;
+    if (std.mem.eql(u8, kind, "terminal")) return .terminal;
+    if (std.mem.eql(u8, kind, "multiterminal")) return .multiterminal;
+    return null;
+}
+
+fn positionInRange(position: types.Position, range: types.Range) bool {
+    return !positionLessThan(position, range.start) and positionLessThan(position, range.end);
+}
+
+fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
+    return lhs.line < rhs.line or
+        (lhs.line == rhs.line and lhs.character < rhs.character);
 }
 
 fn parseDocument(source: []const u8) Error!ParsedDocument {
@@ -1207,6 +1624,40 @@ fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound
     return lsp.offsets.indexToPosition(haystack, index, .@"utf-8");
 }
 
+fn expectInlayHintAfter(
+    source: []const u8,
+    hints: []const types.InlayHint,
+    start_index: usize,
+    alias_name: []const u8,
+    label: []const u8,
+) !void {
+    const alias_index = std.mem.indexOf(u8, source[start_index..], alias_name) orelse return error.NeedleNotFound;
+    const position = lsp.offsets.indexToPosition(source, start_index + alias_index + alias_name.len, .@"utf-8");
+    for (hints) |hint| {
+        if (!std.meta.eql(hint.position, position)) continue;
+        switch (hint.label) {
+            .string => |hint_label| {
+                if (std.mem.eql(u8, hint_label, label)) return;
+            },
+            else => return error.UnexpectedInlayHint,
+        }
+    }
+    return error.MissingInlayHint;
+}
+
+fn expectNoInlayHintAfter(
+    source: []const u8,
+    hints: []const types.InlayHint,
+    start_index: usize,
+    alias_name: []const u8,
+) !void {
+    const alias_index = std.mem.indexOf(u8, source[start_index..], alias_name) orelse return error.NeedleNotFound;
+    const position = lsp.offsets.indexToPosition(source, start_index + alias_index + alias_name.len, .@"utf-8");
+    for (hints) |hint| {
+        try expect(!std.meta.eql(hint.position, position));
+    }
+}
+
 fn compileTagsQuery() ts.Query.Error!*ts.Query {
     var error_offset: u32 = 0;
     return ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
@@ -1360,6 +1811,104 @@ test "classifies zig code positions for middleware routing" {
     try expect(document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "answer")));
     try expect(document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "parser_name")));
     try expect(!document.containsZigCodeAtPosition(.@"utf-8", try positionOfText(sample, "calc ::= expr")));
+}
+
+test "inlay hints type grammar aliases from type directives" {
+    const sample =
+        \\%token_type "Token"
+        \\%default_type {*Default}
+        \\%type expr f64
+        \\%type expr i64
+        \\%type NUMBER {f64}
+        \\start ::= expr(A) PLUS|MINUS(O) fallback(F).
+        \\expr(E) ::= NUMBER(N).
+        \\fallback(D) ::= .
+    ;
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const hints = try document.inlayHints(arena_state.allocator(), .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 100, .character = 0 },
+    }, .@"utf-8");
+
+    const start_rule = try byteIndexOf(sample, "start ::=");
+    try expectInlayHintAfter(sample, hints, start_rule, "A", ": i64");
+    try expectInlayHintAfter(sample, hints, start_rule, "O", ": Token");
+    try expectInlayHintAfter(sample, hints, start_rule, "F", ": *Default");
+
+    const expr_rule = try byteIndexOf(sample, "expr(E)");
+    try expectInlayHintAfter(sample, hints, expr_rule, "E", ": i64");
+    const number_alias = try byteIndexOf(sample, "NUMBER(N)");
+    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": f64");
+}
+
+test "inlay hints type named action and impl aliases by name and position" {
+    const sample =
+        \\%type expr f64
+        \\%type NUMBER {f64}
+        \\expr(A) ::= NUMBER(N). @on_expr(A; N)
+        \\%impl @on_expr(A; N) { _ = .{ A, N }; }
+        \\%impl @on_expr(N; A) { _ = .{ N, A }; }
+        \\%impl @on_expr(A; Bad) { _ = Bad; }
+    ;
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const hints = try document.inlayHints(arena_state.allocator(), .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 100, .character = 0 },
+    }, .@"utf-8");
+
+    const rule = try byteIndexOf(sample, "expr(A)");
+    try expectInlayHintAfter(sample, hints, rule, "A", ": f64");
+    const number_alias = try byteIndexOf(sample, "NUMBER(N)");
+    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": f64");
+
+    const rule_action = try byteIndexOf(sample, "@on_expr(A; N)");
+    try expectInlayHintAfter(sample, hints, rule_action, "A", ": f64");
+    try expectInlayHintAfter(sample, hints, rule_action, "N", ": f64");
+
+    const impl_action = try byteIndexOf(sample, "%impl @on_expr(A; N)");
+    try expectInlayHintAfter(sample, hints, impl_action, "A", ": f64");
+    try expectInlayHintAfter(sample, hints, impl_action, "N", ": f64");
+
+    const swapped_impl = try byteIndexOf(sample, "%impl @on_expr(N; A)");
+    try expectNoInlayHintAfter(sample, hints, swapped_impl, "N");
+    try expectNoInlayHintAfter(sample, hints, swapped_impl, "A");
+
+    const mismatched_impl = try byteIndexOf(sample, "%impl @on_expr(A; Bad)");
+    try expectInlayHintAfter(sample, hints, mismatched_impl, "A", ": f64");
+    try expectNoInlayHintAfter(sample, hints, mismatched_impl, "Bad");
+}
+
+test "inlay hints filter by request range" {
+    const sample =
+        \\%type expr f64
+        \\expr(A) ::= expr(B). @on_expr(A; B)
+        \\%impl @on_expr(A; B) { _ = .{ A, B }; }
+    ;
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const hints = try document.inlayHints(arena_state.allocator(), .{
+        .start = .{ .line = 2, .character = 0 },
+        .end = .{ .line = 3, .character = 0 },
+    }, .@"utf-8");
+
+    try expectEqual(@as(usize, 2), hints.len);
+    const impl_action = try byteIndexOf(sample, "%impl @on_expr(A; B)");
+    try expectInlayHintAfter(sample, hints, impl_action, "A", ": f64");
+    try expectInlayHintAfter(sample, hints, impl_action, "B", ": f64");
 }
 
 test "resolution chooses discard rule reference instead of leftmost rule" {

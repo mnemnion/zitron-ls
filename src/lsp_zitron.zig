@@ -511,7 +511,7 @@ pub const Server = struct {
         return result;
     }
 
-    /// LSP `textDocument/inlayHint` handler for embedded Zig inlay hints.
+    /// LSP `textDocument/inlayHint` handler for grammar and embedded Zig inlay hints.
     pub fn @"textDocument/inlayHint"(
         server: *Server,
         arena: std.mem.Allocator,
@@ -522,17 +522,27 @@ pub const Server = struct {
             params.textDocument.uri,
             params.range,
         });
-        _ = server.getDocument(params.textDocument.uri) orelse {
+        const doc = server.getDocument(params.textDocument.uri) orelse {
             log.debug("LSP -> textDocument/inlayHint uri={s} result=null reason=missing_document elapsed_ns={}", .{
                 params.textDocument.uri,
                 server.logElapsedNs(start),
             });
             return null;
         };
-        const result = try server.zig_middleware.forwardInlayHint(arena, params.textDocument.uri, params);
+        const grammar_hints = try doc.inlayHints(arena, params.range, server.offset_encoding);
+        const zig_hints = try server.zig_middleware.forwardInlayHint(arena, params.textDocument.uri, params);
+        var hints: std.ArrayList(types.InlayHint) = .empty;
+        try hints.appendSlice(arena, grammar_hints);
+        if (zig_hints) |forwarded| {
+            try hints.appendSlice(arena, forwarded);
+        }
+        const result: lsp.ResultType("textDocument/inlayHint") = if (hints.items.len == 0)
+            null
+        else
+            try hints.toOwnedSlice(arena);
         log.debug("LSP -> textDocument/inlayHint uri={s} result_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
-            if (result) |hints| hints.len else 0,
+            if (result) |result_hints| result_hints.len else 0,
             result == null,
             server.logElapsedNs(start),
         });
@@ -1333,11 +1343,39 @@ test "disabled Zig middleware returns null for Zig-code requests" {
     const inlay_hints = try server.@"textDocument/inlayHint"(arena_state.allocator(), .{
         .textDocument = .{ .uri = "file:///samples/calc.zy" },
         .range = .{
-            .start = .{ .line = 0, .character = 0 },
-            .end = .{ .line = 100, .character = 0 },
+            .start = position,
+            .end = .{ .line = position.line, .character = position.character + @as(u32, @intCast("answer = A".len)) },
         },
     });
     try expect(inlay_hints == null);
+}
+
+test "server returns grammar inlay hints with disabled Zig middleware" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const sample =
+        \\%type expr f64
+        \\calc ::= expr(A).
+    ;
+
+    try server.putDocument("file:///samples/grammar_inlay.zy", 1, sample);
+
+    const inlay_hints = (try server.@"textDocument/inlayHint"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = "file:///samples/grammar_inlay.zy" },
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 100, .character = 0 },
+        },
+    })) orelse return error.UnexpectedInlayHints;
+
+    try expectEqual(@as(usize, 1), inlay_hints.len);
+    switch (inlay_hints[0].label) {
+        .string => |label| try expectEqualStrings(": f64", label),
+        else => return error.UnexpectedInlayHints,
+    }
 }
 
 test "hover definition and references operate on stored live document state" {
