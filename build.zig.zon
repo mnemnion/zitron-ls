@@ -13,9 +13,12 @@
             .url = "git+https://github.com/zigtools/lsp-kit.git#b886a2b0d5cee85ecbcc3089b863f7517cc9ff7f",
             .hash = "lsp_kit-0.1.0-bi_PL3IyDACfp1xdTnkiOHEok2YpPCCCJHuuOcNzjl1D",
         },
-        .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/zig-tree-sitter.git#b55d4977d61330390fc733944da06106ff972660",
-            .hash = "tree_sitter-0.26.0-8heIf3CaAQB4SSumoGzq3gLSz2rkvXxcKFyskRWqDGBz",
+        .woodward = .{
+            .path = "../woodward/",
+        },
+        .@"tree-sitter" = .{
+            .url = "https://github.com/neurocyte/tree-sitter/releases/download/master-70dbb6fa9d998bcf599c3aaeecac7479e9ee3f0c/source.tar.gz",
+            .hash = "tree_sitter-0.26.7-z0LhyGSQZzENNbCzqsMPu63xwpZI1WTHcf62imt-H6YL",
         },
         .tree_sitter_zitron = .{
             .url = "https://api.github.com/repos/mnemnion/tree-sitter-zitron/tarball/v0.1.6",

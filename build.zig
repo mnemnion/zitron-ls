@@ -11,7 +11,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("lsp");
-    const tree_sitter_dep = b.dependency("tree_sitter", .{
+    const woodward_dep = b.dependency("woodward", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tree_sitter_dep = b.dependency("tree-sitter", .{
         .target = target,
         .optimize = optimize,
     });
@@ -30,10 +34,18 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const tree_sitter_mod = b.createModule(.{
+        .root_source_file = b.path("src/tree_sitter.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tree_sitter_mod.addImport("woodward", woodward_dep.module("woodward"));
+    tree_sitter_mod.linkLibrary(tree_sitter_dep.artifact("tree-sitter"));
+
     lsp_zitron_mod.addImport("lsp", lsp_module);
     lsp_zitron_mod.addOptions("build_options", options);
     lsp_zitron_mod.addImport("dmp", muad_diff_dep.module("dmp"));
-    lsp_zitron_mod.addImport("tree-sitter", tree_sitter_dep.module("tree_sitter"));
+    lsp_zitron_mod.addImport("tree-sitter", tree_sitter_mod);
     lsp_zitron_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
     lsp_zitron_mod.addAnonymousImport("zitron-tags-query", .{
         .root_source_file = b.path("src/zitron-tags-query.scm"),
