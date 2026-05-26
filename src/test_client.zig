@@ -278,7 +278,7 @@ fn expectInitializeResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 1);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -322,7 +322,7 @@ fn expectHoverResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 3);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -362,7 +362,7 @@ fn expectDefinitionResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 4);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -411,7 +411,7 @@ fn expectNullResponse(
     transport: *lsp.Transport,
     id: i64,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, id);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -443,7 +443,7 @@ fn expectAnyResponse(
     transport: *lsp.Transport,
     id: i64,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, id);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -467,7 +467,7 @@ fn expectReferencesResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 6);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -508,7 +508,7 @@ fn expectCompletionResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 7);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -554,7 +554,7 @@ fn expectDocumentSymbolsResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 8);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -598,7 +598,7 @@ fn expectShutdownResponse(
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
 ) Error!void {
-    const json_message = try transport.readJsonMessage(io, allocator);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, 2);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -613,6 +613,40 @@ fn expectShutdownResponse(
             }
         },
         else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn readResponseJsonMessage(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    id: i64,
+) Error![]u8 {
+    while (true) {
+        const json_message = try transport.readJsonMessage(io, allocator);
+        errdefer allocator.free(json_message);
+
+        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        switch (parsed.value) {
+            .response => |response| {
+                if (response.id == null or !response.id.?.eql(.{ .number = id })) {
+                    return error_set.UnexpectedResponse;
+                }
+                return json_message;
+            },
+            .notification => {
+                allocator.free(json_message);
+                continue;
+            },
+            .request => {
+                allocator.free(json_message);
+                continue;
+            },
+        }
     }
 }
 

@@ -89,6 +89,7 @@ pub const Server = struct {
     rename_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
     zig_middleware: ZigMiddleware,
+    client_transport: ?*lsp.Transport,
     io: ?std.Io,
 
     /// Creates a server instance and compiles the grammar tag query.
@@ -107,6 +108,7 @@ pub const Server = struct {
             .rename_query = rename_query,
             .offset_encoding = .@"utf-16",
             .zig_middleware = ZigMiddleware.disabled(),
+            .client_transport = null,
             .io = null,
         };
     }
@@ -118,6 +120,11 @@ pub const Server = struct {
         server.zig_middleware = try ZigMiddleware.init(io, allocator);
         server.io = io;
         return server;
+    }
+
+    pub fn setClientTransport(server: *Server, transport: *lsp.Transport) void {
+        server.client_transport = transport;
+        server.zig_middleware.setDiagnosticsPublisher(server, publishZlsDiagnostics);
     }
 
     /// Releases all document state and query resources owned by the server.
@@ -143,6 +150,54 @@ pub const Server = struct {
         const io = server.io orelse return 0;
         const started = start orelse return 0;
         return started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    }
+
+    fn publishMergedDiagnostics(server: *Server, uri: []const u8, version: i32) Error!void {
+        if (server.client_transport == null or server.io == null) return;
+        var arena_state = std.heap.ArenaAllocator.init(server.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const grammar_diagnostics = server.zig_middleware.grammarDiagnostics(uri);
+        const zls_diagnostics = server.zig_middleware.zlsDiagnostics(uri);
+        var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+        try diagnostics.appendSlice(arena, grammar_diagnostics);
+        try diagnostics.appendSlice(arena, zls_diagnostics);
+        try server.publishDiagnostics(uri, version, diagnostics.items);
+    }
+
+    fn publishZlsDiagnostics(context: *anyopaque, source_uri: []const u8, version: i32) void {
+        const server: *Server = @ptrCast(@alignCast(context));
+        server.publishMergedDiagnostics(source_uri, version) catch |err| {
+            log.warn("LSP publish diagnostics failed for uri={s}: {}", .{ source_uri, err });
+        };
+    }
+
+    fn publishDiagnostics(
+        server: *Server,
+        uri: []const u8,
+        version: ?i32,
+        diagnostics: []const types.Diagnostic,
+    ) Error!void {
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+        log.debug("LSP -> textDocument/publishDiagnostics uri={s} version={?} diagnostics={}", .{
+            uri,
+            version,
+            diagnostics.len,
+        });
+        try transport.writeNotification(
+            io,
+            server.allocator,
+            "textDocument/publishDiagnostics",
+            lsp.ParamsType("textDocument/publishDiagnostics"),
+            .{
+                .uri = uri,
+                .version = version,
+                .diagnostics = diagnostics,
+            },
+            .{ .emit_null_optional_fields = false },
+        );
     }
 
     /// LSP `initialize` handler required by `lsp-kit`.
@@ -228,6 +283,7 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
+        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,
@@ -260,6 +316,7 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
+        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,
@@ -275,6 +332,9 @@ pub const Server = struct {
     ) void {
         const start = server.logStart();
         log.debug("LSP <- textDocument/didClose uri={s}", .{params.textDocument.uri});
+        server.publishDiagnostics(params.textDocument.uri, null, &.{}) catch |err| {
+            log.warn("LSP publish diagnostics failed while closing uri={s}: {}", .{ params.textDocument.uri, err });
+        };
         server.zig_middleware.closeDocument(params.textDocument.uri);
         server.removeDocument(params.textDocument.uri);
         log.debug("LSP -> textDocument/didClose uri={s} elapsed_ns={}", .{
