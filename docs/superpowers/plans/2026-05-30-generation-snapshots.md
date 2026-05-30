@@ -14,7 +14,7 @@
 ## File Structure
 
 - Modify `src/ZigMiddleware.zig`
-  - Add `DocumentState`, `GenerationLookup`, and helper methods beside `GeneratedDocument`.
+  - Add `DocumentState` and helper methods beside `GeneratedDocument`.
   - Change `Middleware.documents` from `GeneratedDocument` values to `DocumentState` values.
   - Refactor sync, close, diagnostics, and request lookup paths to go through `state.current`.
   - Add unit tests for generation lookup and lapped diagnostics.
@@ -228,8 +228,11 @@ Lock around:
 - `middlewareHandleZlsDiagnostics`
 - `middlewareCloseDocument`
 - `middlewareDeinit` document freeing
-- `middlewareDocumentReady`
 - `middlewareDocumentForGeneratedUri`
+
+Request forwarding still uses `middlewareDocumentReady` as a main-thread
+generation selector. Detailed stale user-facing request behavior remains
+deferred by the design doc.
 
 - [x] **Step 3: Run full tests**
 
