@@ -934,9 +934,13 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
 fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
     const start = logStart(middleware.io);
     log.debug("Zig close <- uri={s}", .{uri});
-    middleware.documents_mutex.lockUncancelable(middleware.io);
-    defer middleware.documents_mutex.unlock(middleware.io);
-    const removed = middleware.documents.fetchRemove(uri) orelse return;
+
+    const removed = blk: {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        break :blk middleware.documents.fetchRemove(uri) orelse return;
+    };
+
     middleware.allocator.free(removed.key);
     var state = removed.value;
     if (state.opened) {
