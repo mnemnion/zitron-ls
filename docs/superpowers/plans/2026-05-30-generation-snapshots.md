@@ -222,8 +222,7 @@ Initialize it with `.init` wherever `Middleware` is constructed.
 
 Lock around:
 
-- `grammarDiagnostics`
-- `zlsDiagnostics`
+- `appendDiagnostics`
 - `middlewareSyncDocument` state lookup and publish points
 - `middlewareHandleZlsDiagnostics`
 - `middlewareCloseDocument`

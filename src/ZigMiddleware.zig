@@ -248,32 +248,6 @@ pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
     }
 }
 
-pub fn grammarDiagnostics(middleware: *ZigMiddleware, uri: []const u8) []const types.Diagnostic {
-    return switch (middleware.mode) {
-        .disabled => &.{},
-        .enabled => |mware| blk: {
-            mware.documents_mutex.lockUncancelable(mware.io);
-            defer mware.documents_mutex.unlock(mware.io);
-            const state = mware.documents.getPtr(uri) orelse break :blk &.{};
-            const generation = state.current orelse break :blk &.{};
-            break :blk generation.grammar_diagnostics;
-        },
-    };
-}
-
-pub fn zlsDiagnostics(middleware: *ZigMiddleware, uri: []const u8) []const types.Diagnostic {
-    return switch (middleware.mode) {
-        .disabled => &.{},
-        .enabled => |mware| blk: {
-            mware.documents_mutex.lockUncancelable(mware.io);
-            defer mware.documents_mutex.unlock(mware.io);
-            const state = mware.documents.getPtr(uri) orelse break :blk &.{};
-            const generation = state.current orelse break :blk &.{};
-            break :blk if (generation.zls_diagnostics_version == generation.version) generation.zls_diagnostics else &.{};
-        },
-    };
-}
-
 pub fn appendDiagnostics(
     middleware: *ZigMiddleware,
     allocator: std.mem.Allocator,
