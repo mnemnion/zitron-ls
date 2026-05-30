@@ -5,6 +5,7 @@
 **Goal:** Make ZLS diagnostic translation operate through published generation snapshots instead of mutable document state.
 
 **Architecture:** Introduce a live `DocumentState` that owns the current published `GeneratedDocument` generation. `GeneratedDocument` becomes a snapshot with duplicated source text, generated text, code map, diagnostics, and a generation id. A document mutex guards live document table access and generation publication; translation paths use per-operation caches so published generations have no mutable translator cache.
+`version = null` diagnostics are accepted only when no generation is in flight, exactly one generated sync has been sent, and the current generation is the one last sent to ZLS.
 
 **Tech Stack:** Zig 0.16.0, `std.StringHashMapUnmanaged`, `std.Io.Mutex`, existing inline Zig tests in `src/ZigMiddleware.zig`.
 

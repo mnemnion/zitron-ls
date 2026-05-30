@@ -114,6 +114,7 @@ const DocumentState = struct {
     in_flight_version: ?i32,
     opened: bool,
     zls_sync_count: usize,
+    zls_synced_generation_id: ?usize,
 
     fn currentGeneration(state: *DocumentState) ?*GeneratedDocument {
         return &(state.current orelse return null);
@@ -126,6 +127,7 @@ const DocumentState = struct {
         } else {
             if (state.in_flight_version != null) return null;
             if (state.zls_sync_count != 1) return null;
+            if (state.zls_synced_generation_id != current.generation_id) return null;
         }
         return current;
     }
@@ -475,6 +477,7 @@ fn middlewareSyncDocument(
                 .in_flight_version = version,
                 .opened = false,
                 .zls_sync_count = 0,
+                .zls_synced_generation_id = null,
             };
             log.debug("Zig sync doc-created uri={s}", .{uri});
         } else {
@@ -641,6 +644,7 @@ fn middlewarePublishGeneration(
                 if (changes.items.len != 0) {
                     notify_kind = .change;
                     state.zls_sync_count += 1;
+                    state.zls_synced_generation_id = generation.generation_id;
                 } else {
                     log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
                         generation.generated_uri,
@@ -652,6 +656,7 @@ fn middlewarePublishGeneration(
                 notify_text = generation.generated_text;
                 state.opened = true;
                 state.zls_sync_count += 1;
+                state.zls_synced_generation_id = generation.generation_id;
             }
         }
 
@@ -3714,6 +3719,7 @@ fn makeTestDocumentState(
         .in_flight_version = null,
         .opened = false,
         .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
     };
 }
 
@@ -4064,6 +4070,7 @@ test "alias code block rename refuses unmapped source blocks" {
         .in_flight_version = null,
         .opened = false,
         .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
     });
     errdefer {
         const removed = middleware.documents.fetchRemove(uri).?;
@@ -4140,6 +4147,7 @@ test "forward requests return null while generation has errors" {
                 .in_flight_version = null,
                 .opened = false,
                 .zls_sync_count = 0,
+                .zls_synced_generation_id = null,
             });
         },
     }
@@ -4287,6 +4295,7 @@ test "document state rejects version-null diagnostics while generation is in fli
     defer state.deinit(testing_allocator);
 
     state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
     state.in_flight_version = 2;
     try std.testing.expect(state.currentForVersion(null) == null);
 }
@@ -4296,8 +4305,22 @@ test "document state accepts version-null diagnostics only before a second ZLS s
     defer state.deinit(testing_allocator);
 
     state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
     try std.testing.expect(state.currentForVersion(null) != null);
     state.zls_sync_count = 2;
+    try std.testing.expect(state.currentForVersion(null) == null);
+}
+
+test "document state rejects version-null diagnostics after unsynced generation replacement" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
+    state.latest_requested_version = 2;
+    const replacement = try makeTestGeneratedDocument(testing_allocator, "file:///source.zy", 2, "source", "generated");
+    try std.testing.expect(state.publishIfCurrent(testing_allocator, replacement));
+
     try std.testing.expect(state.currentForVersion(null) == null);
 }
 
@@ -4308,6 +4331,7 @@ test "document state does not publish stale generation" {
         .in_flight_version = 1,
         .opened = false,
         .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
     };
     defer state.deinit(testing_allocator);
 

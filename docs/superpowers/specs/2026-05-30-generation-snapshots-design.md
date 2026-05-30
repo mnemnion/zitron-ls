@@ -83,8 +83,8 @@ Initial compatibility rule:
 
 ```text
 Accept version-null diagnostics only when the generated URI has exactly one
-unambiguous generated sync for that source and no generation for that source is
-in flight.
+unambiguous generated sync for that source, the current published generation is
+the generation last sent to ZLS, and no generation for that source is in flight.
 ```
 
 Otherwise, drop the diagnostics and log the reason. This keeps compatibility
