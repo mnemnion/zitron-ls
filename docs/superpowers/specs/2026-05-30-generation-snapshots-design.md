@@ -143,9 +143,9 @@ important design point is that the mutex protects publication and generation
 lookup; it is not the semantic model. The semantic model is explicit generation
 ownership.
 
-Translator caches are the one allowed mutable part inside a generation. They
-must either be guarded or removed from shared reader paths until the cache
-ownership is safe.
+Translator caches are not part of the published generation snapshot in the
+initial implementation. Translation paths use per-operation caches so source
+text, generated text, and code maps remain the only shared generation inputs.
 
 ## Deferred User-Facing Request Policy
 

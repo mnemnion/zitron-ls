@@ -88,7 +88,6 @@ const GeneratedDocument = struct {
     generated_uri: []u8,
     generated_text: []u8,
     code_map: CodeMap,
-    translator_cache: SpanTranslatorCache,
     generation_error: ?[]u8,
     grammar_diagnostics: []types.Diagnostic,
     zls_diagnostics: []types.Diagnostic,
@@ -103,7 +102,6 @@ const GeneratedDocument = struct {
         allocator.free(doc.generated_uri);
         allocator.free(doc.generated_text);
         doc.code_map.deinit(allocator);
-        doc.translator_cache.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
         freeStoredDiagnostics(allocator, doc.grammar_diagnostics);
         freeStoredDiagnostics(allocator, doc.zls_diagnostics);
@@ -530,7 +528,6 @@ fn middlewareSyncDocument(
             .generated_uri = generated_uri,
             .generated_text = empty_generated,
             .code_map = .{},
-            .translator_cache = .{},
             .generation_error = generation_error,
             .grammar_diagnostics = &.{},
             .zls_diagnostics = &.{},
@@ -591,7 +588,6 @@ fn middlewareSyncDocument(
         .generated_uri = generated_uri,
         .generated_text = generated_text,
         .code_map = code_map,
-        .translator_cache = .{},
         .generation_error = generation_error,
         .grammar_diagnostics = grammar_diagnostics,
         .zls_diagnostics = &.{},
@@ -863,12 +859,14 @@ fn translateZlsDiagnostics(
         translated.deinit(allocator);
     }
 
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(allocator);
     var context = RequestTranslationContext{
         .allocator = allocator,
         .map = &doc.code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -960,12 +958,14 @@ fn middlewareForwardHover(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1014,12 +1014,14 @@ fn middlewareForwardDefinition(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1080,12 +1082,14 @@ fn middlewareForwardReferences(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1142,12 +1146,14 @@ fn middlewareForwardCompletion(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1262,12 +1268,14 @@ fn middlewareForwardInlayHint(
         return null;
     }
 
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = resolved_active_span_index,
     };
     defer translation_context.deinit();
@@ -1302,12 +1310,14 @@ fn middlewareForwardDocumentSymbols(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer translation_context.deinit();
@@ -1343,12 +1353,14 @@ fn middlewareForwardRename(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1409,6 +1421,8 @@ fn middlewareAliasCodeBlockRenameEdits(
     errdefer edits.deinit(arena);
     var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer seen_starts.deinit(arena);
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
 
     for (source_ranges) |source_range| {
         const span_index = doc.code_map.indexForSourceRange(source_range) orelse {
@@ -1418,7 +1432,7 @@ fn middlewareAliasCodeBlockRenameEdits(
             });
             return null;
         };
-        const translator = try doc.translator_cache.get(
+        const translator = try translation_cache.get(
             middleware.allocator,
             &doc.code_map,
             doc.source_text,
@@ -3659,7 +3673,6 @@ fn makeTestGeneratedDocument(
         .generated_uri = try generatedUriForSourceUri(allocator, uri),
         .generated_text = try allocator.dupe(u8, generated_text),
         .code_map = map,
-        .translator_cache = .{},
         .generation_error = null,
         .grammar_diagnostics = &.{},
         .zls_diagnostics = &.{},
@@ -4019,7 +4032,6 @@ test "alias code block rename refuses unmapped source blocks" {
         .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
         .generated_text = try testing_allocator.dupe(u8, generated),
         .code_map = map,
-        .translator_cache = .{},
         .generation_error = null,
         .grammar_diagnostics = &.{},
         .zls_diagnostics = &.{},
@@ -4090,7 +4102,6 @@ test "forward requests return null while generation has errors" {
                 .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
                 .generated_text = try testing_allocator.dupe(u8, ""),
                 .code_map = .{},
-                .translator_cache = .{},
                 .generation_error = try testing_allocator.dupe(u8, "generation failed"),
                 .grammar_diagnostics = &.{},
                 .zls_diagnostics = &.{},
@@ -4209,7 +4220,6 @@ test "ZLS diagnostics translate to source ranges and default source" {
         .generated_uri = try testing_allocator.dupe(u8, "file:///source.zitron.zig"),
         .generated_text = try testing_allocator.dupe(u8, generated),
         .code_map = map,
-        .translator_cache = .{},
         .generation_error = null,
         .grammar_diagnostics = &.{},
         .zls_diagnostics = &.{},
