@@ -619,66 +619,106 @@ fn middlewarePublishGeneration(
     generation: *GeneratedDocument,
     start: std.Io.Timestamp,
 ) Error!void {
-    middleware.documents_mutex.lockUncancelable(middleware.io);
-    defer middleware.documents_mutex.unlock(middleware.io);
-
-    const state = middleware.documents.getPtr(uri) orelse {
-        log.debug("Zig sync stale generation dropped uri={s} version={} reason=closed", .{ uri, generation.version });
-        generation.deinit(middleware.allocator);
-        generation.* = undefined;
-        return;
-    };
-    if (generation.version != state.latest_requested_version) {
-        log.debug("Zig sync stale generation dropped uri={s} version={} latest={}", .{
-            uri,
-            generation.version,
-            state.latest_requested_version,
-        });
-        generation.deinit(middleware.allocator);
-        generation.* = undefined;
-        return;
-    }
-
-    const send_to_zls = generation.generation_error == null;
     var text_changes: ?diff.TextChanges = null;
     defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
-    if (send_to_zls and state.opened) {
-        const current = state.current orelse return error.MissingGeneratedDocument;
-        text_changes = try diff.textChanges(middleware.allocator, current.generated_text, generation.generated_text, .@"utf-8");
-    }
-    if (send_to_zls) {
-        if (state.opened) {
-            const changes = text_changes orelse return error.MissingGeneratedDocument;
-            if (changes.items.len != 0) {
-                log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} generated_bytes={}", .{
-                    generation.generated_uri,
-                    generation.version,
-                    changes.items.len,
-                    generation.generated_text.len,
-                });
-                try middleware.zls_transport.transport.writeNotification(
-                    middleware.io,
-                    middleware.allocator,
-                    "textDocument/didChange",
-                    lsp.ParamsType("textDocument/didChange"),
-                    .{
-                        .textDocument = .{ .uri = generation.generated_uri, .version = generation.version },
-                        .contentChanges = changes.items,
-                    },
-                    .{ .emit_null_optional_fields = false },
-                );
-                state.zls_sync_count += 1;
-            } else {
-                log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
-                    generation.generated_uri,
-                    generation.version,
-                });
-            }
-        } else {
-            log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
-                generation.generated_uri,
+    var notify_kind: enum { none, open, change } = .none;
+    var notify_uri: []const u8 = &.{};
+    var notify_version: i32 = 0;
+    var notify_text: []const u8 = &.{};
+    var notify_generated_bytes: usize = 0;
+    var log_version: i32 = 0;
+    var log_opened = false;
+    var log_generated_bytes: usize = 0;
+    var log_span_count: usize = 0;
+
+    {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+
+        const state = middleware.documents.getPtr(uri) orelse {
+            log.debug("Zig sync stale generation dropped uri={s} version={} reason=closed", .{ uri, generation.version });
+            generation.deinit(middleware.allocator);
+            generation.* = undefined;
+            return;
+        };
+        if (generation.version != state.latest_requested_version) {
+            log.debug("Zig sync stale generation dropped uri={s} version={} latest={}", .{
+                uri,
                 generation.version,
-                generation.generated_text.len,
+                state.latest_requested_version,
+            });
+            generation.deinit(middleware.allocator);
+            generation.* = undefined;
+            return;
+        }
+
+        const send_to_zls = generation.generation_error == null;
+        if (send_to_zls and state.opened) {
+            const current = state.current orelse return error.MissingGeneratedDocument;
+            text_changes = try diff.textChanges(middleware.allocator, current.generated_text, generation.generated_text, .@"utf-8");
+        }
+
+        if (send_to_zls) {
+            notify_uri = generation.generated_uri;
+            notify_version = generation.version;
+            notify_generated_bytes = generation.generated_text.len;
+            if (state.opened) {
+                const changes = text_changes orelse return error.MissingGeneratedDocument;
+                if (changes.items.len != 0) {
+                    notify_kind = .change;
+                    state.zls_sync_count += 1;
+                } else {
+                    log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
+                        generation.generated_uri,
+                        generation.version,
+                    });
+                }
+            } else {
+                notify_kind = .open;
+                notify_text = generation.generated_text;
+                state.opened = true;
+                state.zls_sync_count += 1;
+            }
+        }
+
+        if (state.current) |*old| old.deinit(middleware.allocator);
+        state.current = generation.*;
+        state.in_flight_version = null;
+        generation.* = undefined;
+        const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingGeneratedDocument;
+        log_version = doc.version;
+        log_opened = state.opened;
+        log_generated_bytes = doc.generated_text.len;
+        log_span_count = doc.code_map.len();
+    }
+
+    switch (notify_kind) {
+        .none => {},
+        .change => {
+            const changes = text_changes orelse return error.MissingGeneratedDocument;
+            log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} generated_bytes={}", .{
+                notify_uri,
+                notify_version,
+                changes.items.len,
+                notify_generated_bytes,
+            });
+            try middleware.zls_transport.transport.writeNotification(
+                middleware.io,
+                middleware.allocator,
+                "textDocument/didChange",
+                lsp.ParamsType("textDocument/didChange"),
+                .{
+                    .textDocument = .{ .uri = notify_uri, .version = notify_version },
+                    .contentChanges = changes.items,
+                },
+                .{ .emit_null_optional_fields = false },
+            );
+        },
+        .open => {
+            log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
+                notify_uri,
+                notify_version,
+                notify_generated_bytes,
             });
             try middleware.zls_transport.transport.writeNotification(
                 middleware.io,
@@ -687,31 +727,23 @@ fn middlewarePublishGeneration(
                 lsp.ParamsType("textDocument/didOpen"),
                 .{
                     .textDocument = .{
-                        .uri = generation.generated_uri,
+                        .uri = notify_uri,
                         .languageId = .{ .custom_value = "zig" },
-                        .version = generation.version,
-                        .text = generation.generated_text,
+                        .version = notify_version,
+                        .text = notify_text,
                     },
                 },
                 .{ .emit_null_optional_fields = false },
             );
-            state.opened = true;
-            state.zls_sync_count += 1;
-        }
+        },
     }
-
-    if (state.current) |*old| old.deinit(middleware.allocator);
-    state.current = generation.*;
-    state.in_flight_version = null;
-    generation.* = undefined;
-    const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingGeneratedDocument;
 
     log.debug("Zig sync -> uri={s} version={} opened={} generated_bytes={} spans={} elapsed_ns={}", .{
         uri,
-        doc.version,
-        state.opened,
-        doc.generated_text.len,
-        doc.code_map.len(),
+        log_version,
+        log_opened,
+        log_generated_bytes,
+        log_span_count,
         elapsedNs(middleware.io, start),
     });
 }
