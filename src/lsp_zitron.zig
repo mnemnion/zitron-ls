@@ -158,11 +158,8 @@ pub const Server = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const grammar_diagnostics = server.zig_middleware.grammarDiagnostics(uri);
-        const zls_diagnostics = server.zig_middleware.zlsDiagnostics(uri);
         var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
-        try diagnostics.appendSlice(arena, grammar_diagnostics);
-        try diagnostics.appendSlice(arena, zls_diagnostics);
+        try server.zig_middleware.appendDiagnostics(arena, &diagnostics, uri);
         try server.publishDiagnostics(uri, version, diagnostics.items);
     }
 
