@@ -113,13 +113,19 @@ const DocumentState = struct {
     latest_requested_version: i32,
     in_flight_version: ?i32,
     opened: bool,
+    zls_sync_count: usize,
+
+    fn currentGeneration(state: *DocumentState) ?*GeneratedDocument {
+        return &(state.current orelse return null);
+    }
 
     fn currentForVersion(state: *DocumentState, version: ?i32) ?*GeneratedDocument {
-        const current = &(state.current orelse return null);
+        const current = state.currentGeneration() orelse return null;
         if (version) |value| {
             if (current.version != value) return null;
-        } else if (state.in_flight_version != null) {
-            return null;
+        } else {
+            if (state.in_flight_version != null) return null;
+            if (state.zls_sync_count != 1) return null;
         }
         return current;
     }
@@ -494,6 +500,7 @@ fn middlewareSyncDocument(
                 .latest_requested_version = version,
                 .in_flight_version = version,
                 .opened = false,
+                .zls_sync_count = 0,
             };
             log.debug("Zig sync doc-created uri={s}", .{uri});
         } else {
@@ -660,6 +667,7 @@ fn middlewarePublishGeneration(
                     },
                     .{ .emit_null_optional_fields = false },
                 );
+                state.zls_sync_count += 1;
             } else {
                 log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
                     generation.generated_uri,
@@ -688,6 +696,7 @@ fn middlewarePublishGeneration(
                 .{ .emit_null_optional_fields = false },
             );
             state.opened = true;
+            state.zls_sync_count += 1;
         }
     }
 
@@ -925,7 +934,7 @@ fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
     middleware.allocator.free(removed.key);
     var state = removed.value;
     if (state.opened) {
-        if (state.currentForVersion(null)) |generation| {
+        if (state.currentGeneration()) |generation| {
             log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.generated_uri});
             middleware.zls_transport.transport.writeNotification(
                 middleware.io,
@@ -3553,7 +3562,7 @@ fn middlewareNextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
 
 fn middlewareDocumentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
     const state = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
-    const doc = state.currentForVersion(null) orelse return error.MissingGeneratedDocument;
+    const doc = state.currentGeneration() orelse return error.MissingGeneratedDocument;
     if (doc.generation_error != null) return error.RequestFailed;
     return doc;
 }
@@ -3694,6 +3703,7 @@ fn makeTestDocumentState(
         .latest_requested_version = version,
         .in_flight_version = null,
         .opened = false,
+        .zls_sync_count = 0,
     };
 }
 
@@ -4025,20 +4035,26 @@ test "alias code block rename refuses unmapped source blocks" {
     };
     const key = try testing_allocator.dupe(u8, uri);
     errdefer testing_allocator.free(key);
-    try middleware.documents.put(testing_allocator, key, .{ .current = .{
-        .source_uri = try testing_allocator.dupe(u8, uri),
-        .source_path = try testing_allocator.dupe(u8, "source.zy"),
-        .source_text = try testing_allocator.dupe(u8, source),
-        .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
-        .generated_text = try testing_allocator.dupe(u8, generated),
-        .code_map = map,
-        .generation_error = null,
-        .grammar_diagnostics = &.{},
-        .zls_diagnostics = &.{},
-        .zls_diagnostics_version = null,
-        .version = 1,
+    try middleware.documents.put(testing_allocator, key, .{
+        .current = .{
+            .source_uri = try testing_allocator.dupe(u8, uri),
+            .source_path = try testing_allocator.dupe(u8, "source.zy"),
+            .source_text = try testing_allocator.dupe(u8, source),
+            .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+            .generated_text = try testing_allocator.dupe(u8, generated),
+            .code_map = map,
+            .generation_error = null,
+            .grammar_diagnostics = &.{},
+            .zls_diagnostics = &.{},
+            .zls_diagnostics_version = null,
+            .version = 1,
+            .opened = false,
+        },
+        .latest_requested_version = 1,
+        .in_flight_version = null,
         .opened = false,
-    }, .latest_requested_version = 1, .in_flight_version = null, .opened = false });
+        .zls_sync_count = 0,
+    });
     errdefer {
         const removed = middleware.documents.fetchRemove(uri).?;
         testing_allocator.free(removed.key);
@@ -4095,20 +4111,26 @@ test "forward requests return null while generation has errors" {
         .enabled => |mware| {
             const key = try testing_allocator.dupe(u8, uri);
             errdefer testing_allocator.free(key);
-            try mware.documents.put(testing_allocator, key, .{ .current = .{
-                .source_uri = try testing_allocator.dupe(u8, uri),
-                .source_path = try testing_allocator.dupe(u8, "source.zy"),
-                .source_text = try testing_allocator.dupe(u8, source),
-                .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
-                .generated_text = try testing_allocator.dupe(u8, ""),
-                .code_map = .{},
-                .generation_error = try testing_allocator.dupe(u8, "generation failed"),
-                .grammar_diagnostics = &.{},
-                .zls_diagnostics = &.{},
-                .zls_diagnostics_version = null,
-                .version = 1,
+            try mware.documents.put(testing_allocator, key, .{
+                .current = .{
+                    .source_uri = try testing_allocator.dupe(u8, uri),
+                    .source_path = try testing_allocator.dupe(u8, "source.zy"),
+                    .source_text = try testing_allocator.dupe(u8, source),
+                    .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+                    .generated_text = try testing_allocator.dupe(u8, ""),
+                    .code_map = .{},
+                    .generation_error = try testing_allocator.dupe(u8, "generation failed"),
+                    .grammar_diagnostics = &.{},
+                    .zls_diagnostics = &.{},
+                    .zls_diagnostics_version = null,
+                    .version = 1,
+                    .opened = false,
+                },
+                .latest_requested_version = 1,
+                .in_flight_version = null,
                 .opened = false,
-            }, .latest_requested_version = 1, .in_flight_version = null, .opened = false });
+                .zls_sync_count = 0,
+            });
         },
     }
     defer switch (zig_middleware.mode) {
@@ -4254,7 +4276,18 @@ test "document state rejects version-null diagnostics while generation is in fli
     var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
     defer state.deinit(testing_allocator);
 
+    state.zls_sync_count = 1;
     state.in_flight_version = 2;
+    try std.testing.expect(state.currentForVersion(null) == null);
+}
+
+test "document state accepts version-null diagnostics only before a second ZLS sync" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    state.zls_sync_count = 1;
+    try std.testing.expect(state.currentForVersion(null) != null);
+    state.zls_sync_count = 2;
     try std.testing.expect(state.currentForVersion(null) == null);
 }
 
@@ -4264,6 +4297,7 @@ test "document state does not publish stale generation" {
         .latest_requested_version = 2,
         .in_flight_version = 1,
         .opened = false,
+        .zls_sync_count = 0,
     };
     defer state.deinit(testing_allocator);
 
