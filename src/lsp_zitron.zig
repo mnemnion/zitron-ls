@@ -158,11 +158,8 @@ pub const Server = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const grammar_diagnostics = server.zig_middleware.grammarDiagnostics(uri);
-        const zls_diagnostics = server.zig_middleware.zlsDiagnostics(uri);
         var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
-        try diagnostics.appendSlice(arena, grammar_diagnostics);
-        try diagnostics.appendSlice(arena, zls_diagnostics);
+        try server.zig_middleware.appendDiagnostics(arena, &diagnostics, uri);
         try server.publishDiagnostics(uri, version, diagnostics.items);
     }
 
@@ -899,7 +896,19 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
 
 /// Loads the configured fixture source into memory for smoke tests and helpers.
 pub fn loadFixtureAlloc(io: std.Io, allocator: std.mem.Allocator) FixtureError![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, build_options.fixture_path, allocator, .limited(64 * 1024));
+    return std.Io.Dir.cwd().readFileAlloc(io, build_options.fixture_path, allocator, .limited(1024 * 1024));
+}
+
+pub fn fixturePath() []const u8 {
+    return build_options.fixture_path;
+}
+
+pub fn loadSmokeFixtureAlloc(io: std.Io, allocator: std.mem.Allocator) FixtureError![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, build_options.smoke_fixture_path, allocator, .limited(1024 * 1024));
+}
+
+pub fn smokeFixturePath() []const u8 {
+    return build_options.smoke_fixture_path;
 }
 
 fn completionItemsContainLabel(items: []const types.CompletionItem, label: []const u8) bool {

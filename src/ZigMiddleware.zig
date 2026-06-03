@@ -24,13 +24,16 @@ const Middleware = struct {
     reader_failed: bool,
     diagnostics_context: ?*anyopaque,
     diagnostics_publisher: ?DiagnosticsPublisher,
-    documents: std.StringHashMapUnmanaged(GeneratedDocument),
+    documents_mutex: std.Io.Mutex,
+    documents: std.StringHashMapUnmanaged(DocumentState),
     zls_completion_triggers: []const []const u8,
+    next_generation_id: usize,
     next_request_id: i64,
 
     const deinit = middlewareDeinit;
     const syncDocument = middlewareSyncDocument;
     const closeDocument = middlewareCloseDocument;
+    const publishGeneration = middlewarePublishGeneration;
     const forwardHover = middlewareForwardHover;
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
@@ -78,13 +81,13 @@ pub const Error =
     };
 
 const GeneratedDocument = struct {
+    generation_id: usize = 0,
     source_uri: []u8,
     source_path: []u8,
     source_text: []const u8,
     generated_uri: []u8,
     generated_text: []u8,
     code_map: CodeMap,
-    translator_cache: SpanTranslatorCache,
     generation_error: ?[]u8,
     grammar_diagnostics: []types.Diagnostic,
     zls_diagnostics: []types.Diagnostic,
@@ -95,13 +98,57 @@ const GeneratedDocument = struct {
     fn deinit(doc: *GeneratedDocument, allocator: std.mem.Allocator) void {
         allocator.free(doc.source_uri);
         allocator.free(doc.source_path);
+        allocator.free(doc.source_text);
         allocator.free(doc.generated_uri);
         allocator.free(doc.generated_text);
         doc.code_map.deinit(allocator);
-        doc.translator_cache.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
         freeStoredDiagnostics(allocator, doc.grammar_diagnostics);
         freeStoredDiagnostics(allocator, doc.zls_diagnostics);
+    }
+};
+
+const DocumentState = struct {
+    current: ?GeneratedDocument,
+    latest_requested_version: i32,
+    in_flight_version: ?i32,
+    opened: bool,
+    zls_sync_count: usize,
+    zls_synced_generation_id: ?usize,
+
+    fn currentGeneration(state: *DocumentState) ?*GeneratedDocument {
+        return &(state.current orelse return null);
+    }
+
+    fn currentForVersion(state: *DocumentState, version: ?i32) ?*GeneratedDocument {
+        const current = state.currentGeneration() orelse return null;
+        if (version) |value| {
+            if (current.version != value) return null;
+        } else {
+            if (state.in_flight_version != null) return null;
+            if (state.zls_synced_generation_id != current.generation_id) return null;
+        }
+        return current;
+    }
+
+    fn publishIfCurrent(
+        state: *DocumentState,
+        allocator: std.mem.Allocator,
+        generation: GeneratedDocument,
+    ) bool {
+        if (generation.version != state.latest_requested_version) {
+            var stale = generation;
+            stale.deinit(allocator);
+            return false;
+        }
+        if (state.current) |*old| old.deinit(allocator);
+        state.current = generation;
+        state.in_flight_version = null;
+        return true;
+    }
+
+    fn deinit(state: *DocumentState, allocator: std.mem.Allocator) void {
+        if (state.current) |*current| current.deinit(allocator);
     }
 };
 
@@ -151,8 +198,10 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
         .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
+        .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
         .next_request_id = 1,
     };
     errdefer mware.deinit();
@@ -200,21 +249,25 @@ pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
     }
 }
 
-pub fn grammarDiagnostics(middleware: *ZigMiddleware, uri: []const u8) []const types.Diagnostic {
-    return switch (middleware.mode) {
-        .disabled => &.{},
-        .enabled => |mware| if (mware.documents.getPtr(uri)) |doc| doc.grammar_diagnostics else &.{},
-    };
-}
-
-pub fn zlsDiagnostics(middleware: *ZigMiddleware, uri: []const u8) []const types.Diagnostic {
-    return switch (middleware.mode) {
-        .disabled => &.{},
-        .enabled => |mware| if (mware.documents.getPtr(uri)) |doc|
-            if (doc.zls_diagnostics_version == doc.version) doc.zls_diagnostics else &.{}
-        else
-            &.{},
-    };
+pub fn appendDiagnostics(
+    middleware: *ZigMiddleware,
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(types.Diagnostic),
+    uri: []const u8,
+) OOM!void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |mware| {
+            mware.documents_mutex.lockUncancelable(mware.io);
+            defer mware.documents_mutex.unlock(mware.io);
+            const state = mware.documents.getPtr(uri) orelse return;
+            const generation = state.current orelse return;
+            try diagnostics.appendSlice(allocator, generation.grammar_diagnostics);
+            if (generation.zls_diagnostics_version == generation.version) {
+                try diagnostics.appendSlice(allocator, generation.zls_diagnostics);
+            }
+        },
+    }
 }
 
 pub fn setDiagnosticsPublisher(
@@ -381,6 +434,8 @@ fn middlewareDeinit(middleware: *Middleware) void {
         middleware.reader_thread = null;
     }
 
+    middleware.documents_mutex.lockUncancelable(middleware.io);
+    defer middleware.documents_mutex.unlock(middleware.io);
     var it = middleware.documents.iterator();
     while (it.next()) |entry| {
         middleware.allocator.free(entry.key_ptr.*);
@@ -405,93 +460,225 @@ fn middlewareSyncDocument(
 ) Error!void {
     const start = logStart(middleware.io);
     log.debug("Zig sync <- uri={s} version={} source_bytes={}", .{ uri, version, source_text.len });
-    const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
-    if (!gop.found_existing) {
-        errdefer _ = middleware.documents.remove(uri);
-        gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
-        errdefer middleware.allocator.free(gop.key_ptr.*);
 
-        const source_path = try filePathFromUri(middleware.allocator, uri);
-        errdefer middleware.allocator.free(source_path);
-        const generated_uri = try generatedUriForSourceUri(middleware.allocator, uri);
-        errdefer middleware.allocator.free(generated_uri);
+    const generation_id = blk: {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
 
-        gop.value_ptr.* = .{
+        const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
+        if (!gop.found_existing) {
+            errdefer _ = middleware.documents.remove(uri);
+            gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
+            errdefer middleware.allocator.free(gop.key_ptr.*);
+            gop.value_ptr.* = .{
+                .current = null,
+                .latest_requested_version = version,
+                .in_flight_version = version,
+                .opened = false,
+                .zls_sync_count = 0,
+                .zls_synced_generation_id = null,
+            };
+            log.debug("Zig sync doc-created uri={s}", .{uri});
+        } else {
+            gop.value_ptr.latest_requested_version = version;
+            gop.value_ptr.in_flight_version = version;
+        }
+
+        const id = middleware.next_generation_id;
+        middleware.next_generation_id += 1;
+        break :blk id;
+    };
+
+    var source_path = try filePathFromUri(middleware.allocator, uri);
+    errdefer if (source_path.len != 0) middleware.allocator.free(source_path);
+    var generated_uri = try generatedUriForSourceUri(middleware.allocator, uri);
+    errdefer if (generated_uri.len != 0) middleware.allocator.free(generated_uri);
+    var owned_source_text = try middleware.allocator.dupe(u8, source_text);
+    errdefer if (owned_source_text.len != 0) middleware.allocator.free(owned_source_text);
+
+    const generation_start = logStart(middleware.io);
+    const generated = runZitron(middleware.allocator, middleware.io, source_path, source_text) catch |err| {
+        log.warn("Zitron generation failed for '{s}': {}", .{ source_path, err });
+        const generation_error = try middleware.allocator.dupe(u8, @errorName(err));
+        errdefer middleware.allocator.free(generation_error);
+        const empty_generated = try middleware.allocator.alloc(u8, 0);
+        errdefer middleware.allocator.free(empty_generated);
+        var generation = GeneratedDocument{
+            .generation_id = generation_id,
             .source_uri = try middleware.allocator.dupe(u8, uri),
             .source_path = source_path,
-            .source_text = source_text,
+            .source_text = owned_source_text,
             .generated_uri = generated_uri,
-            .generated_text = try middleware.allocator.alloc(u8, 0),
+            .generated_text = empty_generated,
             .code_map = .{},
-            .translator_cache = .{},
-            .generation_error = null,
+            .generation_error = generation_error,
             .grammar_diagnostics = &.{},
             .zls_diagnostics = &.{},
             .zls_diagnostics_version = null,
             .version = version,
             .opened = false,
         };
-        log.debug("Zig sync doc-created uri={s}", .{uri});
-    }
-
-    const doc = gop.value_ptr;
-    doc.version = version;
-    doc.source_text = source_text;
-    if (doc.generation_error) |message| {
-        middleware.allocator.free(message);
-        doc.generation_error = null;
-    }
-    freeStoredDiagnostics(middleware.allocator, doc.grammar_diagnostics);
-    doc.grammar_diagnostics = &.{};
-
-    const generation_start = logStart(middleware.io);
-    const generated = runZitron(middleware.allocator, middleware.io, doc.source_path, source_text) catch |err| {
-        log.warn("Zitron generation failed for '{s}': {}", .{ doc.source_path, err });
-        doc.generation_error = try middleware.allocator.dupe(u8, @errorName(err));
-        freeStoredDiagnostics(middleware.allocator, doc.zls_diagnostics);
-        doc.zls_diagnostics = &.{};
-        doc.zls_diagnostics_version = null;
+        source_path = &.{};
+        generated_uri = &.{};
+        owned_source_text = &.{};
+        errdefer generation.deinit(middleware.allocator);
+        try middleware.publishGeneration(uri, &generation, start);
         return;
     };
     defer middleware.allocator.free(generated.stderr);
-    doc.grammar_diagnostics = try parseZitronDiagnostics(middleware.allocator, generated.stderr);
+
+    var grammar_diagnostics = try parseZitronDiagnostics(middleware.allocator, generated.stderr);
+    errdefer if (grammar_diagnostics.len != 0) freeStoredDiagnostics(middleware.allocator, grammar_diagnostics);
+
+    var generation_error: ?[]u8 = null;
+    errdefer if (generation_error) |message| middleware.allocator.free(message);
+    var generated_text: []u8 = undefined;
+    var generated_text_needs_free = false;
+    errdefer if (generated_text_needs_free) middleware.allocator.free(generated_text);
+    var code_map: CodeMap = .{};
+    var code_map_needs_deinit = true;
+    errdefer if (code_map_needs_deinit) code_map.deinit(middleware.allocator);
+
     if (zitronOutputFailedWithoutStdout(generated.term, generated.stdout.len)) {
-        log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ doc.source_path, generated.stderr });
+        log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ source_path, generated.stderr });
         middleware.allocator.free(generated.stdout);
-        doc.generation_error = try middleware.allocator.dupe(u8, generated.stderr);
-        freeStoredDiagnostics(middleware.allocator, doc.zls_diagnostics);
-        doc.zls_diagnostics = &.{};
-        doc.zls_diagnostics_version = null;
-        return;
-    }
-    if (zitronTermFailed(generated.term)) {
-        log.debug("Zitron generation exited with errors for '{s}' but produced stdout; continuing optimistically: {s}", .{
-            doc.source_path,
-            generated.stderr,
+        generated_text = try middleware.allocator.alloc(u8, 0);
+        generation_error = try middleware.allocator.dupe(u8, generated.stderr);
+    } else {
+        generated_text = generated.stdout;
+        generated_text_needs_free = true;
+        if (zitronTermFailed(generated.term)) {
+            log.debug("Zitron generation exited with errors for '{s}' but produced stdout; publishing generated text: {s}", .{
+                source_path,
+                generated.stderr,
+            });
+        }
+        log.debug("Zig sync generated uri={s} generated_bytes={} stderr_bytes={} elapsed_ns={}", .{
+            uri,
+            generated_text.len,
+            generated.stderr.len,
+            elapsedNs(middleware.io, generation_start),
         });
+        try code_map.update(middleware.allocator, source_root, generated_text, source_path);
+        log.debug("Zig sync code-map uri={s} spans={}", .{ uri, code_map.len() });
     }
-    errdefer middleware.allocator.free(generated.stdout);
-    log.debug("Zig sync generated uri={s} generated_bytes={} stderr_bytes={} elapsed_ns={}", .{
-        uri,
-        generated.stdout.len,
-        generated.stderr.len,
-        elapsedNs(middleware.io, generation_start),
-    });
 
-    doc.translator_cache.reset(middleware.allocator);
-    try doc.code_map.update(middleware.allocator, source_root, generated.stdout, doc.source_path);
-    log.debug("Zig sync code-map uri={s} spans={}", .{ uri, doc.code_map.len() });
+    var generation = GeneratedDocument{
+        .generation_id = generation_id,
+        .source_uri = try middleware.allocator.dupe(u8, uri),
+        .source_path = source_path,
+        .source_text = owned_source_text,
+        .generated_uri = generated_uri,
+        .generated_text = generated_text,
+        .code_map = code_map,
+        .generation_error = generation_error,
+        .grammar_diagnostics = grammar_diagnostics,
+        .zls_diagnostics = &.{},
+        .zls_diagnostics_version = null,
+        .version = version,
+        .opened = false,
+    };
+    source_path = &.{};
+    generated_uri = &.{};
+    owned_source_text = &.{};
+    grammar_diagnostics = &.{};
+    generation_error = null;
+    generated_text_needs_free = false;
+    code_map_needs_deinit = false;
+    errdefer generation.deinit(middleware.allocator);
+    try middleware.publishGeneration(uri, &generation, start);
+}
 
-    if (doc.opened) {
-        var text_changes = try diff.textChanges(middleware.allocator, doc.generated_text, generated.stdout, .@"utf-8");
-        defer text_changes.deinit(middleware.allocator);
+fn middlewarePublishGeneration(
+    middleware: *Middleware,
+    uri: []const u8,
+    generation: *GeneratedDocument,
+    start: std.Io.Timestamp,
+) Error!void {
+    var text_changes: ?diff.TextChanges = null;
+    defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
+    var notify_kind: enum { none, open, change } = .none;
+    var notify_uri: []const u8 = &.{};
+    var notify_version: i32 = 0;
+    var notify_text: []const u8 = &.{};
+    var notify_generated_bytes: usize = 0;
+    var log_version: i32 = 0;
+    var log_opened = false;
+    var log_generated_bytes: usize = 0;
+    var log_span_count: usize = 0;
 
-        if (text_changes.items.len != 0) {
+    {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+
+        const state = middleware.documents.getPtr(uri) orelse {
+            log.debug("Zig sync stale generation dropped uri={s} version={} reason=closed", .{ uri, generation.version });
+            generation.deinit(middleware.allocator);
+            generation.* = undefined;
+            return;
+        };
+        if (generation.version != state.latest_requested_version) {
+            log.debug("Zig sync stale generation dropped uri={s} version={} latest={}", .{
+                uri,
+                generation.version,
+                state.latest_requested_version,
+            });
+            generation.deinit(middleware.allocator);
+            generation.* = undefined;
+            return;
+        }
+
+        const send_to_zls = generation.generation_error == null;
+        if (send_to_zls and state.opened) {
+            const current = state.current orelse return error.MissingGeneratedDocument;
+            text_changes = try diff.textChanges(middleware.allocator, current.generated_text, generation.generated_text, .@"utf-8");
+        }
+
+        if (send_to_zls) {
+            notify_uri = generation.generated_uri;
+            notify_version = generation.version;
+            notify_generated_bytes = generation.generated_text.len;
+            if (state.opened) {
+                const changes = text_changes orelse return error.MissingGeneratedDocument;
+                if (changes.items.len != 0) {
+                    notify_kind = .change;
+                    state.zls_sync_count += 1;
+                    state.zls_synced_generation_id = generation.generation_id;
+                } else {
+                    log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
+                        generation.generated_uri,
+                        generation.version,
+                    });
+                }
+            } else {
+                notify_kind = .open;
+                notify_text = generation.generated_text;
+                state.opened = true;
+                state.zls_sync_count += 1;
+                state.zls_synced_generation_id = generation.generation_id;
+            }
+        }
+
+        if (state.current) |*old| old.deinit(middleware.allocator);
+        state.current = generation.*;
+        state.in_flight_version = null;
+        generation.* = undefined;
+        const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingGeneratedDocument;
+        log_version = doc.version;
+        log_opened = state.opened;
+        log_generated_bytes = doc.generated_text.len;
+        log_span_count = doc.code_map.len();
+    }
+
+    switch (notify_kind) {
+        .none => {},
+        .change => {
+            const changes = text_changes orelse return error.MissingGeneratedDocument;
             log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} generated_bytes={}", .{
-                doc.generated_uri,
-                version,
-                text_changes.items.len,
-                generated.stdout.len,
+                notify_uri,
+                notify_version,
+                changes.items.len,
+                notify_generated_bytes,
             });
             try middleware.zls_transport.transport.writeNotification(
                 middleware.io,
@@ -499,49 +686,42 @@ fn middlewareSyncDocument(
                 "textDocument/didChange",
                 lsp.ParamsType("textDocument/didChange"),
                 .{
-                    .textDocument = .{ .uri = doc.generated_uri, .version = version },
-                    .contentChanges = text_changes.items,
+                    .textDocument = .{ .uri = notify_uri, .version = notify_version },
+                    .contentChanges = changes.items,
                 },
                 .{ .emit_null_optional_fields = false },
             );
-        } else {
-            log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
-                doc.generated_uri,
-                version,
+        },
+        .open => {
+            log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
+                notify_uri,
+                notify_version,
+                notify_generated_bytes,
             });
-        }
-    } else {
-        log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
-            doc.generated_uri,
-            version,
-            generated.stdout.len,
-        });
-        try middleware.zls_transport.transport.writeNotification(
-            middleware.io,
-            middleware.allocator,
-            "textDocument/didOpen",
-            lsp.ParamsType("textDocument/didOpen"),
-            .{
-                .textDocument = .{
-                    .uri = doc.generated_uri,
-                    .languageId = .{ .custom_value = "zig" },
-                    .version = version,
-                    .text = generated.stdout,
+            try middleware.zls_transport.transport.writeNotification(
+                middleware.io,
+                middleware.allocator,
+                "textDocument/didOpen",
+                lsp.ParamsType("textDocument/didOpen"),
+                .{
+                    .textDocument = .{
+                        .uri = notify_uri,
+                        .languageId = .{ .custom_value = "zig" },
+                        .version = notify_version,
+                        .text = notify_text,
+                    },
                 },
-            },
-            .{ .emit_null_optional_fields = false },
-        );
-        doc.opened = true;
+                .{ .emit_null_optional_fields = false },
+            );
+        },
     }
 
-    middleware.allocator.free(doc.generated_text);
-    doc.generated_text = generated.stdout;
     log.debug("Zig sync -> uri={s} version={} opened={} generated_bytes={} spans={} elapsed_ns={}", .{
         uri,
-        version,
-        doc.opened,
-        doc.generated_text.len,
-        doc.code_map.len(),
+        log_version,
+        log_opened,
+        log_generated_bytes,
+        log_span_count,
         elapsedNs(middleware.io, start),
     });
 }
@@ -630,24 +810,34 @@ fn middlewareHandleZlsDiagnostics(
     defer parsed.deinit();
 
     const params = parsed.value;
-    const doc = middleware.documentForGeneratedUri(params.uri) orelse {
+    middleware.documents_mutex.lockUncancelable(middleware.io);
+    defer middleware.documents_mutex.unlock(middleware.io);
+
+    const state = middleware.documentForGeneratedUri(params.uri) orelse {
         log.debug("ZLS diagnostics ignored uri={s} reason=unknown_generated_uri count={}", .{
             params.uri,
             params.diagnostics.len,
         });
         return null;
     };
+    const doc = state.currentForVersion(params.version) orelse {
+        const current_version = if (state.current) |current| current.version else null;
+        log.debug("ZLS diagnostics ignored uri={s} reason=stale_or_ambiguous_version zls_version={?} current_version={?} count={}", .{
+            params.uri,
+            params.version,
+            current_version,
+            params.diagnostics.len,
+        });
+        return null;
+    };
 
-    if (params.version) |diagnostic_version| {
-        if (diagnostic_version != doc.version) {
-            log.debug("ZLS diagnostics ignored uri={s} reason=stale_version zls_version={} current_version={} count={}", .{
-                params.uri,
-                diagnostic_version,
-                doc.version,
-                params.diagnostics.len,
-            });
-            return null;
-        }
+    if (params.version == null and state.in_flight_version != null) {
+        log.debug("ZLS diagnostics ignored uri={s} reason=null_version_in_flight current_version={} count={}", .{
+            params.uri,
+            doc.version,
+            params.diagnostics.len,
+        });
+        return null;
     }
 
     freeStoredDiagnostics(middleware.allocator, doc.zls_diagnostics);
@@ -688,12 +878,14 @@ fn translateZlsDiagnostics(
         translated.deinit(allocator);
     }
 
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(allocator);
     var context = RequestTranslationContext{
         .allocator = allocator,
         .map = &doc.code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -746,21 +938,29 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
 fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
     const start = logStart(middleware.io);
     log.debug("Zig close <- uri={s}", .{uri});
-    const removed = middleware.documents.fetchRemove(uri) orelse return;
+
+    const removed = blk: {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        break :blk middleware.documents.fetchRemove(uri) orelse return;
+    };
+
     middleware.allocator.free(removed.key);
-    var doc = removed.value;
-    if (doc.opened) {
-        log.debug("ZLS <- textDocument/didClose uri={s}", .{doc.generated_uri});
-        middleware.zls_transport.transport.writeNotification(
-            middleware.io,
-            middleware.allocator,
-            "textDocument/didClose",
-            lsp.ParamsType("textDocument/didClose"),
-            .{ .textDocument = .{ .uri = doc.generated_uri } },
-            .{ .emit_null_optional_fields = false },
-        ) catch {};
+    var state = removed.value;
+    if (state.opened) {
+        if (state.currentGeneration()) |generation| {
+            log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.generated_uri});
+            middleware.zls_transport.transport.writeNotification(
+                middleware.io,
+                middleware.allocator,
+                "textDocument/didClose",
+                lsp.ParamsType("textDocument/didClose"),
+                .{ .textDocument = .{ .uri = generation.generated_uri } },
+                .{ .emit_null_optional_fields = false },
+            ) catch {};
+        }
     }
-    doc.deinit(middleware.allocator);
+    state.deinit(middleware.allocator);
     log.debug("Zig close -> uri={s} elapsed_ns={}", .{ uri, elapsedNs(middleware.io, start) });
 }
 
@@ -781,12 +981,14 @@ fn middlewareForwardHover(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -835,12 +1037,14 @@ fn middlewareForwardDefinition(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -901,12 +1105,14 @@ fn middlewareForwardReferences(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -963,12 +1169,14 @@ fn middlewareForwardCompletion(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1083,12 +1291,14 @@ fn middlewareForwardInlayHint(
         return null;
     }
 
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = resolved_active_span_index,
     };
     defer translation_context.deinit();
@@ -1123,12 +1333,14 @@ fn middlewareForwardDocumentSymbols(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer translation_context.deinit();
@@ -1164,12 +1376,14 @@ fn middlewareForwardRename(
         });
         return null;
     };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
     var translation_context = RequestTranslationContext{
         .allocator = middleware.allocator,
         .map = code_map,
         .source_text = doc.source_text,
         .generated_text = doc.generated_text,
-        .cache = &doc.translator_cache,
+        .cache = &translation_cache,
         .active_span_index = span_index,
     };
     defer translation_context.deinit();
@@ -1230,6 +1444,8 @@ fn middlewareAliasCodeBlockRenameEdits(
     errdefer edits.deinit(arena);
     var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer seen_starts.deinit(arena);
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
 
     for (source_ranges) |source_range| {
         const span_index = doc.code_map.indexForSourceRange(source_range) orelse {
@@ -1239,7 +1455,7 @@ fn middlewareAliasCodeBlockRenameEdits(
             });
             return null;
         };
-        const translator = try doc.translator_cache.get(
+        const translator = try translation_cache.get(
             middleware.allocator,
             &doc.code_map,
             doc.source_text,
@@ -3359,15 +3575,17 @@ fn middlewareNextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
 }
 
 fn middlewareDocumentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
-    const doc = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
+    const state = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
+    const doc = state.currentGeneration() orelse return error.MissingGeneratedDocument;
     if (doc.generation_error != null) return error.RequestFailed;
     return doc;
 }
 
-fn middlewareDocumentForGeneratedUri(middleware: *Middleware, generated_uri: []const u8) ?*GeneratedDocument {
+fn middlewareDocumentForGeneratedUri(middleware: *Middleware, generated_uri: []const u8) ?*DocumentState {
     var it = middleware.documents.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.value_ptr.generated_uri, generated_uri)) return entry.value_ptr;
+        const current = entry.value_ptr.current orelse continue;
+        if (std.mem.eql(u8, current.generated_uri, generated_uri)) return entry.value_ptr;
     }
     return null;
 }
@@ -3458,6 +3676,50 @@ fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: 
     const tree = try parseZitronTreeForTest(effective_source);
     defer tree.destroy();
     try map.update(testing_allocator, tree.rootNode(), generated_text, source_path);
+}
+
+fn makeTestGeneratedDocument(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    version: i32,
+    source_text: []const u8,
+    generated_text: []const u8,
+) !GeneratedDocument {
+    var map = try parseCodeMapForTest(source_text, generated_text, "source.zy");
+    errdefer map.deinit(allocator);
+
+    return .{
+        .generation_id = @intCast(version),
+        .source_uri = try allocator.dupe(u8, uri),
+        .source_path = try allocator.dupe(u8, "source.zy"),
+        .source_text = try allocator.dupe(u8, source_text),
+        .generated_uri = try generatedUriForSourceUri(allocator, uri),
+        .generated_text = try allocator.dupe(u8, generated_text),
+        .code_map = map,
+        .generation_error = null,
+        .grammar_diagnostics = &.{},
+        .zls_diagnostics = &.{},
+        .zls_diagnostics_version = null,
+        .version = version,
+        .opened = false,
+    };
+}
+
+fn makeTestDocumentState(
+    allocator: std.mem.Allocator,
+    uri: []const u8,
+    version: i32,
+    source_text: []const u8,
+    generated_text: []const u8,
+) !DocumentState {
+    return .{
+        .current = try makeTestGeneratedDocument(allocator, uri, version, source_text, generated_text),
+        .latest_requested_version = version,
+        .in_flight_version = null,
+        .opened = false,
+        .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
+    };
 }
 
 fn requestTranslationContextForTest(
@@ -3780,32 +4042,40 @@ test "alias code block rename refuses unmapped source blocks" {
         .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
+        .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
         .next_request_id = 1,
     };
     const key = try testing_allocator.dupe(u8, uri);
     errdefer testing_allocator.free(key);
     try middleware.documents.put(testing_allocator, key, .{
-        .source_uri = try testing_allocator.dupe(u8, uri),
-        .source_path = try testing_allocator.dupe(u8, "source.zy"),
-        .source_text = source,
-        .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
-        .generated_text = try testing_allocator.dupe(u8, generated),
-        .code_map = map,
-        .translator_cache = .{},
-        .generation_error = null,
-        .grammar_diagnostics = &.{},
-        .zls_diagnostics = &.{},
-        .zls_diagnostics_version = null,
-        .version = 1,
+        .current = .{
+            .source_uri = try testing_allocator.dupe(u8, uri),
+            .source_path = try testing_allocator.dupe(u8, "source.zy"),
+            .source_text = try testing_allocator.dupe(u8, source),
+            .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+            .generated_text = try testing_allocator.dupe(u8, generated),
+            .code_map = map,
+            .generation_error = null,
+            .grammar_diagnostics = &.{},
+            .zls_diagnostics = &.{},
+            .zls_diagnostics_version = null,
+            .version = 1,
+            .opened = false,
+        },
+        .latest_requested_version = 1,
+        .in_flight_version = null,
         .opened = false,
+        .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
     });
     errdefer {
         const removed = middleware.documents.fetchRemove(uri).?;
         testing_allocator.free(removed.key);
-        var doc = removed.value;
-        doc.deinit(testing_allocator);
+        var state = removed.value;
+        state.deinit(testing_allocator);
         middleware.documents.deinit(testing_allocator);
     }
 
@@ -3844,8 +4114,10 @@ test "forward requests return null while generation has errors" {
         .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
+        .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
         .next_request_id = 1,
     };
     var zig_middleware: ZigMiddleware = .{ .mode = .{ .enabled = &middleware } };
@@ -3856,19 +4128,25 @@ test "forward requests return null while generation has errors" {
             const key = try testing_allocator.dupe(u8, uri);
             errdefer testing_allocator.free(key);
             try mware.documents.put(testing_allocator, key, .{
-                .source_uri = try testing_allocator.dupe(u8, uri),
-                .source_path = try testing_allocator.dupe(u8, "source.zy"),
-                .source_text = source,
-                .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
-                .generated_text = try testing_allocator.dupe(u8, ""),
-                .code_map = .{},
-                .translator_cache = .{},
-                .generation_error = try testing_allocator.dupe(u8, "generation failed"),
-                .grammar_diagnostics = &.{},
-                .zls_diagnostics = &.{},
-                .zls_diagnostics_version = null,
-                .version = 1,
+                .current = .{
+                    .source_uri = try testing_allocator.dupe(u8, uri),
+                    .source_path = try testing_allocator.dupe(u8, "source.zy"),
+                    .source_text = try testing_allocator.dupe(u8, source),
+                    .generated_uri = try generatedUriForSourceUri(testing_allocator, uri),
+                    .generated_text = try testing_allocator.dupe(u8, ""),
+                    .code_map = .{},
+                    .generation_error = try testing_allocator.dupe(u8, "generation failed"),
+                    .grammar_diagnostics = &.{},
+                    .zls_diagnostics = &.{},
+                    .zls_diagnostics_version = null,
+                    .version = 1,
+                    .opened = false,
+                },
+                .latest_requested_version = 1,
+                .in_flight_version = null,
                 .opened = false,
+                .zls_sync_count = 0,
+                .zls_synced_generation_id = null,
             });
         },
     }
@@ -3877,8 +4155,8 @@ test "forward requests return null while generation has errors" {
         .enabled => |mware| {
             const removed = mware.documents.fetchRemove(uri).?;
             testing_allocator.free(removed.key);
-            var doc = removed.value;
-            doc.deinit(testing_allocator);
+            var state = removed.value;
+            state.deinit(testing_allocator);
             mware.documents.deinit(testing_allocator);
         },
     };
@@ -3977,11 +4255,10 @@ test "ZLS diagnostics translate to source ranges and default source" {
     var doc: GeneratedDocument = .{
         .source_uri = try testing_allocator.dupe(u8, "file:///source.zy"),
         .source_path = try testing_allocator.dupe(u8, "source.zy"),
-        .source_text = source,
+        .source_text = try testing_allocator.dupe(u8, source),
         .generated_uri = try testing_allocator.dupe(u8, "file:///source.zitron.zig"),
         .generated_text = try testing_allocator.dupe(u8, generated),
         .code_map = map,
-        .translator_cache = .{},
         .generation_error = null,
         .grammar_diagnostics = &.{},
         .zls_diagnostics = &.{},
@@ -4002,6 +4279,199 @@ test "ZLS diagnostics translate to source ranges and default source" {
     try expectEqualStrings("zls-code", translated[0].code.?.string);
     try expectEqual(@as(usize, 1), translated[0].tags.?.len);
     try expectEqual(types.Diagnostic.Tag.Unnecessary, translated[0].tags.?[0]);
+}
+
+test "document state resolves current generation by version" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    try std.testing.expect(state.currentForVersion(1) != null);
+    try std.testing.expect(state.currentForVersion(2) == null);
+}
+
+test "document state rejects version-null diagnostics while generation is in flight" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
+    state.in_flight_version = 2;
+    try std.testing.expect(state.currentForVersion(null) == null);
+}
+
+test "document state accepts version-null diagnostics after repeated ZLS syncs when current" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
+    try std.testing.expect(state.currentForVersion(null) != null);
+    state.zls_sync_count = 2;
+    try std.testing.expect(state.currentForVersion(null) != null);
+}
+
+test "document state rejects version-null diagnostics after unsynced generation replacement" {
+    var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
+    defer state.deinit(testing_allocator);
+
+    state.zls_sync_count = 1;
+    state.zls_synced_generation_id = state.current.?.generation_id;
+    state.latest_requested_version = 2;
+    const replacement = try makeTestGeneratedDocument(testing_allocator, "file:///source.zy", 2, "source", "generated");
+    try std.testing.expect(state.publishIfCurrent(testing_allocator, replacement));
+
+    try std.testing.expect(state.currentForVersion(null) == null);
+}
+
+test "document state does not publish stale generation" {
+    var state = DocumentState{
+        .current = null,
+        .latest_requested_version = 2,
+        .in_flight_version = 1,
+        .opened = false,
+        .zls_sync_count = 0,
+        .zls_synced_generation_id = null,
+    };
+    defer state.deinit(testing_allocator);
+
+    const stale = try makeTestGeneratedDocument(testing_allocator, "file:///source.zy", 1, "old", "old generated");
+    const published = state.publishIfCurrent(testing_allocator, stale);
+
+    try std.testing.expect(!published);
+    try std.testing.expect(state.current == null);
+}
+
+test "ZLS diagnostics for stale generation do not replace current diagnostics" {
+    const uri = "file:///source.zy";
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .reader_thread = null,
+        .response_mutex = .init,
+        .response_cond = .init,
+        .pending_responses = .empty,
+        .reader_failed = false,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+        .next_request_id = 1,
+    };
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, try makeTestDocumentState(
+        testing_allocator,
+        uri,
+        2,
+        "rule ::= TOKEN. { result = token; }",
+        "// #line 1 source.zy\n result = token;",
+    ));
+    defer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var state = removed.value;
+        state.deinit(testing_allocator);
+        middleware.documents.deinit(testing_allocator);
+    }
+
+    const params_json =
+        \\{
+        \\  "uri": "file:///source.zitron.zig",
+        \\  "version": 1,
+        \\  "diagnostics": []
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing_allocator, params_json, .{});
+    defer parsed.deinit();
+
+    const published = try middleware.handleZlsDiagnostics(parsed.value);
+    try std.testing.expect(published == null);
+    const state = middleware.documents.getPtr(uri).?;
+    const current = state.currentForVersion(2).?;
+    try expectEqual(@as(usize, 0), current.zls_diagnostics.len);
+    try std.testing.expect(current.zls_diagnostics_version == null);
+}
+
+test "ZLS diagnostics with null version publish after repeated current syncs" {
+    const uri = "file:///source.zy";
+    const source =
+        \\rule ::= value. {
+        \\    const result: MissingType = value;
+        \\}
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\    const result: MissingType = value;
+    ;
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .reader_thread = null,
+        .response_mutex = .init,
+        .response_cond = .init,
+        .pending_responses = .empty,
+        .reader_failed = false,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+        .next_request_id = 1,
+    };
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, try makeTestDocumentState(testing_allocator, uri, 2, source, generated));
+    defer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var state = removed.value;
+        state.deinit(testing_allocator);
+        middleware.documents.deinit(testing_allocator);
+    }
+    {
+        const state = middleware.documents.getPtr(uri).?;
+        state.zls_sync_count = 2;
+        state.zls_synced_generation_id = state.current.?.generation_id;
+    }
+
+    const params_json =
+        \\{
+        \\  "uri": "file:///source.zitron.zig",
+        \\  "version": null,
+        \\  "diagnostics": [{
+        \\    "range": {
+        \\      "start": { "line": 1, "character": 18 },
+        \\      "end": { "line": 1, "character": 29 }
+        \\    },
+        \\    "severity": 1,
+        \\    "source": "zls",
+        \\    "message": "use of undeclared identifier 'MissingType'"
+        \\  }]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing_allocator, params_json, .{});
+    defer parsed.deinit();
+
+    const published = (try middleware.handleZlsDiagnostics(parsed.value)).?;
+    defer testing_allocator.free(published.source_uri);
+
+    try expectEqual(@as(i32, 2), published.version);
+    try expectEqualStrings(uri, published.source_uri);
+    const state = middleware.documents.getPtr(uri).?;
+    const current = state.currentForVersion(2).?;
+    try expectEqual(@as(usize, 1), current.zls_diagnostics.len);
+    try expectEqual(@as(i32, 2), current.zls_diagnostics_version.?);
+    try expectEqualStrings("use of undeclared identifier 'MissingType'", current.zls_diagnostics[0].message);
 }
 
 test "request span translator applies source column offset" {

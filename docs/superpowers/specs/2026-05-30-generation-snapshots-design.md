@@ -68,7 +68,7 @@ fields while translating.
 | Translator cache | Owned by a generation but may remain mutable. | Shared reader/main access is possible. | Guard cache mutation, or remove caching from shared paths until ownership is clean. |
 | ZLS `didOpen` / `didChange` sent by us | Generated URI plus generated version derived from the generation. | A later source generation is sent before ZLS responds. | Later diagnostics can be stale and must be checked before translation. |
 | ZLS diagnostics with a version | Generated URI plus diagnostic version. | Diagnostic version is not the latest published generation for that generated URI. | Drop and log at debug level. |
-| ZLS diagnostics with `version = null` | No authoritative version. | Ambiguous if a generation is in flight or a newer generated sync was sent. | Accept only if exactly one latest published generation is unambiguous and no newer generated sync is pending or in flight; otherwise drop and log. |
+| ZLS diagnostics with `version = null` | No authoritative version. | Ambiguous if a generation is in flight, a newer generated sync was sent, or the current source generation was not the generation last sent to ZLS. | Accept only if exactly one latest published generation is unambiguous, no newer generated sync is pending or in flight, and the current generation is the generation last sent to ZLS; otherwise drop and log. |
 | Hover/completion/definition/references/inlay/document symbols/rename | Generation chosen at request start. | Detailed behavior deferred. | Route through generation handles; do not design retry/drop policy in this phase. |
 | Close document | Document lifecycle. | Diagnostics arrive after close. | Drop; no reachable generation should be mutated. |
 | Shutdown/deinit | Server lifecycle. | Reader thread can still receive ZLS messages. | Stop or drain reader ownership before freeing generations and maps. |
@@ -83,8 +83,8 @@ Initial compatibility rule:
 
 ```text
 Accept version-null diagnostics only when the generated URI has exactly one
-unambiguous latest published generation, no generation for that source is in
-flight, and no newer generated sync has been sent to ZLS.
+unambiguous generated sync for that source, the current published generation is
+the generation last sent to ZLS, and no generation for that source is in flight.
 ```
 
 Otherwise, drop the diagnostics and log the reason. This keeps compatibility
@@ -143,9 +143,9 @@ important design point is that the mutex protects publication and generation
 lookup; it is not the semantic model. The semantic model is explicit generation
 ownership.
 
-Translator caches are the one allowed mutable part inside a generation. They
-must either be guarded or removed from shared reader paths until the cache
-ownership is safe.
+Translator caches are not part of the published generation snapshot in the
+initial implementation. Translation paths use per-operation caches so source
+text, generated text, and code maps remain the only shared generation inputs.
 
 ## Deferred User-Facing Request Policy
 
