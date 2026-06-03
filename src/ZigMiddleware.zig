@@ -126,7 +126,6 @@ const DocumentState = struct {
             if (current.version != value) return null;
         } else {
             if (state.in_flight_version != null) return null;
-            if (state.zls_sync_count != 1) return null;
             if (state.zls_synced_generation_id != current.generation_id) return null;
         }
         return current;
@@ -4300,7 +4299,7 @@ test "document state rejects version-null diagnostics while generation is in fli
     try std.testing.expect(state.currentForVersion(null) == null);
 }
 
-test "document state accepts version-null diagnostics only before a second ZLS sync" {
+test "document state accepts version-null diagnostics after repeated ZLS syncs when current" {
     var state = try makeTestDocumentState(testing_allocator, "file:///source.zy", 1, "source", "generated");
     defer state.deinit(testing_allocator);
 
@@ -4308,7 +4307,7 @@ test "document state accepts version-null diagnostics only before a second ZLS s
     state.zls_synced_generation_id = state.current.?.generation_id;
     try std.testing.expect(state.currentForVersion(null) != null);
     state.zls_sync_count = 2;
-    try std.testing.expect(state.currentForVersion(null) == null);
+    try std.testing.expect(state.currentForVersion(null) != null);
 }
 
 test "document state rejects version-null diagnostics after unsynced generation replacement" {
@@ -4396,6 +4395,83 @@ test "ZLS diagnostics for stale generation do not replace current diagnostics" {
     const current = state.currentForVersion(2).?;
     try expectEqual(@as(usize, 0), current.zls_diagnostics.len);
     try std.testing.expect(current.zls_diagnostics_version == null);
+}
+
+test "ZLS diagnostics with null version publish after repeated current syncs" {
+    const uri = "file:///source.zy";
+    const source =
+        \\rule ::= value. {
+        \\    const result: MissingType = value;
+        \\}
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\    const result: MissingType = value;
+    ;
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .reader_thread = null,
+        .response_mutex = .init,
+        .response_cond = .init,
+        .pending_responses = .empty,
+        .reader_failed = false,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+        .next_request_id = 1,
+    };
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, try makeTestDocumentState(testing_allocator, uri, 2, source, generated));
+    defer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var state = removed.value;
+        state.deinit(testing_allocator);
+        middleware.documents.deinit(testing_allocator);
+    }
+    {
+        const state = middleware.documents.getPtr(uri).?;
+        state.zls_sync_count = 2;
+        state.zls_synced_generation_id = state.current.?.generation_id;
+    }
+
+    const params_json =
+        \\{
+        \\  "uri": "file:///source.zitron.zig",
+        \\  "version": null,
+        \\  "diagnostics": [{
+        \\    "range": {
+        \\      "start": { "line": 1, "character": 18 },
+        \\      "end": { "line": 1, "character": 29 }
+        \\    },
+        \\    "severity": 1,
+        \\    "source": "zls",
+        \\    "message": "use of undeclared identifier 'MissingType'"
+        \\  }]
+        \\}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing_allocator, params_json, .{});
+    defer parsed.deinit();
+
+    const published = (try middleware.handleZlsDiagnostics(parsed.value)).?;
+    defer testing_allocator.free(published.source_uri);
+
+    try expectEqual(@as(i32, 2), published.version);
+    try expectEqualStrings(uri, published.source_uri);
+    const state = middleware.documents.getPtr(uri).?;
+    const current = state.currentForVersion(2).?;
+    try expectEqual(@as(usize, 1), current.zls_diagnostics.len);
+    try expectEqual(@as(i32, 2), current.zls_diagnostics_version.?);
+    try expectEqualStrings("use of undeclared identifier 'MissingType'", current.zls_diagnostics[0].message);
 }
 
 test "request span translator applies source column offset" {
