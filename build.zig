@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const options = b.addOptions();
     options.addOption([]const u8, "fixture_path", "samples/calc.zy");
+    options.addOption([]const u8, "smoke_fixture_path", "samples/pikchr.zy");
 
     const lsp_module = b.dependency("lsp_kit", .{
         .target = target,

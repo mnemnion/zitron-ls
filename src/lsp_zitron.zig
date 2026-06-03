@@ -896,7 +896,19 @@ fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const
 
 /// Loads the configured fixture source into memory for smoke tests and helpers.
 pub fn loadFixtureAlloc(io: std.Io, allocator: std.mem.Allocator) FixtureError![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, build_options.fixture_path, allocator, .limited(64 * 1024));
+    return std.Io.Dir.cwd().readFileAlloc(io, build_options.fixture_path, allocator, .limited(1024 * 1024));
+}
+
+pub fn fixturePath() []const u8 {
+    return build_options.fixture_path;
+}
+
+pub fn loadSmokeFixtureAlloc(io: std.Io, allocator: std.mem.Allocator) FixtureError![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, build_options.smoke_fixture_path, allocator, .limited(1024 * 1024));
+}
+
+pub fn smokeFixturePath() []const u8 {
+    return build_options.smoke_fixture_path;
 }
 
 fn completionItemsContainLabel(items: []const types.CompletionItem, label: []const u8) bool {
