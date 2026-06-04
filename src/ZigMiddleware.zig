@@ -3262,31 +3262,7 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
         id,
         "initialize",
         lsp.ParamsType("initialize"),
-        .{
-            .processId = null,
-            .clientInfo = .{ .name = "lsp_zitron" },
-            .capabilities = .{
-                .general = .{
-                    .positionEncodings = &.{.@"utf-8"},
-                },
-                .textDocument = .{
-                    .hover = .{
-                        .contentFormat = &.{ .markdown, .plaintext },
-                    },
-                    .documentSymbol = .{
-                        .hierarchicalDocumentSymbolSupport = true,
-                    },
-                    .publishDiagnostics = .{
-                        .relatedInformation = true,
-                        .tagSupport = .{ .valueSet = &.{ .Unnecessary, .Deprecated } },
-                        .versionSupport = true,
-                        .codeDescriptionSupport = true,
-                        .dataSupport = true,
-                    },
-                    .inlayHint = .{},
-                },
-            },
-        },
+        zlsInitializeParams(),
         .{ .emit_null_optional_fields = false },
     );
     const wait_start = logStart(middleware.io);
@@ -3343,6 +3319,43 @@ fn middlewareInitializeZls(middleware: *Middleware) Error!void {
         middleware.zls_completion_triggers.len,
         elapsedNs(middleware.io, start),
     });
+}
+
+const zls_position_encodings = [_]types.PositionEncodingKind{.@"utf-8"};
+const zls_hover_content_formats = [_]types.MarkupKind{ .markdown, .plaintext };
+const zls_diagnostic_tags = [_]types.DiagnosticTag{ .Unnecessary, .Deprecated };
+
+fn zlsInitializeParams() types.InitializeParams {
+    return .{
+        .processId = null,
+        .clientInfo = .{ .name = "lsp_zitron" },
+        .capabilities = .{
+            .general = .{
+                .positionEncodings = &zls_position_encodings,
+            },
+            .textDocument = .{
+                .completion = .{
+                    .completionItem = .{
+                        .snippetSupport = true,
+                    },
+                },
+                .hover = .{
+                    .contentFormat = &zls_hover_content_formats,
+                },
+                .documentSymbol = .{
+                    .hierarchicalDocumentSymbolSupport = true,
+                },
+                .publishDiagnostics = .{
+                    .relatedInformation = true,
+                    .tagSupport = .{ .valueSet = &zls_diagnostic_tags },
+                    .versionSupport = true,
+                    .codeDescriptionSupport = true,
+                    .dataSupport = true,
+                },
+                .inlayHint = .{},
+            },
+        },
+    };
 }
 
 fn dupeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) OOM![]const []const u8 {
@@ -4127,6 +4140,15 @@ test "alias code block rename refuses unmapped source blocks" {
     var doc = removed.value;
     doc.deinit(testing_allocator);
     middleware.documents.deinit(testing_allocator);
+}
+
+test "ZLS initialize advertises snippet completion support" {
+    const params = zlsInitializeParams();
+    const text_document = params.capabilities.textDocument orelse return error.UnexpectedCapability;
+    const completion = text_document.completion orelse return error.UnexpectedCapability;
+    const completion_item = completion.completionItem orelse return error.UnexpectedCapability;
+
+    try std.testing.expect(completion_item.snippetSupport orelse false);
 }
 
 test "forward requests return null while generation has errors" {
