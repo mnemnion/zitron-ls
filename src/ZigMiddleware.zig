@@ -2213,6 +2213,34 @@ const GeneratedPositionCursor = struct {
         return cursor.sourcePositionForRel(translator, source_rel);
     }
 
+    fn generatedRangeToSource(cursor: *GeneratedPositionCursor, range: types.Range) OOM!?types.Range {
+        const translator = try cursor.translatorForPosition(range.start) orelse return null;
+        if (!translator.containsGeneratedPosition(range.start, false) or
+            !translator.containsGeneratedPosition(range.end, true))
+        {
+            return null;
+        }
+
+        const generated_start = cursor.generatedIndexForPosition(translator, range.start) orelse return null;
+        const generated_end = cursor.generatedIndexForPosition(translator, range.end) orelse return null;
+        const rel_start = generated_start - translator.gen_span.generated_range.start;
+        const rel_end = generated_end - translator.gen_span.generated_range.start;
+        if (rel_end < rel_start or !translator.generatedIntervalShared(rel_start, rel_end)) return null;
+
+        const start_rel = switch (cursor.generatedOffsetToSource(translator, rel_start)) {
+            .shared => |source_rel| source_rel,
+            .mutant => return null,
+        };
+        const end_rel = switch (cursor.generatedOffsetToSource(translator, rel_end)) {
+            .shared => |source_rel| source_rel,
+            .mutant => return null,
+        };
+        return .{
+            .start = cursor.sourcePositionForRel(translator, start_rel),
+            .end = cursor.sourcePositionForRel(translator, end_rel),
+        };
+    }
+
     fn translatorForPosition(cursor: *GeneratedPositionCursor, position: types.Position) OOM!?*SpanTranslator {
         if (cursor.span_index) |span_index| {
             const span = cursor.context.map.gen_span.items[span_index];
@@ -2946,7 +2974,10 @@ pub fn translateDocumentSymbols(
     map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentSymbol {
     return switch (result) {
-        .document_symbols => |symbols| translateDocumentSymbolSlice(arena, symbols, map),
+        .document_symbols => |symbols| {
+            var position_cursor = GeneratedPositionCursor{ .context = map };
+            return translateDocumentSymbolSlice(arena, symbols, &position_cursor);
+        },
         .symbol_informations => null,
     };
 }
@@ -3020,19 +3051,19 @@ fn translateLocation(location: types.Location, map: *RequestTranslationContext, 
 fn translateDocumentSymbolSlice(
     arena: std.mem.Allocator,
     symbols: []const types.DocumentSymbol,
-    map: *RequestTranslationContext,
+    position_cursor: *GeneratedPositionCursor,
 ) OOM!?[]const types.DocumentSymbol {
     var translated: std.ArrayList(types.DocumentSymbol) = .empty;
     for (symbols) |symbol| {
         if (startsWithYy(symbol.name)) {
             if (symbol.children) |children| {
-                if (try translateDocumentSymbolSlice(arena, children, map)) |mapped_children| {
+                if (try translateDocumentSymbolSlice(arena, children, position_cursor)) |mapped_children| {
                     try translated.appendSlice(arena, mapped_children);
                 }
             }
             continue;
         }
-        if (try translateDocumentSymbol(arena, symbol, map)) |mapped| {
+        if (try translateDocumentSymbol(arena, symbol, position_cursor)) |mapped| {
             try translated.append(arena, mapped);
         }
     }
@@ -3043,7 +3074,7 @@ fn translateDocumentSymbolSlice(
 fn translateDocumentSymbol(
     arena: std.mem.Allocator,
     symbol: types.DocumentSymbol,
-    map: *RequestTranslationContext,
+    position_cursor: *GeneratedPositionCursor,
 ) OOM!?types.DocumentSymbol {
     return .{
         .name = symbol.name,
@@ -3051,9 +3082,9 @@ fn translateDocumentSymbol(
         .kind = symbol.kind,
         .tags = symbol.tags,
         .deprecated = symbol.deprecated,
-        .range = (try map.generatedRangeToSource(symbol.range)) orelse return null,
-        .selectionRange = (try map.generatedRangeToSource(symbol.selectionRange)) orelse return null,
-        .children = if (symbol.children) |children| try translateDocumentSymbolSlice(arena, children, map) else null,
+        .range = (try position_cursor.generatedRangeToSource(symbol.range)) orelse return null,
+        .selectionRange = (try position_cursor.generatedRangeToSource(symbol.selectionRange)) orelse return null,
+        .children = if (symbol.children) |children| try translateDocumentSymbolSlice(arena, children, position_cursor) else null,
     };
 }
 
@@ -5103,6 +5134,56 @@ test "translates inlay hints on first block line with source column skew" {
 
     try expectEqual(@as(usize, 1), translated.len);
     try expectEqual(types.Position{ .line = 0, .character = prefix.len + 12 }, translated[0].position);
+}
+
+test "generated position cursor translates generated ranges" {
+    const prefix = "prefix ";
+    const source = prefix ++ "const answer = 42;";
+    const generated = "const answer = 42;";
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.gen_span.append(testing_allocator, .{
+        .source_line = 0,
+        .generated_line = 0,
+        .line_count = 1,
+        .generated_range = .{ .start = 0, .end = generated.len },
+    });
+    try map.src_range.append(testing_allocator, .{
+        .start_byte = prefix.len,
+        .end_byte = @intCast(source.len),
+        .start_point = .{ .row = 0, .column = prefix.len },
+        .end_point = .{ .row = 0, .column = @intCast(source.len) },
+    });
+    try map.rebuildSourceOrder(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var cursor = GeneratedPositionCursor{ .context = &context };
+    try expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 13 },
+        .end = .{ .line = 0, .character = 19 },
+    }, (try cursor.generatedRangeToSource(.{
+        .start = .{ .line = 0, .character = 6 },
+        .end = .{ .line = 0, .character = 12 },
+    })) orelse return error.UnexpectedCodeMap);
+    try expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 22 },
+        .end = .{ .line = 0, .character = 24 },
+    }, (try cursor.generatedRangeToSource(.{
+        .start = .{ .line = 0, .character = 15 },
+        .end = .{ .line = 0, .character = 17 },
+    })) orelse return error.UnexpectedCodeMap);
 }
 
 test "translates inlay hints with one cached diff per touched block" {
