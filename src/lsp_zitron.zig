@@ -49,6 +49,14 @@ fn serverCapabilities(
         .documentSymbolProvider = .{ .bool = true },
         .renameProvider = .{ .bool = true },
         .inlayHintProvider = .{ .inlay_hint_options = .{} },
+        .semanticTokensProvider = .{ .semantic_tokens_options = .{
+            .legend = .{
+                .tokenTypes = &ZigMiddleware.semantic_token_types,
+                .tokenModifiers = &ZigMiddleware.semantic_token_modifiers,
+            },
+            .range = .{ .bool = true },
+            .full = .{ .semantic_tokens_full_delta = .{ .delta = true } },
+        } },
     };
 }
 
@@ -279,6 +287,7 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
+            null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
@@ -301,7 +310,7 @@ pub const Server = struct {
             params.contentChanges.len,
         });
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
-        try doc.updateIncremental(
+        const change_range = try doc.updateIncremental(
             server.allocator,
             params.textDocument.version,
             params.contentChanges,
@@ -312,6 +321,10 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
+            if (change_range) |range| .{
+                .previous = range.previous,
+                .current = range.current,
+            } else null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
@@ -639,6 +652,72 @@ pub const Server = struct {
             params.textDocument.uri,
             local_symbols.len,
             owned_symbols.len,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/full"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/full uri={s}", .{params.textDocument.uri});
+        const result = try server.zig_middleware.forwardSemanticTokensFull(arena, params.textDocument.uri, params);
+        log.debug("LSP -> textDocument/semanticTokens/full uri={s} null={} token_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            if (result) |tokens| tokens.data.len / 5 else 0,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/full/delta"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensDeltaParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/full/delta uri={s} previous={s}", .{
+            params.textDocument.uri,
+            params.previousResultId,
+        });
+        const result = try server.zig_middleware.forwardSemanticTokensFullDelta(arena, params.textDocument.uri, params);
+        const token_count = if (result) |tokens| switch (tokens) {
+            .semantic_tokens => |full| full.data.len / 5,
+            .semantic_tokens_delta => 0,
+        } else 0;
+        const edit_count = if (result) |tokens| switch (tokens) {
+            .semantic_tokens => 0,
+            .semantic_tokens_delta => |delta| delta.edits.len,
+        } else 0;
+        log.debug("LSP -> textDocument/semanticTokens/full/delta uri={s} null={} token_count={} edit_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            token_count,
+            edit_count,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/range"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensRangeParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/range") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/range uri={s} range={any}", .{
+            params.textDocument.uri,
+            params.range,
+        });
+        const result = try server.zig_middleware.forwardSemanticTokensRange(arena, params.textDocument.uri, params);
+        log.debug("LSP -> textDocument/semanticTokens/range uri={s} null={} token_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            if (result) |tokens| tokens.data.len / 5 else 0,
             server.logElapsedNs(start),
         });
         return result;
@@ -1258,7 +1337,7 @@ test "incremental tree-sitter reparse matches fresh parse" {
     var incremental = try Document.init(testing_allocator, 1, sample);
     defer incremental.deinit(testing_allocator);
 
-    try incremental.updateIncremental(testing_allocator, 2, &.{
+    _ = try incremental.updateIncremental(testing_allocator, 2, &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },

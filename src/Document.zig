@@ -54,6 +54,11 @@ pub const Resolution = union(enum) {
     symbol: SemanticSymbol,
 };
 
+pub const ChangeRange = struct {
+    previous: types.Range,
+    current: types.Range,
+};
+
 /// Errors that can occur while parsing or updating a document.
 pub const Error = OOM || ts.Query.Error || error{
     IncompatibleLanguage,
@@ -100,7 +105,7 @@ pub fn updateIncremental(
     version: i32,
     content_changes: []const types.TextDocumentContentChangeEvent,
     offset_encoding: lsp.offsets.Encoding,
-) Error!void {
+) Error!?ChangeRange {
     var applied_change = try diff.applyContentChangesWithEdits(
         allocator,
         document.source,
@@ -128,6 +133,30 @@ pub fn updateIncremental(
         .version = version,
         .parsed = parsed.summary,
         .tree = parsed.tree,
+    };
+    return changeRangeFromInputEdits(applied_change.input_edits.items);
+}
+
+fn changeRangeFromInputEdits(input_edits: []const ts.InputEdit) ?ChangeRange {
+    if (input_edits.len != 1) return null;
+
+    const edit = input_edits[0];
+    return .{
+        .previous = .{
+            .start = positionFromTsPoint(edit.start_point),
+            .end = positionFromTsPoint(edit.old_end_point),
+        },
+        .current = .{
+            .start = positionFromTsPoint(edit.start_point),
+            .end = positionFromTsPoint(edit.new_end_point),
+        },
+    };
+}
+
+fn positionFromTsPoint(point: ts.Point) types.Position {
+    return .{
+        .line = point.row,
+        .character = point.column,
     };
 }
 
@@ -1677,7 +1706,7 @@ test "updateIncremental preserves parse correctness" {
     defer document.deinit(testing_allocator);
 
     const end_position = lsp.offsets.indexToPosition(document.source, document.source.len, .@"utf-8");
-    try document.updateIncremental(
+    const newline_change = try document.updateIncremental(
         testing_allocator,
         2,
         &.{
@@ -1692,6 +1721,15 @@ test "updateIncremental preserves parse correctness" {
         },
         .@"utf-8",
     );
+    const change = newline_change orelse return error.UnexpectedResponse;
+    try expectEqual(end_position.line, change.previous.start.line);
+    try expectEqual(end_position.character, change.previous.start.character);
+    try expectEqual(end_position.line, change.previous.end.line);
+    try expectEqual(end_position.character, change.previous.end.character);
+    try expectEqual(end_position.line, change.current.start.line);
+    try expectEqual(end_position.character, change.current.start.character);
+    try expectEqual(end_position.line + 1, change.current.end.line);
+    try expectEqual(@as(u32, 0), change.current.end.character);
 
     try expectEqual(@as(i32, 2), document.version);
     try expectEqualStrings("\n", document.source[document.source.len - 1 ..]);
@@ -1704,7 +1742,7 @@ test "updateIncremental accepts same-line insert after nonzero column" {
     defer document.deinit(testing_allocator);
 
     const insert_position = lsp.offsets.indexToPosition(document.source, 4, .@"utf-8");
-    try document.updateIncremental(
+    const same_line_change = try document.updateIncremental(
         testing_allocator,
         2,
         &.{
@@ -1719,6 +1757,7 @@ test "updateIncremental accepts same-line insert after nonzero column" {
         },
         .@"utf-8",
     );
+    try expect(same_line_change != null);
 
     try expectEqual(@as(i32, 2), document.version);
     try expectEqualStrings("rule ::= TOKEN.", document.source);
