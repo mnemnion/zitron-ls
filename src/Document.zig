@@ -454,6 +454,30 @@ pub fn findReferences(
     return if (references.items.len == 0) null else try references.toOwnedSlice(arena);
 }
 
+/// Collects same-document highlights for directive names, grammar symbols, and named actions.
+pub fn documentHighlights(
+    document: Document,
+    tags_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    position: types.Position,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!?[]const types.DocumentHighlight {
+    const source_index = lsp.offsets.positionToIndex(document.source, position, offset_encoding);
+    const point = tsPointFromIndex(document.source, source_index);
+    const root = document.tree.rootNode();
+    const raw_node = root.descendantForPointRange(point, point) orelse return null;
+    if (containsUnsupportedCode(raw_node)) return null;
+
+    if (directiveNameAtIndex(document.source, raw_node, source_index)) |directive_name| {
+        return try document.directiveHighlights(arena, directive_name, offset_encoding);
+    }
+
+    return switch (document.resolveAtPosition(tags_query, offset_encoding, position)) {
+        .no_match, .unsupported_zig_code => null,
+        .symbol => |symbol| try document.symbolHighlights(tags_query, arena, symbol, offset_encoding),
+    };
+}
+
 /// Collects document-local symbols for editor outlines and symbol pickers.
 pub fn documentSymbols(
     document: Document,
@@ -481,6 +505,63 @@ pub fn documentSymbols(
     }
 
     return try symbols.toOwnedSlice(arena);
+}
+
+fn directiveHighlights(
+    document: Document,
+    arena: std.mem.Allocator,
+    directive_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!?[]const types.DocumentHighlight {
+    var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+
+    const root = document.tree.rootNode();
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = root.namedChild(index).?;
+        if (!std.mem.eql(u8, child.kind(), "directive")) continue;
+        const name_node = directiveNameChild(child) orelse continue;
+        if (!std.mem.eql(u8, sliceForNode(document.source, name_node), directive_name)) continue;
+        try highlights.append(arena, .{
+            .range = directiveNameRange(document.source, name_node, offset_encoding),
+        });
+    }
+
+    return if (highlights.items.len == 0) null else try highlights.toOwnedSlice(arena);
+}
+
+fn symbolHighlights(
+    document: Document,
+    tags_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    symbol: SemanticSymbol,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!?[]const types.DocumentHighlight {
+    var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+    defer seen_starts.deinit(arena);
+
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(tags_query, document.tree.rootNode());
+
+    while (cursor.nextMatch()) |match| {
+        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
+        if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
+        if (!highlightKindsMatch(symbol.kind, candidate.kind)) continue;
+
+        const start = candidate.name_node.startByte();
+        const gop = try seen_starts.getOrPut(arena, start);
+        if (gop.found_existing) continue;
+
+        try highlights.append(arena, .{
+            .range = rangeFromNode(document.source, candidate.name_node, offset_encoding),
+            .kind = highlightKindForSemanticKind(candidate.kind),
+        });
+    }
+
+    return if (highlights.items.len == 0) null else try highlights.toOwnedSlice(arena);
 }
 
 /// Builds an LSP location for the given syntax node in this document.
@@ -902,7 +983,9 @@ fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
 fn isDirectiveNameNode(node: ts.Node) bool {
     const kind = node.kind();
     return std.mem.eql(u8, kind, "arg_directive_name") or
-        std.mem.eql(u8, kind, "directive_name");
+        std.mem.eql(u8, kind, "directive_name") or
+        std.mem.eql(u8, kind, "token_directive_name") or
+        std.mem.eql(u8, kind, "bad_directive_name");
 }
 
 fn grammarParticleKind(node: ts.Node) ?GrammarParticleKind {
@@ -1015,6 +1098,22 @@ fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
     if (std.mem.eql(u8, capture_name, "definition.interface")) return .action_definition;
     if (std.mem.eql(u8, capture_name, "reference.implementation")) return .action_implementation;
     return null;
+}
+
+fn highlightKindsMatch(selected: SemanticKind, candidate: SemanticKind) bool {
+    return switch (selected) {
+        .rule_definition, .rule_reference => candidate == .rule_definition or candidate == .rule_reference,
+        .terminal_reference => candidate == .terminal_reference,
+        .action_definition, .action_implementation => candidate == .action_definition or candidate == .action_implementation,
+    };
+}
+
+fn highlightKindForSemanticKind(kind: SemanticKind) ?types.DocumentHighlight.Kind {
+    return switch (kind) {
+        .rule_definition => .Write,
+        .rule_reference => .Read,
+        .terminal_reference, .action_definition, .action_implementation => null,
+    };
 }
 
 fn renameKindForNode(node: ts.Node) ?RenameKind {
@@ -1551,10 +1650,56 @@ fn firstNamedChildOfKind(node: ts.Node, kind: []const u8) ?ts.Node {
     return null;
 }
 
+fn directiveNameAtIndex(source: []const u8, node: ts.Node, index: usize) ?[]const u8 {
+    const directive = nodeOrAncestorOfKind(node, "directive") orelse return null;
+    const name_node = directiveNameChild(directive) orelse return null;
+    if (!rangeContainsIndex(directiveNameByteRange(source, name_node), index)) return null;
+    return sliceForNode(source, name_node);
+}
+
+fn directiveNameChild(directive: ts.Node) ?ts.Node {
+    const child_count = directive.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = directive.namedChild(index).?;
+        if (isDirectiveNameNode(child)) return child;
+    }
+    return null;
+}
+
+fn directiveNameRange(source: []const u8, node: ts.Node, offset_encoding: lsp.offsets.Encoding) types.Range {
+    const range = directiveNameByteRange(source, node);
+    return lsp.offsets.locToRange(source, .{
+        .start = range.start,
+        .end = range.end,
+    }, offset_encoding);
+}
+
+fn directiveNameByteRange(source: []const u8, node: ts.Node) struct { start: usize, end: usize } {
+    var start: usize = node.startByte();
+    if (start > 0 and source[start - 1] == '%') start -= 1;
+    return .{
+        .start = start,
+        .end = node.endByte(),
+    };
+}
+
+fn nodeOrAncestorOfKind(node: ts.Node, kind: []const u8) ?ts.Node {
+    var cursor = node;
+    while (true) {
+        if (std.mem.eql(u8, cursor.kind(), kind)) return cursor;
+        cursor = cursor.parent() orelse return null;
+    }
+}
+
 fn nodeContainsIndex(node: ts.Node, index: usize) bool {
     const start: usize = node.startByte();
     const end: usize = node.endByte();
     return start <= index and index < end;
+}
+
+fn rangeContainsIndex(range: anytype, index: usize) bool {
+    return range.start <= index and index < range.end;
 }
 
 fn isBetterMatch(candidate: SemanticSymbol, current: SemanticSymbol, source_index: usize) bool {

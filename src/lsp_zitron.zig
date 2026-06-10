@@ -58,6 +58,7 @@ fn serverCapabilities(
         .declarationProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
+        .documentHighlightProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
         .renameProvider = .{ .bool = true },
         .inlayHintProvider = .{ .inlay_hint_options = .{} },
@@ -706,6 +707,39 @@ pub const Server = struct {
         return result;
     }
 
+    /// LSP `textDocument/documentHighlight` handler for grammar-side symbol highlights.
+    pub fn @"textDocument/documentHighlight"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DocumentHighlightParams,
+    ) Error!lsp.ResultType("textDocument/documentHighlight") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/documentHighlight uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/documentHighlight uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        const result = try doc.documentHighlights(
+            server.tags_query,
+            arena,
+            params.position,
+            server.offset_encoding,
+        );
+        log.debug("LSP -> textDocument/documentHighlight uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (result) |highlights| highlights.len else 0,
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
     /// LSP `textDocument/inlayHint` handler for grammar and embedded Zig inlay hints.
     pub fn @"textDocument/inlayHint"(
         server: *Server,
@@ -1033,6 +1067,29 @@ pub const Server = struct {
         }
 
         return false;
+    }
+
+    fn hasHighlightAt(highlights: []const types.DocumentHighlight, position: types.Position) bool {
+        for (highlights) |highlight| {
+            if (std.meta.eql(highlight.range.start, position)) return true;
+        }
+
+        return false;
+    }
+
+    fn expectHighlightAtWithKind(
+        highlights: []const types.DocumentHighlight,
+        position: types.Position,
+        expected_kind: ?types.DocumentHighlight.Kind,
+    ) !void {
+        for (highlights) |highlight| {
+            if (std.meta.eql(highlight.range.start, position)) {
+                try expectEqual(expected_kind, highlight.kind);
+                return;
+            }
+        }
+
+        return error.UnexpectedDocumentHighlights;
     }
 
     fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
@@ -1840,6 +1897,83 @@ test "hover definition and references operate on stored live document state" {
 
     const number_rhs_index = try byteIndexOf(sample, "factor(A) ::= NUMBER(N).");
     try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_rhs_index, "NUMBER")));
+}
+
+test "document highlights cover directives identifiers and named actions" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/document_highlight.zy";
+    const sample =
+        \\%type expr f64
+        \\%type term f64
+        \\%token_type Token
+        \\calc ::= expr(A).
+        \\expr(A) ::= term(A) PLUS|MINUS PLUS. @on_expr(A)
+        \\term(A) ::= PLUS(A).
+        \\%impl @on_expr(A) { _ = A; }
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const directive_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "%type"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 2), directive_highlights.len);
+    try expect(Server.hasHighlightAt(directive_highlights, try positionOfText(sample, "%type")));
+    const second_type = try byteIndexOfAfter(sample, 1, "%type");
+    try expect(Server.hasHighlightAt(directive_highlights, lsp.offsets.indexToPosition(sample, second_type, test_offset_encoding)));
+    try Server.expectHighlightAtWithKind(directive_highlights, try positionOfText(sample, "%type"), null);
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const nonterminal_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "expr(A)"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 3), nonterminal_highlights.len);
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfTextAfter(sample, try byteIndexOf(sample, "%type expr"), "expr")));
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfText(sample, "expr(A) ::= term")));
+    const calc_ref = try byteIndexOf(sample, "calc ::= expr(A)");
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfTextAfter(sample, calc_ref, "expr")));
+    try Server.expectHighlightAtWithKind(
+        nonterminal_highlights,
+        try positionOfText(sample, "expr(A) ::= term"),
+        .Write,
+    );
+    try Server.expectHighlightAtWithKind(
+        nonterminal_highlights,
+        try positionOfTextAfter(sample, calc_ref, "expr"),
+        .Read,
+    );
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const terminal_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "PLUS|MINUS"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 3), terminal_highlights.len);
+    try expect(Server.hasHighlightAt(terminal_highlights, try positionOfText(sample, "PLUS|MINUS")));
+    const second_plus = try byteIndexOfAfter(sample, try byteIndexOf(sample, "PLUS|MINUS") + 1, "PLUS");
+    try expect(Server.hasHighlightAt(terminal_highlights, lsp.offsets.indexToPosition(sample, second_plus, test_offset_encoding)));
+    const term_plus = try byteIndexOf(sample, "term(A) ::= PLUS(A)");
+    try expect(Server.hasHighlightAt(terminal_highlights, try positionOfTextAfter(sample, term_plus, "PLUS")));
+    try Server.expectHighlightAtWithKind(terminal_highlights, try positionOfText(sample, "PLUS|MINUS"), null);
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const action_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "on_expr(A)"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 2), action_highlights.len);
+    try expect(Server.hasHighlightAt(action_highlights, try positionOfText(sample, "@on_expr(A)")));
+    const impl_action = try byteIndexOf(sample, "%impl @on_expr(A)");
+    try expect(Server.hasHighlightAt(action_highlights, try positionOfTextAfter(sample, impl_action, "@on_expr(A)")));
+    try Server.expectHighlightAtWithKind(action_highlights, try positionOfText(sample, "@on_expr(A)"), null);
 }
 
 test "document symbols operate on stored live document state" {
