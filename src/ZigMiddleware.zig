@@ -40,6 +40,7 @@ const Middleware = struct {
     const closeDocument = middlewareCloseDocument;
     const publishGeneration = middlewarePublishGeneration;
     const forwardHover = middlewareForwardHover;
+    const forwardDeclaration = middlewareForwardDeclaration;
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
@@ -346,6 +347,21 @@ pub fn forwardDefinition(
         .disabled => null,
         .enabled => |mware| mware.forwardDefinition(arena, source_uri, params) catch |err| {
             try suppressForwardRequestFailure("definition", source_uri, err);
+            return null;
+        },
+    };
+}
+
+pub fn forwardDeclaration(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.DeclarationParams,
+) Error!lsp.ResultType("textDocument/declaration") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |mware| mware.forwardDeclaration(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("declaration", source_uri, err);
             return null;
         },
     };
@@ -1259,12 +1275,56 @@ fn middlewareForwardDefinition(
     source_uri: []const u8,
     params: types.DefinitionParams,
 ) Error!lsp.ResultType("textDocument/definition") {
+    return try middlewareForwardDefinitionLike(
+        "textDocument/definition",
+        "definition",
+        middleware,
+        arena,
+        source_uri,
+        params.textDocument,
+        params.position,
+        params.workDoneToken,
+        params.partialResultToken,
+    );
+}
+
+fn middlewareForwardDeclaration(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.DeclarationParams,
+) Error!lsp.ResultType("textDocument/declaration") {
+    return try middlewareForwardDefinitionLike(
+        "textDocument/declaration",
+        "declaration",
+        middleware,
+        arena,
+        source_uri,
+        params.textDocument,
+        params.position,
+        params.workDoneToken,
+        params.partialResultToken,
+    );
+}
+
+fn middlewareForwardDefinitionLike(
+    comptime method: []const u8,
+    comptime label: []const u8,
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    text_document: types.TextDocumentIdentifier,
+    position: types.Position,
+    work_done_token: ?types.ProgressToken,
+    partial_result_token: ?types.ProgressToken,
+) Error!lsp.ResultType(method) {
     const start = logStart(middleware.io);
-    log.debug("Zig forward definition <- uri={s} source_position={any}", .{ source_uri, params.position });
+    log.debug("Zig forward {s} <- uri={s} source_position={any}", .{ label, source_uri, position });
     const doc = try middleware.documentReady(source_uri);
     const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward definition -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+    const span_index = code_map.sourceSpanIndexForPosition(position) orelse {
+        log.debug("Zig forward {s} -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+            label,
             source_uri,
             elapsedNs(middleware.io, start),
         });
@@ -1282,32 +1342,41 @@ fn middlewareForwardDefinition(
     };
     defer translation_context.deinit();
 
-    var mapped = params;
+    var mapped: lsp.ParamsType(method) = .{
+        .textDocument = text_document,
+        .position = position,
+        .workDoneToken = work_done_token,
+        .partialResultToken = partial_result_token,
+    };
     mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward definition -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+    mapped.position = (try translation_context.sourcePositionToGenerated(position)) orelse {
+        log.debug("Zig forward {s} -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+            label,
             source_uri,
             span_index,
             elapsedNs(middleware.io, start),
         });
         return null;
     };
-    log.debug("Zig forward definition mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+    log.debug("Zig forward {s} mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+        label,
         source_uri,
         doc.generated_uri,
         span_index,
         mapped.position,
     });
 
-    const result = (try middleware.request(arena, "textDocument/definition", mapped)) orelse {
-        log.debug("Zig forward definition -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+    const result = (try middleware.request(arena, method, mapped)) orelse {
+        log.debug("Zig forward {s} -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+            label,
             source_uri,
             elapsedNs(middleware.io, start),
         });
         return null;
     };
     const translated = try translateDefinition(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
-    log.debug("Zig forward definition -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+    log.debug("Zig forward {s} -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+        label,
         source_uri,
         definitionResultCount(result),
         definitionResultCount(translated),

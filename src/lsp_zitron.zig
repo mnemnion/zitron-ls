@@ -16,6 +16,11 @@ fn zitronLanguage() *const ts.Language {
 /// Errors that can occur while loading the configured fixture source.
 pub const FixtureError = std.Io.Dir.ReadFileAllocError;
 
+const DefinitionLikeRoute = enum {
+    declaration,
+    definition,
+};
+
 fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKind {
     return switch (encoding) {
         .@"utf-8" => .@"utf-8",
@@ -44,6 +49,7 @@ fn serverCapabilities(
             ) catch &zitron_completion_triggers,
         },
         .hoverProvider = .{ .bool = true },
+        .declarationProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
@@ -203,6 +209,68 @@ pub const Server = struct {
             },
             .{ .emit_null_optional_fields = false },
         );
+    }
+
+    fn definitionLikeAtPosition(
+        server: *Server,
+        route: DefinitionLikeRoute,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        position: types.Position,
+        work_done_token: ?types.ProgressToken,
+        partial_result_token: ?types.ProgressToken,
+    ) Error!lsp.ResultType("textDocument/definition") {
+        const doc = server.getDocument(uri) orelse return null;
+        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, position)) {
+            .no_match => null,
+            .unsupported_zig_code => switch (route) {
+                .declaration => try server.zig_middleware.forwardDeclaration(arena, uri, .{
+                    .textDocument = .{ .uri = uri },
+                    .position = position,
+                    .workDoneToken = work_done_token,
+                    .partialResultToken = partial_result_token,
+                }),
+                .definition => try server.zig_middleware.forwardDefinition(arena, uri, .{
+                    .textDocument = .{ .uri = uri },
+                    .position = position,
+                    .workDoneToken = work_done_token,
+                    .partialResultToken = partial_result_token,
+                }),
+            },
+            .symbol => |symbol| switch (symbol.kind) {
+                .rule_definition, .action_definition => .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            symbol.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                },
+                .rule_reference => if (doc.findRuleDefinition(
+                    server.tags_query,
+                    symbol.symbol_name,
+                )) |definition| .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
+                .terminal_reference => null,
+                .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
+            },
+        };
     }
 
     /// LSP `initialize` handler required by `lsp-kit`.
@@ -488,51 +556,57 @@ pub const Server = struct {
             params.textDocument.uri,
             params.position,
         });
-        const doc = server.getDocument(params.textDocument.uri) orelse {
+        if (server.getDocument(params.textDocument.uri) == null) {
             log.debug("LSP -> textDocument/definition uri={s} result=null reason=missing_document elapsed_ns={}", .{
                 params.textDocument.uri,
                 server.logElapsedNs(start),
             });
             return null;
-        };
-        const result: lsp.ResultType("textDocument/definition") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
-            .no_match => null,
-            .unsupported_zig_code => try server.zig_middleware.forwardDefinition(arena, params.textDocument.uri, params),
-            .symbol => |symbol| switch (symbol.kind) {
-                .rule_definition, .action_definition => .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            symbol.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                },
-                .rule_reference => if (doc.findRuleDefinition(
-                    server.tags_query,
-                    symbol.symbol_name,
-                )) |definition| .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            definition.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                } else null,
-                .terminal_reference => null,
-                .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            definition.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                } else null,
-            },
-        };
+        }
+        const result = try server.definitionLikeAtPosition(
+            .definition,
+            arena,
+            params.textDocument.uri,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
         log.debug("LSP -> textDocument/definition uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            definitionResultCount(result),
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    /// LSP `textDocument/declaration` handler; Zig declarations and definitions are equivalent.
+    pub fn @"textDocument/declaration"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DeclarationParams,
+    ) Error!lsp.ResultType("textDocument/declaration") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/declaration uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        if (server.getDocument(params.textDocument.uri) == null) {
+            log.debug("LSP -> textDocument/declaration uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        }
+        const result = try server.definitionLikeAtPosition(
+            .declaration,
+            arena,
+            params.textDocument.uri,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
+        log.debug("LSP -> textDocument/declaration uri={s} result_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
             definitionResultCount(result),
             result == null,
@@ -1056,6 +1130,36 @@ test "server capabilities merge zls completion triggers" {
     try expectEqualStrings("(", triggers[1]);
     try expectEqualStrings(".", triggers[2]);
     try expectEqualStrings(":", triggers[3]);
+}
+
+test "server supports declaration as definition for grammar symbols" {
+    try expect(@hasDecl(Server, "textDocument/declaration"));
+    if (comptime @hasDecl(Server, "textDocument/declaration")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+
+        const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
+        defer testing_allocator.free(sample);
+
+        try server.putDocument("file:///samples/calc.zy", 1, sample);
+
+        const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
+        const declaration = (try server.@"textDocument/declaration"(testing_allocator, .{
+            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
+        })) orelse return error.UnexpectedDefinitionTarget;
+        switch (declaration) {
+            .definition => |target| switch (target) {
+                .location => |location| {
+                    try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                    try expectEqual(@as(u32, 48), location.range.start.line);
+                    try expectEqual(@as(u32, 0), location.range.start.character);
+                },
+                else => return error.UnexpectedDefinitionTarget,
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        }
+    }
 }
 
 test "embedded tags query compiles for the zitron grammar" {
