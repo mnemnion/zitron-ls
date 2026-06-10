@@ -44,6 +44,7 @@ const Middleware = struct {
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
     const forwardCompletion = middlewareForwardCompletion;
+    const forwardSignatureHelp = middlewareForwardSignatureHelp;
     const forwardInlayHint = middlewareForwardInlayHint;
     const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
     const forwardSemanticTokensFull = middlewareForwardSemanticTokensFull;
@@ -392,6 +393,21 @@ pub fn forwardCompletion(
         .disabled => null,
         .enabled => |mware| mware.forwardCompletion(arena, source_uri, params) catch |err| {
             try suppressForwardRequestFailure("completion", source_uri, err);
+            return null;
+        },
+    };
+}
+
+pub fn forwardSignatureHelp(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.SignatureHelpParams,
+) Error!lsp.ResultType("textDocument/signatureHelp") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |mware| mware.forwardSignatureHelp(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("signatureHelp", source_uri, err);
             return null;
         },
     };
@@ -1507,6 +1523,62 @@ fn middlewareForwardCompletion(
         source_uri,
         zls_count,
         completionResultCount(result),
+        result == null,
+        elapsedNs(middleware.io, start),
+    });
+    return result;
+}
+
+fn middlewareForwardSignatureHelp(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.SignatureHelpParams,
+) Error!lsp.ResultType("textDocument/signatureHelp") {
+    const start = logStart(middleware.io);
+    log.debug("Zig forward signatureHelp <- uri={s} source_position={any}", .{ source_uri, params.position });
+    const doc = try middleware.documentReady(source_uri);
+    const code_map = &doc.code_map;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+        log.debug("Zig forward signatureHelp -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+            source_uri,
+            elapsedNs(middleware.io, start),
+        });
+        return null;
+    };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .cache = &translation_cache,
+        .active_span_index = span_index,
+    };
+    defer translation_context.deinit();
+
+    var mapped = params;
+    mapped.textDocument = .{ .uri = doc.generated_uri };
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+        log.debug("Zig forward signatureHelp -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+            source_uri,
+            span_index,
+            elapsedNs(middleware.io, start),
+        });
+        return null;
+    };
+    log.debug("Zig forward signatureHelp mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+        source_uri,
+        doc.generated_uri,
+        span_index,
+        mapped.position,
+    });
+
+    const result = try middleware.request(arena, "textDocument/signatureHelp", mapped);
+    log.debug("Zig forward signatureHelp -> uri={s} result_count={} null={} elapsed_ns={}", .{
+        source_uri,
+        if (result) |help| help.signatures.len else 0,
         result == null,
         elapsedNs(middleware.io, start),
     });
@@ -4566,6 +4638,16 @@ fn zlsInitializeParams() types.InitializeParams {
                 .hover = .{
                     .contentFormat = &zls_hover_content_formats,
                 },
+                .signatureHelp = .{
+                    .signatureInformation = .{
+                        .documentationFormat = &zls_hover_content_formats,
+                        .parameterInformation = .{
+                            .labelOffsetSupport = true,
+                        },
+                        .activeParameterSupport = true,
+                    },
+                    .contextSupport = true,
+                },
                 .documentSymbol = .{
                     .hierarchicalDocumentSymbolSupport = true,
                 },
@@ -5459,6 +5541,11 @@ test "ZLS initialize advertises snippet completion support" {
     const completion_item = completion.completionItem orelse return error.UnexpectedCapability;
 
     try std.testing.expect(completion_item.snippetSupport orelse false);
+
+    const signature_help = text_document.signatureHelp orelse return error.UnexpectedCapability;
+    const signature_information = signature_help.signatureInformation orelse return error.UnexpectedCapability;
+    try std.testing.expect(signature_help.contextSupport orelse false);
+    try std.testing.expect(signature_information.activeParameterSupport orelse false);
 }
 
 test "forward requests return null while generation has errors" {
@@ -5533,6 +5620,13 @@ test "forward requests return null while generation has errors" {
         .position = .{ .line = 0, .character = 0 },
     });
     try std.testing.expect(completion_result == null);
+
+    try std.testing.expect(@hasDecl(ZigMiddleware, "forwardSignatureHelp"));
+    const signature_help_result = try zig_middleware.forwardSignatureHelp(arena_state.allocator(), uri, .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = 0, .character = 0 },
+    });
+    try std.testing.expect(signature_help_result == null);
 
     const inlay_result = try zig_middleware.forwardInlayHint(arena_state.allocator(), uri, .{
         .textDocument = .{ .uri = uri },

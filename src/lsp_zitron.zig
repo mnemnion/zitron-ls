@@ -517,11 +517,14 @@ pub const Server = struct {
             return null;
         };
         if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
-            log.debug("LSP -> textDocument/signatureHelp uri={s} route=zig result=null elapsed_ns={}", .{
+            const result = try server.zig_middleware.forwardSignatureHelp(arena, params.textDocument.uri, params);
+            log.debug("LSP -> textDocument/signatureHelp uri={s} route=zig result_count={} null={} elapsed_ns={}", .{
                 params.textDocument.uri,
+                if (result) |help| help.signatures.len else 0,
+                result == null,
                 server.logElapsedNs(start),
             });
-            return null;
+            return result;
         }
 
         const result = try completion.signatureHelp(
