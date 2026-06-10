@@ -45,6 +45,15 @@ const Particle = struct {
     kind: ParticleKind,
 };
 
+const ActionSignatureContext = struct {
+    action_name: []const u8,
+    kind: ActionArgumentKind,
+    action_start: usize,
+    action_row: u32,
+    open_end: usize,
+    index: usize,
+};
+
 const directives = [_][]const u8{
     "%name",
     "%include",
@@ -76,6 +85,46 @@ const directives = [_][]const u8{
     "%wildcard",
     "%token_class",
 };
+
+pub fn signatureHelp(
+    allocator: Allocator,
+    source: []const u8,
+    root: ts.Node,
+    position: types.Position,
+    encoding: lsp.offsets.Encoding,
+) OOM!?types.SignatureHelp {
+    const context = actionSignatureContext(source, root, position, encoding) orelse return null;
+    const aliases = switch (context.kind) {
+        .impl => try actionAliasesForName(allocator, source, root, context.action_name),
+        .rule_action => blk: {
+            const rule = ruleNodeForAction(root, context.action_start, context.action_row) orelse return null;
+            break :blk try aliasesForRuleAction(allocator, source, rule);
+        },
+    } orelse return null;
+
+    var label: std.ArrayList(u8) = .empty;
+    try label.appendSlice(allocator, context.action_name);
+    try label.append(allocator, '(');
+    try label.appendSlice(allocator, aliases);
+    try label.append(allocator, ')');
+    const signature_label = try label.toOwnedSlice(allocator);
+
+    const parameters = try signatureParameters(allocator, aliases);
+    const active_parameter = activeActionParameter(source[context.open_end..context.index], parameters.len);
+
+    const signatures = try allocator.alloc(types.SignatureInformation, 1);
+    signatures[0] = .{
+        .label = signature_label,
+        .parameters = parameters,
+        .activeParameter = active_parameter,
+    };
+
+    return .{
+        .signatures = signatures,
+        .activeSignature = 0,
+        .activeParameter = active_parameter,
+    };
+}
 
 /// Returns named-action alias completions for `%impl @action(` contexts.
 pub fn completeImplAliases(
@@ -204,6 +253,75 @@ pub fn completeDirectives(
     }
 
     return items;
+}
+
+fn actionSignatureContext(
+    source: []const u8,
+    _: ts.Node,
+    position: types.Position,
+    encoding: lsp.offsets.Encoding,
+) ?ActionSignatureContext {
+    const index = lsp.offsets.positionToIndex(source, position, encoding);
+    const open = actionOpenBefore(source, index) orelse return null;
+    const action_start = actionNameStartBeforeOpen(source, open) orelse return null;
+    const action_name = source[action_start..open];
+    if (index < open + 1) return null;
+    if (containsAnyByte(source[open + 1 .. index], &.{ ')', '{' })) return null;
+
+    const line_start = lineStartBefore(source, action_start);
+    const is_impl = linePrefixHasImplDirective(source[line_start..action_start]);
+    return .{
+        .action_name = action_name,
+        .kind = if (is_impl) .impl else .rule_action,
+        .action_start = action_start,
+        .action_row = position.line,
+        .open_end = open + 1,
+        .index = index,
+    };
+}
+
+fn actionOpenBefore(source: []const u8, index: usize) ?usize {
+    var scan = index;
+    while (scan > 0) {
+        scan -= 1;
+        switch (source[scan]) {
+            '(' => return scan,
+            '\n', '\r' => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn actionNameStartBeforeOpen(source: []const u8, open: usize) ?usize {
+    if (open == 0) return null;
+    var scan = open;
+    while (scan > 0 and isIdentifierByte(source[scan - 1])) {
+        scan -= 1;
+    }
+    if (scan == 0 or source[scan - 1] != '@') return null;
+    return scan - 1;
+}
+
+fn lineStartBefore(source: []const u8, index: usize) usize {
+    var scan = index;
+    while (scan > 0) {
+        if (source[scan - 1] == '\n' or source[scan - 1] == '\r') break;
+        scan -= 1;
+    }
+    return scan;
+}
+
+fn linePrefixHasImplDirective(prefix: []const u8) bool {
+    const trimmed = std.mem.trim(u8, prefix, " \t");
+    return std.mem.startsWith(u8, trimmed, "%impl");
+}
+
+fn containsAnyByte(haystack: []const u8, needles: []const u8) bool {
+    for (haystack) |byte| {
+        if (std.mem.indexOfScalar(u8, needles, byte) != null) return true;
+    }
+    return false;
 }
 
 fn ruleActionAliasContext(
@@ -354,6 +472,51 @@ fn actionAliasesForName(
         try formatted.appendSlice(allocator, alias);
     }
     return try formatted.toOwnedSlice(allocator);
+}
+
+fn signatureParameters(allocator: Allocator, aliases: []const u8) OOM![]const types.ParameterInformation {
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start <= aliases.len) {
+        const end = aliasParameterEnd(aliases, start);
+        const parameter = std.mem.trim(u8, aliases[start..end], " \t\r\n");
+        if (parameter.len != 0) count += 1;
+        if (end == aliases.len) break;
+        start = end + 1;
+    }
+
+    const parameters = try allocator.alloc(types.ParameterInformation, count);
+    var next: usize = 0;
+    start = 0;
+    while (start <= aliases.len) {
+        const end = aliasParameterEnd(aliases, start);
+        const parameter = std.mem.trim(u8, aliases[start..end], " \t\r\n");
+        if (parameter.len != 0) {
+            parameters[next] = .{ .label = .{ .string = parameter } };
+            next += 1;
+        }
+        if (end == aliases.len) break;
+        start = end + 1;
+    }
+    return parameters;
+}
+
+fn aliasParameterEnd(aliases: []const u8, start: usize) usize {
+    var index = start;
+    while (index < aliases.len) : (index += 1) {
+        if (aliases[index] == ';' or aliases[index] == ',') break;
+    }
+    return index;
+}
+
+fn activeActionParameter(argument_text: []const u8, parameter_count: usize) ?u32 {
+    if (parameter_count == 0) return null;
+
+    var index: usize = 0;
+    for (argument_text) |byte| {
+        if (byte == ';' or byte == ',') index += 1;
+    }
+    return @intCast(@min(index, parameter_count - 1));
 }
 
 fn collectActionAliases(

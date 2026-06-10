@@ -8,6 +8,8 @@ pub const server_name = "lsp_zitron";
 
 const server_version = "0.0.1";
 const zitron_completion_triggers = [_][]const u8{ "%", "(" };
+const zitron_signature_help_triggers = [_][]const u8{ "(", ";", "," };
+const zitron_signature_help_retriggers = [_][]const u8{ ";", "," };
 
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
@@ -47,6 +49,10 @@ fn serverCapabilities(
                 allocator,
                 zls_completion_triggers,
             ) catch &zitron_completion_triggers,
+        },
+        .signatureHelpProvider = .{
+            .triggerCharacters = &zitron_signature_help_triggers,
+            .retriggerCharacters = &zitron_signature_help_retriggers,
         },
         .hoverProvider = .{ .bool = true },
         .declarationProvider = .{ .bool = true },
@@ -487,6 +493,48 @@ pub const Server = struct {
         log.debug("LSP -> textDocument/completion uri={s} route=zitron result_count={} elapsed_ns={}", .{
             params.textDocument.uri,
             items.len,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    /// LSP `textDocument/signatureHelp` handler for Zitron named actions.
+    pub fn @"textDocument/signatureHelp"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SignatureHelpParams,
+    ) Error!lsp.ResultType("textDocument/signatureHelp") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/signatureHelp uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/signatureHelp uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
+            log.debug("LSP -> textDocument/signatureHelp uri={s} route=zig result=null elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        }
+
+        const result = try completion.signatureHelp(
+            arena,
+            doc.source,
+            doc.tree.rootNode(),
+            params.position,
+            server.offset_encoding,
+        );
+        log.debug("LSP -> textDocument/signatureHelp uri={s} route=zitron result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (result) |help| help.signatures.len else 0,
+            result == null,
             server.logElapsedNs(start),
         });
         return result;
@@ -1108,10 +1156,18 @@ fn expectActionAliasCompletion(
 }
 
 test "server capabilities match the implemented handlers" {
+    const capabilities = serverCapabilities(testing_allocator, .@"utf-16", null);
     lsp.basic_server.validateServerCapabilities(
         Server,
-        serverCapabilities(testing_allocator, .@"utf-16", null),
+        capabilities,
     );
+
+    const signature_help = capabilities.signatureHelpProvider.?;
+    try expectEqualStrings("(", signature_help.triggerCharacters.?[0]);
+    try expectEqualStrings(";", signature_help.triggerCharacters.?[1]);
+    try expectEqualStrings(",", signature_help.triggerCharacters.?[2]);
+    try expectEqualStrings(";", signature_help.retriggerCharacters.?[0]);
+    try expectEqualStrings(",", signature_help.retriggerCharacters.?[1]);
 }
 
 test "server capabilities merge zls completion triggers" {
@@ -1349,6 +1405,53 @@ test "server returns rule action alias completions in house style" {
             },
         });
         try expectActionAliasCompletion(&server, arena_state.allocator(), case.sample, case.marker, case.expected);
+    }
+}
+
+test "server returns rule action signature help from aliases" {
+    try expect(@hasDecl(Server, "textDocument/signatureHelp"));
+    if (comptime @hasDecl(Server, "textDocument/signatureHelp")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+        defer arena_state.deinit();
+
+        const sample = "pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; ";
+        try server.putDocument("file:///samples/signature_help.zy", 1, sample);
+
+        const help = (try server.@"textDocument/signatureHelp"(arena_state.allocator(), .{
+            .textDocument = .{ .uri = "file:///samples/signature_help.zy" },
+            .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+        })) orelse return error.UnexpectedSignatureHelp;
+
+        try expectEqual(@as(usize, 1), help.signatures.len);
+        try expectEqualStrings("@on_pair2(P; K, V)", help.signatures[0].label);
+        try expectEqual(@as(u32, 1), help.activeParameter.?);
+    }
+}
+
+test "server returns impl signature help from named action definition" {
+    try expect(@hasDecl(Server, "textDocument/signatureHelp"));
+    if (comptime @hasDecl(Server, "textDocument/signatureHelp")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+        defer arena_state.deinit();
+
+        const sample =
+            \\pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; K, V)
+            \\%impl @on_pair2(P; K, 
+        ;
+        try server.putDocument("file:///samples/impl_signature_help.zy", 1, sample);
+
+        const help = (try server.@"textDocument/signatureHelp"(arena_state.allocator(), .{
+            .textDocument = .{ .uri = "file:///samples/impl_signature_help.zy" },
+            .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+        })) orelse return error.UnexpectedSignatureHelp;
+
+        try expectEqual(@as(usize, 1), help.signatures.len);
+        try expectEqualStrings("@on_pair2(P; K, V)", help.signatures[0].label);
+        try expectEqual(@as(u32, 2), help.activeParameter.?);
     }
 }
 
