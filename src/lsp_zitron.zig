@@ -707,7 +707,7 @@ pub const Server = struct {
         return result;
     }
 
-    /// LSP `textDocument/documentHighlight` handler for grammar-side symbol highlights.
+    /// LSP `textDocument/documentHighlight` handler for grammar-side and embedded Zig highlights.
     pub fn @"textDocument/documentHighlight"(
         server: *Server,
         arena: std.mem.Allocator,
@@ -725,15 +725,32 @@ pub const Server = struct {
             });
             return null;
         };
-        const result = try doc.documentHighlights(
+        const local_highlights = try doc.documentHighlights(
             server.tags_query,
             arena,
             params.position,
             server.offset_encoding,
         );
-        log.debug("LSP -> textDocument/documentHighlight uri={s} result_count={} null={} elapsed_ns={}", .{
+        const zig_highlights = if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position))
+            try server.zig_middleware.forwardDocumentHighlight(arena, params.textDocument.uri, params)
+        else
+            null;
+        var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+        if (local_highlights) |local| {
+            try highlights.appendSlice(arena, local);
+        }
+        if (zig_highlights) |forwarded| {
+            try highlights.appendSlice(arena, forwarded);
+        }
+        const result: lsp.ResultType("textDocument/documentHighlight") = if (highlights.items.len == 0)
+            null
+        else
+            try highlights.toOwnedSlice(arena);
+        log.debug("LSP -> textDocument/documentHighlight uri={s} local_count={} zig_count={} total_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
-            if (result) |highlights| highlights.len else 0,
+            if (local_highlights) |local| local.len else 0,
+            if (zig_highlights) |forwarded| forwarded.len else 0,
+            if (result) |result_highlights| result_highlights.len else 0,
             result == null,
             server.logElapsedNs(start),
         });

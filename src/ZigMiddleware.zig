@@ -43,6 +43,7 @@ const Middleware = struct {
     const forwardDeclaration = middlewareForwardDeclaration;
     const forwardDefinition = middlewareForwardDefinition;
     const forwardReferences = middlewareForwardReferences;
+    const forwardDocumentHighlight = middlewareForwardDocumentHighlight;
     const forwardCompletion = middlewareForwardCompletion;
     const forwardSignatureHelp = middlewareForwardSignatureHelp;
     const forwardInlayHint = middlewareForwardInlayHint;
@@ -378,6 +379,21 @@ pub fn forwardReferences(
         .disabled => null,
         .enabled => |mware| mware.forwardReferences(arena, source_uri, params) catch |err| {
             try suppressForwardRequestFailure("references", source_uri, err);
+            return null;
+        },
+    };
+}
+
+pub fn forwardDocumentHighlight(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.DocumentHighlightParams,
+) Error!lsp.ResultType("textDocument/documentHighlight") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |mware| mware.forwardDocumentHighlight(arena, source_uri, params) catch |err| {
+            try suppressForwardRequestFailure("documentHighlight", source_uri, err);
             return null;
         },
     };
@@ -792,7 +808,7 @@ fn middlewareSyncDocument(
             elapsedNs(middleware.io, generation_start),
         });
         const code_map_start = logStart(middleware.io);
-        try code_map.updateExtractingLineDirectives(middleware.allocator, source_root, generated_text, source_path);
+        try code_map.updateExtractingLineDirectives(middleware.allocator, source_root, source_text, generated_text, source_path);
         code_map_ns = elapsedNs(middleware.io, code_map_start);
         log.debug("Zig sync code-map uri={s} spans={}", .{ uri, code_map.len() });
     }
@@ -1470,6 +1486,70 @@ fn middlewareForwardReferences(
     return translated;
 }
 
+fn middlewareForwardDocumentHighlight(
+    middleware: *Middleware,
+    arena: std.mem.Allocator,
+    source_uri: []const u8,
+    params: types.DocumentHighlightParams,
+) Error!lsp.ResultType("textDocument/documentHighlight") {
+    const start = logStart(middleware.io);
+    log.debug("Zig forward documentHighlight <- uri={s} source_position={any}", .{ source_uri, params.position });
+    const doc = try middleware.documentReady(source_uri);
+    const code_map = &doc.code_map;
+    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+            source_uri,
+            elapsedNs(middleware.io, start),
+        });
+        return null;
+    };
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(middleware.allocator);
+    var translation_context = RequestTranslationContext{
+        .allocator = middleware.allocator,
+        .map = code_map,
+        .source_text = doc.source_text,
+        .generated_text = doc.generated_text,
+        .cache = &translation_cache,
+        .active_span_index = span_index,
+    };
+    defer translation_context.deinit();
+
+    var mapped = params;
+    mapped.textDocument = .{ .uri = doc.generated_uri };
+    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+            source_uri,
+            span_index,
+            elapsedNs(middleware.io, start),
+        });
+        return null;
+    };
+    log.debug("Zig forward documentHighlight mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+        source_uri,
+        doc.generated_uri,
+        span_index,
+        mapped.position,
+    });
+
+    const result = (try middleware.request(arena, "textDocument/documentHighlight", mapped)) orelse {
+        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+            source_uri,
+            elapsedNs(middleware.io, start),
+        });
+        return null;
+    };
+    const translated = try translateDocumentHighlights(arena, result, &translation_context);
+    log.debug("Zig forward documentHighlight -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+        source_uri,
+        result.len,
+        if (translated) |highlights| highlights.len else 0,
+        translated == null,
+        elapsedNs(middleware.io, start),
+    });
+    return translated;
+}
+
 fn middlewareForwardCompletion(
     middleware: *Middleware,
     arena: std.mem.Allocator,
@@ -1925,14 +2005,32 @@ fn middlewareSemanticTokensRangeAsDelta(
 ) Error!?lsp.ResultType("textDocument/semanticTokens/full/delta") {
     const dirty_start = logStart(middleware.io);
     const dirty = try semanticDirtyRangeFromDiff(arena, snapshot.source_text, doc.source_text) orelse {
-        log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=no_dirty_range", .{source_uri});
-        return null;
+        const dirty_ns = elapsedNs(middleware.io, dirty_start);
+        log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=empty_delta source_edits=0 elapsed_ns={}", .{
+            source_uri,
+            elapsedNs(middleware.io, start),
+        });
+        log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=empty_delta dirty_ns={} elapsed_ns={}", .{
+            source_uri,
+            dirty_ns,
+            elapsedNs(middleware.io, start),
+        });
+        return .{ .semantic_tokens_delta = .{
+            .resultId = snapshot.source_result_id,
+            .edits = &.{},
+        } };
     };
     const dirty_ns = elapsedNs(middleware.io, dirty_start);
     const previous_source_range = expandSemanticDirtyRange(dirty.previous);
     const current_source_range = expandSemanticDirtyRange(dirty.current);
     const map_start = logStart(middleware.io);
-    const generated_range = sourceRangeToGeneratedRange(&doc.code_map, current_source_range) orelse {
+    const generated_range = (try sourceRangeToGeneratedRange(
+        middleware.allocator,
+        &doc.code_map,
+        doc.source_text,
+        doc.generated_text,
+        current_source_range,
+    )) orelse {
         log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=unmapped_dirty_range", .{source_uri});
         return null;
     };
@@ -2020,7 +2118,13 @@ fn middlewareForwardSemanticTokensRange(
     const start = logStart(middleware.io);
     log.debug("Zig forward semanticTokens/range <- uri={s} source_range={any}", .{ source_uri, params.range });
     const doc = try middleware.documentReady(source_uri);
-    const resolved_range = sourceRangeToGeneratedRange(&doc.code_map, params.range) orelse {
+    const resolved_range = (try sourceRangeToGeneratedRange(
+        middleware.allocator,
+        &doc.code_map,
+        doc.source_text,
+        doc.generated_text,
+        params.range,
+    )) orelse {
         log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=unmapped_range elapsed_ns={}", .{
             source_uri,
             elapsedNs(middleware.io, start),
@@ -2192,6 +2296,8 @@ pub const CodeMap = struct {
     /// Source ranges for the generated spans.  Indexes are kept in lockstep with
     /// `gen_span`, but the range retains exact tree-sitter byte and point data.
     src_range: std.ArrayList(ts.Range) = .empty,
+    /// Whether a span came from a direct `%code`/`%include` shortcut.
+    fast_column_mapping: std.ArrayList(bool) = .empty,
     /// Indexes into `gen_span` and `src_range`, sorted by source-line order for source -> generated
     /// lookups. The buffer is retained across updates.
     src_order: std.ArrayList(usize) = .empty,
@@ -2267,6 +2373,7 @@ pub const CodeMap = struct {
     const ActiveSpan = struct {
         gen_span: GenSpan,
         src_range: ts.Range,
+        fast_column_mapping: bool,
     };
 
     /// Parses generated Zig into an initial map by delegating to `update`, so the
@@ -2274,12 +2381,13 @@ pub const CodeMap = struct {
     pub fn parse(
         allocator: std.mem.Allocator,
         source_root: ts.Node,
+        source_text: []const u8,
         generated_text: []const u8,
         source_path: []const u8,
     ) OOM!CodeMap {
         var map: CodeMap = .{};
         errdefer map.deinit(allocator);
-        try map.update(allocator, source_root, generated_text, source_path);
+        try map.update(allocator, source_root, source_text, generated_text, source_path);
         return map;
     }
 
@@ -2290,14 +2398,16 @@ pub const CodeMap = struct {
         map: *CodeMap,
         allocator: std.mem.Allocator,
         source_root: ts.Node,
+        source_text: []const u8,
         generated_text: []const u8,
         source_path: []const u8,
     ) OOM!void {
         map.gen_span.clearRetainingCapacity();
         map.src_range.clearRetainingCapacity();
+        map.fast_column_mapping.clearRetainingCapacity();
         map.src_order.clearRetainingCapacity();
 
-        try map.collectSpans(allocator, source_root, generated_text, source_path, null);
+        try map.collectSpans(allocator, source_root, source_text, generated_text, source_path, null);
         try map.rebuildSourceOrder(allocator);
     }
 
@@ -2307,14 +2417,16 @@ pub const CodeMap = struct {
         map: *CodeMap,
         allocator: std.mem.Allocator,
         source_root: ts.Node,
+        source_text: []const u8,
         generated_text: []u8,
         source_path: []const u8,
     ) OOM!void {
         map.gen_span.clearRetainingCapacity();
         map.src_range.clearRetainingCapacity();
+        map.fast_column_mapping.clearRetainingCapacity();
         map.src_order.clearRetainingCapacity();
 
-        try map.collectSpans(allocator, source_root, generated_text, source_path, generated_text);
+        try map.collectSpans(allocator, source_root, source_text, generated_text, source_path, generated_text);
         try map.rebuildSourceOrder(allocator);
     }
 
@@ -2322,6 +2434,7 @@ pub const CodeMap = struct {
     pub fn deinit(map: *CodeMap, allocator: std.mem.Allocator) void {
         map.gen_span.deinit(allocator);
         map.src_range.deinit(allocator);
+        map.fast_column_mapping.deinit(allocator);
         map.src_order.deinit(allocator);
         map.* = .{};
     }
@@ -2378,6 +2491,7 @@ pub const CodeMap = struct {
         map: *CodeMap,
         allocator: std.mem.Allocator,
         source_root: ts.Node,
+        source_text: []const u8,
         generated_text: []const u8,
         source_path: []const u8,
         extraction_text: ?[]u8,
@@ -2394,7 +2508,7 @@ pub const CodeMap = struct {
                 if (extraction_text) |text| extractLineDirective(text, generated_offset, directive);
                 try map.processActiveSpan(allocator, &active_span, generated_line, generated_offset);
                 if (std.mem.eql(u8, directive.path, source_path)) {
-                    if (zigCodeRangeForLine(source_root, directive.line)) |src_range| {
+                    if (zigCodeSpanForLine(source_text, source_root, directive.line)) |source_span| {
                         active_span = .{
                             .gen_span = .{
                                 .source_line = directive.line,
@@ -2405,7 +2519,8 @@ pub const CodeMap = struct {
                                     .end = next_generated_offset,
                                 },
                             },
-                            .src_range = src_range,
+                            .src_range = source_span.range,
+                            .fast_column_mapping = source_span.fast_column_mapping,
                         };
                     }
                 }
@@ -2433,6 +2548,8 @@ pub const CodeMap = struct {
         try map.gen_span.append(allocator, span.gen_span);
         errdefer _ = map.gen_span.pop();
         try map.src_range.append(allocator, span.src_range);
+        errdefer _ = map.src_range.pop();
+        try map.fast_column_mapping.append(allocator, span.fast_column_mapping);
     }
 
     /// Rebuilds the source-order index over the current span buffer.
@@ -2858,7 +2975,17 @@ const RequestTranslationContext = struct {
 
     fn sourcePositionToGenerated(context: *RequestTranslationContext, position: types.Position) OOM!?types.Position {
         const span_index = context.active_span_index orelse context.map.sourceSpanIndexForPosition(position) orelse return null;
+        return try context.sourcePositionToGeneratedInSpan(span_index, position);
+    }
+
+    fn sourcePositionToGeneratedInSpan(
+        context: *RequestTranslationContext,
+        span_index: usize,
+        position: types.Position,
+    ) OOM!?types.Position {
         const translator = try context.translatorForSpanIndex(span_index);
+        const source_index = lsp.offsets.positionToIndex(context.source_text, position, .@"utf-8");
+        if (source_index < translator.src_range.start_byte or source_index > translator.src_range.end_byte) return null;
         return sharedPosition(translator.sourcePositionToGenerated(position));
     }
 
@@ -3324,7 +3451,25 @@ fn semanticDirtyLineDelta(dirty: SemanticDirtyRange) i64 {
     return @as(i64, dirty.current.end.line) - @as(i64, dirty.previous.end.line);
 }
 
-fn sourceRangeToGeneratedRange(code_map: *const CodeMap, source_range: types.Range) ?types.Range {
+fn sourceRangeToGeneratedRange(
+    allocator: std.mem.Allocator,
+    code_map: *const CodeMap,
+    source_text: []const u8,
+    generated_text: []const u8,
+    source_range: types.Range,
+) OOM!?types.Range {
+    var translation_cache: SpanTranslatorCache = .{};
+    defer translation_cache.deinit(allocator);
+    var translation_context = RequestTranslationContext{
+        .allocator = allocator,
+        .map = code_map,
+        .source_text = source_text,
+        .generated_text = generated_text,
+        .cache = &translation_cache,
+        .active_span_index = null,
+    };
+    defer translation_context.deinit();
+
     var mapped_range: ?types.Range = null;
     var source_order_index = code_map.firstSourceIndexPossiblyIntersecting(source_range);
     while (source_order_index < code_map.src_order.items.len) : (source_order_index += 1) {
@@ -3334,10 +3479,17 @@ fn sourceRangeToGeneratedRange(code_map: *const CodeMap, source_range: types.Ran
 
         const request_range = rangeIntersection(source_range, span_source_range) orelse continue;
         const span = code_map.gen_span.items[span_index];
-        mapped_range = rangeUnion(mapped_range, .{
-            .start = span.sourcePositionToGenerated(request_range.start),
-            .end = span.sourcePositionToGenerated(request_range.end),
-        });
+        const generated_range = if (code_map.fast_column_mapping.items[span_index])
+            types.Range{
+                .start = span.sourcePositionToGenerated(request_range.start),
+                .end = span.sourcePositionToGenerated(request_range.end),
+            }
+        else
+            types.Range{
+                .start = (try translation_context.sourcePositionToGeneratedInSpan(span_index, request_range.start)) orelse continue,
+                .end = (try translation_context.sourcePositionToGeneratedInSpan(span_index, request_range.end)) orelse continue,
+            };
+        mapped_range = rangeUnion(mapped_range, generated_range);
     }
     return mapped_range;
 }
@@ -3553,18 +3705,62 @@ fn isAliasByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
 
-fn zigCodeRangeForLine(source_root: ts.Node, line: u32) ?ts.Range {
+const ZigCodeSpan = struct {
+    range: ts.Range,
+    fast_column_mapping: bool,
+};
+
+fn zigCodeSpanForLine(source_text: []const u8, source_root: ts.Node, line: u32) ?ZigCodeSpan {
     const line_start: ts.Point = .{ .row = line, .column = 0 };
     var node = source_root.descendantForPointRange(line_start, lineEndPoint(source_root, line)) orelse return null;
-    if (std.mem.eql(u8, node.kind(), "zig_code")) return node.range();
+    if (std.mem.eql(u8, node.kind(), "zig_code")) return zigCodeSpan(source_text, node);
 
     while (true) {
         const zig_code = descendantOfKindOnLine(node, "zig_code", line) orelse {
             node = node.parent() orelse return null;
             continue;
         };
-        return zig_code.range();
+        return zigCodeSpan(source_text, zig_code);
     }
+}
+
+fn zigCodeSpan(source_text: []const u8, zig_code: ts.Node) ZigCodeSpan {
+    return .{
+        .range = zig_code.range(),
+        .fast_column_mapping = isFastCodeDirective(source_text, zig_code),
+    };
+}
+
+fn isFastCodeDirective(source_text: []const u8, zig_code: ts.Node) bool {
+    const code_block = zig_code.parent() orelse return false;
+    if (!std.mem.eql(u8, code_block.kind(), "code_block")) return false;
+    const directive = code_block.parent() orelse return false;
+    if (!std.mem.eql(u8, directive.kind(), "directive")) return false;
+    const name_node = directiveNameChild(directive) orelse return false;
+    const name = source_text[name_node.startByte()..name_node.endByte()];
+    return std.mem.eql(u8, name, "code") or
+        std.mem.eql(u8, name, "include") or
+        std.mem.eql(u8, name, "%code") or
+        std.mem.eql(u8, name, "%include");
+}
+
+fn directiveNameChild(directive: ts.Node) ?ts.Node {
+    const child_count = directive.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const child = directive.namedChild(index).?;
+        if (isDirectiveNameNode(child)) return child;
+    }
+    return null;
+}
+
+fn isDirectiveNameNode(node: ts.Node) bool {
+    const kind = node.kind();
+    return std.mem.eql(u8, kind, "arg_directive_name") or
+        std.mem.eql(u8, kind, "directive_name") or
+        std.mem.eql(u8, kind, "token_directive_name") or
+        std.mem.eql(u8, kind, "bad_directive_name") or
+        std.mem.eql(u8, kind, "impl_name");
 }
 
 fn lineEndPoint(source_root: ts.Node, line: u32) ts.Point {
@@ -3731,6 +3927,31 @@ pub fn translateLocations(
     return if (translated.items.len == 0) null else try translated.toOwnedSlice(arena);
 }
 
+fn translateDocumentHighlights(
+    arena: std.mem.Allocator,
+    highlights: []const types.DocumentHighlight,
+    map: *RequestTranslationContext,
+) OOM!?[]const types.DocumentHighlight {
+    var translated: std.ArrayList(types.DocumentHighlight) = .empty;
+    for (highlights) |highlight| {
+        if (try translateDocumentHighlight(highlight, map)) |mapped| {
+            try translated.append(arena, mapped);
+        }
+    }
+
+    return if (translated.items.len == 0) null else try translated.toOwnedSlice(arena);
+}
+
+fn translateDocumentHighlight(
+    highlight: types.DocumentHighlight,
+    map: *RequestTranslationContext,
+) OOM!?types.DocumentHighlight {
+    return .{
+        .range = (try map.generatedRangeToSource(highlight.range)) orelse return null,
+        .kind = highlight.kind,
+    };
+}
+
 pub fn translateCompletionResult(
     arena: std.mem.Allocator,
     result: *lsp.ResultType("textDocument/completion"),
@@ -3783,8 +4004,8 @@ fn translateSemanticTokenData(
 
     const token_ranges = try arena.alloc(SemanticTokenRange, map.map.gen_span.items.len);
     @memset(token_ranges, .{});
+    const span_mappings = try semanticSpanMappings(arena, map.map, map.generated_text);
 
-    var position_cursor = GeneratedPositionCursor{ .context = map };
     var line: u32 = 0;
     var character: u32 = 0;
     var write_index: usize = 0;
@@ -3797,17 +4018,20 @@ fn translateSemanticTokenData(
         const token_type = data[index + 3];
         const token_modifiers = data[index + 4];
 
-        const source_range = (try position_cursor.generatedRangeToSource(.{
+        const generated_range: types.Range = .{
             .start = .{ .line = line, .character = character },
             .end = .{ .line = line, .character = character + length },
-        })) orelse continue;
+        };
+        const span_index = map.map.generatedSpanIndexForRange(generated_range) orelse continue;
+        const source_range = (try translateSemanticTokenRange(
+            map,
+            span_mappings,
+            span_index,
+            generated_range,
+        )) orelse continue;
         if (source_range.start.line != source_range.end.line) continue;
         if (source_range.end.character < source_range.start.character) continue;
-        if (source_filter) |filter| {
-            if (rangeIntersection(source_range, filter) == null) continue;
-        }
 
-        const span_index = position_cursor.span_index orelse continue;
         var range = &token_ranges[span_index];
         if (!range.seen) {
             range.* = .{
@@ -3860,11 +4084,14 @@ fn translateSemanticTokenDataFiltered(
             .end = .{ .line = line, .character = character + length },
         };
         const span_index = map.map.generatedSpanIndexForRange(generated_range) orelse continue;
-        const span = map.map.gen_span.items[span_index];
-        const source_range: types.Range = .{
-            .start = span.generatedPositionToSource(generated_range.start),
-            .end = span.generatedPositionToSource(generated_range.end),
-        };
+        if (!semanticTokenMightIntersectSourceFilter(map.map, span_index, generated_range, source_filter)) continue;
+
+        const source_range = (try translateSemanticTokenRangeFromMapping(
+            map,
+            semanticSpanMapping(map.map, map.generated_text, span_index),
+            span_index,
+            generated_range,
+        )) orelse continue;
         if (source_range.start.line != source_range.end.line) continue;
         if (source_range.end.character < source_range.start.character) continue;
         if (rangeIntersection(source_range, source_filter) == null) continue;
@@ -3893,6 +4120,101 @@ fn translateSemanticTokenDataFiltered(
     const translated = data[0..write_index];
     try reorderSemanticTokenRanges(translated, token_ranges, map.map.src_order.items);
     return encodeSemanticTokenDataInPlace(translated);
+}
+
+fn semanticSpanMappings(
+    arena: std.mem.Allocator,
+    code_map: *const CodeMap,
+    generated_text: []const u8,
+) OOM![]const SemanticSpanMapping {
+    const mappings = try arena.alloc(SemanticSpanMapping, code_map.gen_span.items.len);
+    for (mappings, code_map.gen_span.items, code_map.fast_column_mapping.items) |*mapping, span, fast| {
+        mapping.* = semanticSpanMappingForSpan(generated_text, span, fast);
+    }
+    return mappings;
+}
+
+fn semanticSpanMapping(
+    code_map: *const CodeMap,
+    generated_text: []const u8,
+    span_index: usize,
+) SemanticSpanMapping {
+    return semanticSpanMappingForSpan(
+        generated_text,
+        code_map.gen_span.items[span_index],
+        code_map.fast_column_mapping.items[span_index],
+    );
+}
+
+fn semanticSpanMappingForSpan(
+    generated_text: []const u8,
+    span: CodeMap.GenSpan,
+    fast_column_mapping: bool,
+) SemanticSpanMapping {
+    return .{
+        .generated_range = rangeFromByteRange(generated_text, span.generated_range.start, span.generated_range.end),
+        .fast_column_mapping = fast_column_mapping,
+    };
+}
+
+fn translateSemanticTokenRange(
+    map: *RequestTranslationContext,
+    span_mappings: []const SemanticSpanMapping,
+    span_index: usize,
+    generated_range: types.Range,
+) OOM!?types.Range {
+    return translateSemanticTokenRangeFromMapping(
+        map,
+        span_mappings[span_index],
+        span_index,
+        generated_range,
+    );
+}
+
+fn translateSemanticTokenRangeFromMapping(
+    map: *RequestTranslationContext,
+    mapping: SemanticSpanMapping,
+    span_index: usize,
+    generated_range: types.Range,
+) OOM!?types.Range {
+    if (!rangeContainsRange(mapping.generated_range, generated_range)) return null;
+
+    if (mapping.fast_column_mapping) {
+        const span = map.map.gen_span.items[span_index];
+        return .{
+            .start = span.generatedPositionToSource(generated_range.start),
+            .end = span.generatedPositionToSource(generated_range.end),
+        };
+    }
+
+    const translator = try map.translatorForSpanIndex(span_index);
+    return translator.generatedRangeToSource(generated_range);
+}
+
+const SemanticSpanMapping = struct {
+    generated_range: types.Range,
+    fast_column_mapping: bool,
+};
+
+fn rangeContainsRange(outer: types.Range, inner: types.Range) bool {
+    return !positionLessThan(inner.start, outer.start) and !positionLessThan(outer.end, inner.end);
+}
+
+fn semanticTokenMightIntersectSourceFilter(
+    code_map: *const CodeMap,
+    span_index: usize,
+    generated_range: types.Range,
+    source_filter: types.Range,
+) bool {
+    const span = code_map.gen_span.items[span_index];
+    if (generated_range.start.line < span.generated_line or generated_range.end.line < span.generated_line) return false;
+
+    const source_start_line = span.source_line + (generated_range.start.line - span.generated_line);
+    const source_end_line = span.source_line + (generated_range.end.line - span.generated_line);
+    return rangeIntersection(.{
+        .start = .{ .line = source_start_line, .character = 0 },
+        .end = .{ .line = source_end_line + 1, .character = 0 },
+    }, source_filter) != null;
 }
 
 const SemanticTokenRange = struct {
@@ -5049,7 +5371,7 @@ fn parseCodeMapForTest(source_text: []const u8, generated_text: []const u8, sour
 
     const tree = try parseZitronTreeForTest(effective_source);
     defer tree.destroy();
-    return try CodeMap.parse(testing_allocator, tree.rootNode(), generated_text, source_path);
+    return try CodeMap.parse(testing_allocator, tree.rootNode(), effective_source, generated_text, source_path);
 }
 
 fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: []const u8, source_path: []const u8) !void {
@@ -5062,7 +5384,7 @@ fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: 
 
     const tree = try parseZitronTreeForTest(effective_source);
     defer tree.destroy();
-    try map.update(testing_allocator, tree.rootNode(), generated_text, source_path);
+    try map.update(testing_allocator, tree.rootNode(), effective_source, generated_text, source_path);
 }
 
 fn makeTestGeneratedDocument(
@@ -5220,7 +5542,7 @@ test "code map extraction scrubs line directive digits without losing map" {
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
 
-    try map.updateExtractingLineDirectives(testing_allocator, tree.rootNode(), extracted, "source.zy");
+    try map.updateExtractingLineDirectives(testing_allocator, tree.rootNode(), source, extracted, "source.zy");
 
     try expectEqualStrings(expected, extracted);
     try expectEqual(@as(usize, 2), map.len());
@@ -5417,6 +5739,34 @@ test "code map stores source and generated byte ranges" {
     try expectEqual(generated.len, action_gen_span.generated_range.end);
 }
 
+test "code map marks directive shortcuts as fast column mappings" {
+    const source =
+        \\%include {
+        \\const include_answer = 1;
+        \\}
+        \\%code {
+        \\const code_answer = 2;
+        \\}
+        \\rule ::= TOKEN. { result = token; }
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\const include_answer = 1;
+        \\// #line 5 source.zy
+        \\const code_answer = 2;
+        \\// #line 7 source.zy
+        \\ result = token;
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try expectEqual(@as(usize, 3), map.len());
+    try std.testing.expect(map.fast_column_mapping.items[0]);
+    try std.testing.expect(map.fast_column_mapping.items[1]);
+    try std.testing.expect(!map.fast_column_mapping.items[2]);
+}
+
 test "code map reports optimized-away code blocks as unmapped" {
     const source =
         \\%impl @first(A) {
@@ -5433,11 +5783,11 @@ test "code map reports optimized-away code blocks as unmapped" {
 
     const tree = try parseZitronTreeForTest(source);
     defer tree.destroy();
-    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), generated, "source.zy");
+    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), source, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
-    const mapped_range = zigCodeRangeForLine(tree.rootNode(), 1) orelse return error.UnexpectedCodeMap;
-    const unmapped_range = zigCodeRangeForLine(tree.rootNode(), 4) orelse return error.UnexpectedCodeMap;
+    const mapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 1) orelse return error.UnexpectedCodeMap).range;
+    const unmapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 4) orelse return error.UnexpectedCodeMap).range;
     try std.testing.expect(map.indexForSourceRange(mapped_range) != null);
     try expectEqual(@as(?usize, null), map.indexForSourceRange(unmapped_range));
 }
@@ -5459,9 +5809,9 @@ test "alias code block rename refuses unmapped source blocks" {
 
     const tree = try parseZitronTreeForTest(source);
     defer tree.destroy();
-    const mapped_range = zigCodeRangeForLine(tree.rootNode(), 1) orelse return error.UnexpectedCodeMap;
-    const unmapped_range = zigCodeRangeForLine(tree.rootNode(), 4) orelse return error.UnexpectedCodeMap;
-    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), generated, "source.zy");
+    const mapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 1) orelse return error.UnexpectedCodeMap).range;
+    const unmapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 4) orelse return error.UnexpectedCodeMap).range;
+    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), source, generated, "source.zy");
     errdefer map.deinit(testing_allocator);
 
     var middleware: Middleware = .{
@@ -5636,6 +5986,13 @@ test "forward requests return null while generation has errors" {
         },
     });
     try std.testing.expect(inlay_result == null);
+
+    try std.testing.expect(@hasDecl(ZigMiddleware, "forwardDocumentHighlight"));
+    const highlight_result = try zig_middleware.forwardDocumentHighlight(arena_state.allocator(), uri, .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = 0, .character = 0 },
+    });
+    try std.testing.expect(highlight_result == null);
 }
 
 test "nonzero Zitron exit can continue with stdout" {
@@ -6272,6 +6629,92 @@ test "request translation context maps reference ranges in other spans" {
     try expectEqual(lsp.offsets.indexToPosition(source, source_call + "pik_elist_append".len, .@"utf-8"), translated[0].range.end);
 }
 
+test "request translation context maps document highlight ranges" {
+    const source =
+        \\rule ::= item. {
+        \\    const answer = item;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\    const answer = yymsp[0].minor.yy0;
+        \\// #line 200 source.zig
+        \\generated_only();
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const active_position = lsp.offsets.indexToPosition(source, std.mem.indexOf(u8, source, "answer").?, .@"utf-8");
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = map.sourceSpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
+    };
+    defer context.deinit();
+
+    const generated_answer = std.mem.indexOf(u8, generated, "answer").?;
+    const generated_only = std.mem.indexOf(u8, generated, "generated_only").?;
+    const highlights = [_]types.DocumentHighlight{
+        .{
+            .range = .{
+                .start = lsp.offsets.indexToPosition(generated, generated_answer, .@"utf-8"),
+                .end = lsp.offsets.indexToPosition(generated, generated_answer + "answer".len, .@"utf-8"),
+            },
+            .kind = .Read,
+        },
+        .{
+            .range = .{
+                .start = lsp.offsets.indexToPosition(generated, generated_only, .@"utf-8"),
+                .end = lsp.offsets.indexToPosition(generated, generated_only + "generated_only".len, .@"utf-8"),
+            },
+            .kind = .Write,
+        },
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = (try translateDocumentHighlights(arena_state.allocator(), &highlights, &context)) orelse return error.UnexpectedCodeMap;
+    const source_answer = std.mem.indexOf(u8, source, "answer").?;
+    try expectEqual(@as(usize, 1), translated.len);
+    try expectEqual(lsp.offsets.indexToPosition(source, source_answer, .@"utf-8"), translated[0].range.start);
+    try expectEqual(lsp.offsets.indexToPosition(source, source_answer + "answer".len, .@"utf-8"), translated[0].range.end);
+    try expectEqual(types.DocumentHighlight.Kind.Read, translated[0].kind.?);
+}
+
+test "request translation context rejects source positions before active source range" {
+    const source = "rule ::= item. { const answer = item; }";
+    const generated =
+        \\// #line 1 source.zy
+        \\ const answer = yymsp[0].minor.yy0;
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    const grammar_index = std.mem.indexOf(u8, source, "item.") orelse return error.NeedleNotFound;
+    const grammar_position = lsp.offsets.indexToPosition(source, grammar_index, .@"utf-8");
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = map.sourceSpanIndexForPosition(grammar_position) orelse return error.UnexpectedCodeMap,
+    };
+    defer context.deinit();
+
+    try expectEqual(@as(?types.Position, null), try context.sourcePositionToGenerated(grammar_position));
+}
+
 test "request span translator handles one leading newline edit" {
     const source = "\nconst answer = 42;";
     const generated = "const answer = 42;";
@@ -6289,6 +6732,7 @@ test "request span translator handles one leading newline edit" {
         .start_point = .{ .row = 0, .column = 0 },
         .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
     });
+    try map.fast_column_mapping.append(testing_allocator, false);
 
     var cache: SpanTranslatorCache = .{};
     defer cache.deinit(testing_allocator);
@@ -6529,6 +6973,7 @@ test "translates inlay hints on first block line with source column skew" {
         .start_point = .{ .row = 0, .column = prefix.len },
         .end_point = .{ .row = 0, .column = @intCast(source.len) },
     });
+    try map.fast_column_mapping.append(testing_allocator, false);
     try map.rebuildSourceOrder(testing_allocator);
 
     var cache: SpanTranslatorCache = .{};
@@ -6583,6 +7028,7 @@ test "generated position cursor translates generated ranges" {
         .start_point = .{ .row = 0, .column = prefix.len },
         .end_point = .{ .row = 0, .column = @intCast(source.len) },
     });
+    try map.fast_column_mapping.append(testing_allocator, false);
     try map.rebuildSourceOrder(testing_allocator);
 
     var cache: SpanTranslatorCache = .{};
@@ -6776,6 +7222,74 @@ test "semantic dirty range comes from snapshot diff for line move" {
     try expectEqual(@as(u32, 0), dirty.current.end.character);
 }
 
+test "semantic token range delta returns empty edit when source is unchanged" {
+    const uri = "file:///source.zy";
+    const source =
+        \\%code {
+        \\const answer = 42;
+        \\}
+    ;
+    const generated =
+        \\// #line 2 source.zy
+        \\const answer = 42;
+    ;
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .zls_child = undefined,
+        .zls_transport = undefined,
+        .zls_read_buffer = undefined,
+        .reader_thread = null,
+        .response_mutex = .init,
+        .response_cond = .init,
+        .pending_responses = .empty,
+        .reader_failed = false,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+        .next_request_id = 1,
+    };
+
+    var doc = try makeTestGeneratedDocument(testing_allocator, uri, 2, source, generated);
+    defer doc.deinit(testing_allocator);
+
+    const source_data = try testing_allocator.dupe(u32, &.{ 1, 6, 6, 8, 0 });
+    errdefer testing_allocator.free(source_data);
+    const source_index = try semanticTokenIndexFromData(testing_allocator, source_data);
+    errdefer testing_allocator.free(source_index);
+    var snapshot = SemanticTokensSnapshot{
+        .source_result_id = try testing_allocator.dupe(u8, "previous"),
+        .zls_result_id = null,
+        .source_text = try testing_allocator.dupe(u8, source),
+        .source_data = source_data,
+        .source_index = source_index,
+    };
+    defer snapshot.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const maybe_result = (try middleware.semanticTokensRangeAsDelta(
+        arena_state.allocator(),
+        uri,
+        &doc,
+        &snapshot,
+        .{ .textDocument = .{ .uri = uri } },
+        logStart(std.Options.debug_io),
+    )) orelse return error.UnexpectedResponse;
+    const result = maybe_result orelse return error.UnexpectedResponse;
+    const delta = switch (result) {
+        .semantic_tokens_delta => |delta| delta,
+        .semantic_tokens => return error.UnexpectedResponse,
+    };
+    try expectEqualStrings("previous", delta.resultId.?);
+    try expectEqual(@as(usize, 0), delta.edits.len);
+}
+
 test "translates semantic tokens and drops generated-only spans" {
     const source =
         \\%code {
@@ -6823,6 +7337,158 @@ test "translates semantic tokens and drops generated-only spans" {
         1, 6, 6, 8,  0,
         0, 9, 2, 19, 0,
     }, translated);
+    try expectEqual(@as(usize, 0), cache.len());
+}
+
+test "semantic token inline action spans use column-aware slow path" {
+    const prefix = "statement(A) ::= TOKEN. { ";
+    const generated = "const answer = 42;";
+    const source = prefix ++ generated ++ " }";
+    const generated_len: u32 = @intCast(generated.len);
+    const source_len: u32 = @intCast(source.len);
+    const answer_source_column: u32 = @intCast(prefix.len + 6);
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.gen_span.append(testing_allocator, .{
+        .source_line = 0,
+        .generated_line = 0,
+        .line_count = 1,
+        .generated_range = .{ .start = 0, .end = generated_len },
+    });
+    try map.src_range.append(testing_allocator, .{
+        .start_byte = prefix.len,
+        .end_byte = prefix.len + generated.len,
+        .start_point = .{ .row = 0, .column = @intCast(prefix.len) },
+        .end_point = .{ .row = 0, .column = @intCast(prefix.len + generated.len) },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.rebuildSourceOrder(testing_allocator);
+
+    const mapped_range = (try sourceRangeToGeneratedRange(
+        testing_allocator,
+        &map,
+        source,
+        generated,
+        .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = source_len },
+        },
+    )) orelse return error.UnexpectedCodeMap;
+    try expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = generated_len },
+    }, mapped_range);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var generated_tokens = [_]u32{ 0, 6, 6, 8, 0 };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = try translateSemanticTokenData(
+        arena_state.allocator(),
+        &generated_tokens,
+        &context,
+        .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 1, .character = 0 },
+        },
+    );
+
+    try expectEqualSlices(u32, &.{ 0, answer_source_column, 6, 8, 0 }, translated);
+    try expectEqual(@as(usize, 1), cache.len());
+}
+
+test "filtered semantic tokens skip unrequested slow spans before diffing" {
+    const source =
+        "rule1 ::= A. { const first = A; }\n" ++
+        "rule2 ::= B. { const second = B; }";
+    const generated =
+        "const first = yy;\n" ++
+        "const second = yy;";
+    const first_source_start = std.mem.indexOf(u8, source, "const first").?;
+    const first_source_len = "const first = A;".len;
+    const second_source_start = std.mem.indexOf(u8, source, "const second").?;
+    const second_source_len = "const second = B;".len;
+    const second_line_start = std.mem.indexOf(u8, source, "rule2").?;
+    const generated_first_end = std.mem.indexOfScalar(u8, generated, '\n').?;
+    const second_source_character: u32 = @intCast(second_source_start - second_line_start + 6);
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.gen_span.append(testing_allocator, .{
+        .source_line = 0,
+        .generated_line = 0,
+        .line_count = 1,
+        .generated_range = .{ .start = 0, .end = generated_first_end },
+    });
+    try map.src_range.append(testing_allocator, .{
+        .start_byte = @intCast(first_source_start),
+        .end_byte = @intCast(first_source_start + first_source_len),
+        .start_point = .{ .row = 0, .column = @intCast(first_source_start) },
+        .end_point = .{ .row = 0, .column = @intCast(first_source_start + first_source_len) },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.gen_span.append(testing_allocator, .{
+        .source_line = 1,
+        .generated_line = 1,
+        .line_count = 1,
+        .generated_range = .{ .start = generated_first_end + 1, .end = generated.len },
+    });
+    try map.src_range.append(testing_allocator, .{
+        .start_byte = @intCast(second_source_start),
+        .end_byte = @intCast(second_source_start + second_source_len),
+        .start_point = .{ .row = 1, .column = @intCast(second_source_start - second_line_start) },
+        .end_point = .{ .row = 1, .column = @intCast(second_source_start - second_line_start + second_source_len) },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.rebuildSourceOrder(testing_allocator);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var generated_tokens = [_]u32{
+        0, 6, 5, 8, 0,
+        1, 6, 6, 8, 0,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const filtered = try translateSemanticTokenData(
+        arena_state.allocator(),
+        &generated_tokens,
+        &context,
+        .{
+            .start = .{ .line = 1, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+    );
+
+    const expected = [_]u32{ 1, second_source_character, 6, 8, 0 };
+    try expectEqualSlices(u32, &expected, filtered);
+    try expectEqual(@as(usize, 1), cache.len());
 }
 
 test "translates semantic tokens in source span order" {
@@ -6853,6 +7519,7 @@ test "translates semantic tokens in source span order" {
         .start_point = .{ .row = 2, .column = 0 },
         .end_point = .{ .row = 2, .column = @intCast(source.len - source_second_start) },
     });
+    try map.fast_column_mapping.append(testing_allocator, true);
     try map.gen_span.append(testing_allocator, .{
         .source_line = 0,
         .generated_line = 1,
@@ -6865,6 +7532,7 @@ test "translates semantic tokens in source span order" {
         .start_point = .{ .row = 0, .column = 0 },
         .end_point = .{ .row = 0, .column = @intCast(source_first_end) },
     });
+    try map.fast_column_mapping.append(testing_allocator, true);
     try map.rebuildSourceOrder(testing_allocator);
 
     var cache: SpanTranslatorCache = .{};
