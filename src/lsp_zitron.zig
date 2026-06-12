@@ -128,7 +128,7 @@ pub const Server = struct {
             .tags_query = tags_query,
             .rename_query = rename_query,
             .offset_encoding = .@"utf-16",
-            .zig_middleware = ZigMiddleware.disabled(),
+            .zig_middleware = .disabled,
             .client_transport = null,
             .io = null,
         };
@@ -1517,7 +1517,7 @@ test "server returns impl signature help from named action definition" {
 
         const sample =
             \\pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; K, V)
-            \\%impl @on_pair2(P; K, 
+            \\%impl @on_pair2(P; K,
         ;
         try server.putDocument("file:///samples/impl_signature_help.zy", 1, sample);
 

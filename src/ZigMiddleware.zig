@@ -35,41 +35,1936 @@ const Middleware = struct {
     next_generation_id: usize,
     next_request_id: i64,
 
-    const deinit = middlewareDeinit;
-    const syncDocument = middlewareSyncDocument;
-    const closeDocument = middlewareCloseDocument;
-    const publishGeneration = middlewarePublishGeneration;
-    const forwardHover = middlewareForwardHover;
-    const forwardDeclaration = middlewareForwardDeclaration;
-    const forwardDefinition = middlewareForwardDefinition;
-    const forwardReferences = middlewareForwardReferences;
-    const forwardDocumentHighlight = middlewareForwardDocumentHighlight;
-    const forwardCompletion = middlewareForwardCompletion;
-    const forwardSignatureHelp = middlewareForwardSignatureHelp;
-    const forwardInlayHint = middlewareForwardInlayHint;
-    const forwardDocumentSymbols = middlewareForwardDocumentSymbols;
-    const forwardSemanticTokensFull = middlewareForwardSemanticTokensFull;
-    const forwardSemanticTokensFullDelta = middlewareForwardSemanticTokensFullDelta;
-    const forwardSemanticTokensRange = middlewareForwardSemanticTokensRange;
-    const forwardRename = middlewareForwardRename;
-    const aliasCodeBlockRenameEdits = middlewareAliasCodeBlockRenameEdits;
-    const initializeZls = middlewareInitializeZls;
-    const shutdownZls = middlewareShutdownZls;
-    const request = middlewareRequest;
-    const waitResponseForId = middlewareWaitResponseForId;
-    const nextRequestId = middlewareNextRequestId;
-    const documentReady = middlewareDocumentReady;
-    const semanticTokensSnapshot = middlewareSemanticTokensSnapshot;
-    const storeSemanticTokensSnapshot = middlewareStoreSemanticTokensSnapshot;
-    const storeSemanticTokensSnapshotOwned = middlewareStoreSemanticTokensSnapshotOwned;
-    const translateSemanticTokensForDocument = middlewareTranslateSemanticTokensForDocument;
-    const translateSemanticTokensForDocumentRange = middlewareTranslateSemanticTokensForDocumentRange;
-    const semanticTokensFullAsDelta = middlewareSemanticTokensFullAsDelta;
-    const semanticTokensRangeAsDelta = middlewareSemanticTokensRangeAsDelta;
-    const documentForGeneratedUri = middlewareDocumentForGeneratedUri;
-    const handleZlsDiagnostics = middlewareHandleZlsDiagnostics;
-    const readerMain = middlewareReaderMain;
-    const handleZlsMessage = middlewareHandleZlsMessage;
+    fn deinit(middleware: *Middleware) void {
+        freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
+        middleware.shutdownZls() catch |err| {
+            log.warn("ZLS shutdown failed: {}", .{err});
+            middleware.zls_child.kill(middleware.io);
+        };
+        if (middleware.reader_thread) |thread| {
+            thread.join();
+            middleware.reader_thread = null;
+        }
+
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        var it = middleware.documents.iterator();
+        while (it.next()) |entry| {
+            middleware.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(middleware.allocator);
+        }
+        middleware.documents.deinit(middleware.allocator);
+
+        var pending_it = middleware.pending_responses.iterator();
+        while (pending_it.next()) |entry| {
+            if (entry.value_ptr.response) |response| middleware.allocator.free(response);
+        }
+        middleware.pending_responses.deinit(middleware.allocator);
+        middleware.allocator.free(middleware.zls_read_buffer);
+    }
+
+    fn syncDocument(
+        middleware: *Middleware,
+        uri: []const u8,
+        version: i32,
+        source_text: []const u8,
+        source_root: ts.Node,
+        semantic_dirty_range: ?SemanticDirtyRange,
+    ) Error!void {
+        const start = logStart(middleware.io);
+        log.debug("Zig sync <- uri={s} version={} source_bytes={}", .{ uri, version, source_text.len });
+
+        const generation_id = blk: {
+            middleware.documents_mutex.lockUncancelable(middleware.io);
+            defer middleware.documents_mutex.unlock(middleware.io);
+
+            const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
+            if (!gop.found_existing) {
+                errdefer _ = middleware.documents.remove(uri);
+                gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
+                errdefer middleware.allocator.free(gop.key_ptr.*);
+                gop.value_ptr.* = .{
+                    .current = null,
+                    .latest_requested_version = version,
+                    .in_flight_version = version,
+                    .opened = false,
+                    .zls_sync_count = 0,
+                    .zls_synced_generation_id = null,
+                };
+                log.debug("Zig sync doc-created uri={s}", .{uri});
+            } else {
+                gop.value_ptr.latest_requested_version = version;
+                gop.value_ptr.in_flight_version = version;
+            }
+
+            const id = middleware.next_generation_id;
+            middleware.next_generation_id += 1;
+            break :blk id;
+        };
+
+        var source_path = try filePathFromUri(middleware.allocator, uri);
+        errdefer if (source_path.len != 0) middleware.allocator.free(source_path);
+        var generated_uri = try generatedUriForSourceUri(middleware.allocator, uri);
+        errdefer if (generated_uri.len != 0) middleware.allocator.free(generated_uri);
+        var owned_source_text = try middleware.allocator.dupe(u8, source_text);
+        errdefer if (owned_source_text.len != 0) middleware.allocator.free(owned_source_text);
+
+        const generation_start = logStart(middleware.io);
+        var generation_ns: i96 = 0;
+        var diagnostics_ns: i96 = 0;
+        var code_map_ns: i96 = 0;
+        var publish_ns: i96 = 0;
+        const generated = runZitron(middleware.allocator, middleware.io, source_path, source_text) catch |err| {
+            generation_ns = elapsedNs(middleware.io, generation_start);
+            log.warn("Zitron generation failed for '{s}': {}", .{ source_path, err });
+            const generation_error = try middleware.allocator.dupe(u8, @errorName(err));
+            errdefer middleware.allocator.free(generation_error);
+            const empty_generated = try middleware.allocator.alloc(u8, 0);
+            errdefer middleware.allocator.free(empty_generated);
+            var generation = GeneratedDocument{
+                .generation_id = generation_id,
+                .source_uri = try middleware.allocator.dupe(u8, uri),
+                .source_path = source_path,
+                .source_text = owned_source_text,
+                .generated_uri = generated_uri,
+                .generated_text = empty_generated,
+                .code_map = .{},
+                .generation_error = generation_error,
+                .grammar_diagnostics = &.{},
+                .zls_diagnostics = &.{},
+                .zls_diagnostics_version = null,
+                .semantic_dirty_range = semantic_dirty_range,
+                .version = version,
+                .opened = false,
+            };
+            source_path = &.{};
+            generated_uri = &.{};
+            owned_source_text = &.{};
+            errdefer generation.deinit(middleware.allocator);
+            const publish_start = logStart(middleware.io);
+            try middleware.publishGeneration(uri, &generation, start);
+            publish_ns = elapsedNs(middleware.io, publish_start);
+            log.debug("Zig sync phases uri={s} version={} generation_ns={} diagnostics_ns={} code_map_ns={} publish_ns={} elapsed_ns={}", .{
+                uri,
+                version,
+                generation_ns,
+                diagnostics_ns,
+                code_map_ns,
+                publish_ns,
+                elapsedNs(middleware.io, start),
+            });
+            return;
+        };
+        generation_ns = elapsedNs(middleware.io, generation_start);
+        defer middleware.allocator.free(generated.stderr);
+
+        const diagnostics_start = logStart(middleware.io);
+        var grammar_diagnostics = try parseZitronDiagnostics(middleware.allocator, generated.stderr);
+        diagnostics_ns = elapsedNs(middleware.io, diagnostics_start);
+        errdefer if (grammar_diagnostics.len != 0) freeStoredDiagnostics(middleware.allocator, grammar_diagnostics);
+
+        var generation_error: ?[]u8 = null;
+        errdefer if (generation_error) |message| middleware.allocator.free(message);
+        var generated_text: []u8 = undefined;
+        var generated_text_needs_free = false;
+        errdefer if (generated_text_needs_free) middleware.allocator.free(generated_text);
+        var code_map: CodeMap = .{};
+        var code_map_needs_deinit = true;
+        errdefer if (code_map_needs_deinit) code_map.deinit(middleware.allocator);
+
+        if (zitronOutputFailedWithoutStdout(generated.term, generated.stdout.len)) {
+            log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ source_path, generated.stderr });
+            middleware.allocator.free(generated.stdout);
+            generated_text = try middleware.allocator.alloc(u8, 0);
+            generation_error = try middleware.allocator.dupe(u8, generated.stderr);
+        } else {
+            generated_text = generated.stdout;
+            generated_text_needs_free = true;
+            if (zitronTermFailed(generated.term)) {
+                log.debug("Zitron generation exited with errors for '{s}' but produced stdout; publishing generated text: {s}", .{
+                    source_path,
+                    generated.stderr,
+                });
+            }
+            log.debug("Zig sync generated uri={s} generated_bytes={} stderr_bytes={} elapsed_ns={}", .{
+                uri,
+                generated_text.len,
+                generated.stderr.len,
+                elapsedNs(middleware.io, generation_start),
+            });
+            const code_map_start = logStart(middleware.io);
+            try code_map.update(middleware.allocator, source_root, source_text, generated_text, source_path);
+            code_map_ns = elapsedNs(middleware.io, code_map_start);
+            log.debug("Zig sync code-map uri={s} spans={}", .{ uri, code_map.len() });
+        }
+
+        var generation = GeneratedDocument{
+            .generation_id = generation_id,
+            .source_uri = try middleware.allocator.dupe(u8, uri),
+            .source_path = source_path,
+            .source_text = owned_source_text,
+            .generated_uri = generated_uri,
+            .generated_text = generated_text,
+            .code_map = code_map,
+            .generation_error = generation_error,
+            .grammar_diagnostics = grammar_diagnostics,
+            .zls_diagnostics = &.{},
+            .zls_diagnostics_version = null,
+            .semantic_dirty_range = semantic_dirty_range,
+            .version = version,
+            .opened = false,
+        };
+        source_path = &.{};
+        generated_uri = &.{};
+        owned_source_text = &.{};
+        grammar_diagnostics = &.{};
+        generation_error = null;
+        generated_text_needs_free = false;
+        code_map_needs_deinit = false;
+        errdefer generation.deinit(middleware.allocator);
+        const publish_start = logStart(middleware.io);
+        try middleware.publishGeneration(uri, &generation, start);
+        publish_ns = elapsedNs(middleware.io, publish_start);
+        log.debug("Zig sync phases uri={s} version={} generation_ns={} diagnostics_ns={} code_map_ns={} publish_ns={} elapsed_ns={}", .{
+            uri,
+            version,
+            generation_ns,
+            diagnostics_ns,
+            code_map_ns,
+            publish_ns,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn closeDocument(middleware: *Middleware, uri: []const u8) void {
+        const start = logStart(middleware.io);
+        log.debug("Zig close <- uri={s}", .{uri});
+
+        const removed = blk: {
+            middleware.documents_mutex.lockUncancelable(middleware.io);
+            defer middleware.documents_mutex.unlock(middleware.io);
+            break :blk middleware.documents.fetchRemove(uri) orelse return;
+        };
+
+        middleware.allocator.free(removed.key);
+        var state = removed.value;
+        if (state.opened) {
+            if (state.currentGeneration()) |generation| {
+                log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.generated_uri});
+                middleware.zls_transport.transport.writeNotification(
+                    middleware.io,
+                    middleware.allocator,
+                    "textDocument/didClose",
+                    lsp.ParamsType("textDocument/didClose"),
+                    .{ .textDocument = .{ .uri = generation.generated_uri } },
+                    .{ .emit_null_optional_fields = false },
+                ) catch {};
+            }
+        }
+        state.deinit(middleware.allocator);
+        log.debug("Zig close -> uri={s} elapsed_ns={}", .{ uri, elapsedNs(middleware.io, start) });
+    }
+
+    fn publishGeneration(
+        middleware: *Middleware,
+        uri: []const u8,
+        generation: *GeneratedDocument,
+        start: std.Io.Timestamp,
+    ) Error!void {
+        var text_changes: ?diff.TextChanges = null;
+        defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
+        var notify_kind: enum { none, open, change } = .none;
+        var notify_uri: []const u8 = &.{};
+        var notify_version: i32 = 0;
+        var notify_text: []const u8 = &.{};
+        var notify_generated_bytes: usize = 0;
+        var log_version: i32 = 0;
+        var log_opened = false;
+        var log_generated_bytes: usize = 0;
+        var log_span_count: usize = 0;
+        var log_change_count: usize = 0;
+        var diff_ns: i96 = 0;
+
+        const state_start = logStart(middleware.io);
+        {
+            middleware.documents_mutex.lockUncancelable(middleware.io);
+            defer middleware.documents_mutex.unlock(middleware.io);
+
+            const state = middleware.documents.getPtr(uri) orelse {
+                log.debug("Zig sync stale generation dropped uri={s} version={} reason=closed", .{ uri, generation.version });
+                generation.deinit(middleware.allocator);
+                generation.* = undefined;
+                return;
+            };
+            if (generation.version != state.latest_requested_version) {
+                log.debug("Zig sync stale generation dropped uri={s} version={} latest={}", .{
+                    uri,
+                    generation.version,
+                    state.latest_requested_version,
+                });
+                generation.deinit(middleware.allocator);
+                generation.* = undefined;
+                return;
+            }
+
+            const send_to_zls = generation.generation_error == null;
+            if (send_to_zls and state.opened) {
+                const current = state.current orelse return error.MissingGeneratedDocument;
+                const diff_start = logStart(middleware.io);
+                text_changes = try diff.textChanges(middleware.allocator, current.generated_text, generation.generated_text, .@"utf-8");
+                diff_ns = elapsedNs(middleware.io, diff_start);
+            }
+
+            if (send_to_zls) {
+                notify_uri = generation.generated_uri;
+                notify_version = generation.version;
+                notify_generated_bytes = generation.generated_text.len;
+                if (state.opened) {
+                    const changes = text_changes orelse return error.MissingGeneratedDocument;
+                    log_change_count = changes.items.len;
+                    if (changes.items.len != 0) {
+                        notify_kind = .change;
+                        state.zls_sync_count += 1;
+                        state.zls_synced_generation_id = generation.generation_id;
+                    } else {
+                        log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
+                            generation.generated_uri,
+                            generation.version,
+                        });
+                    }
+                } else {
+                    notify_kind = .open;
+                    notify_text = generation.generated_text;
+                    state.opened = true;
+                    state.zls_sync_count += 1;
+                    state.zls_synced_generation_id = generation.generation_id;
+                }
+            }
+
+            if (state.current) |*old| old.deinit(middleware.allocator);
+            state.current = generation.*;
+            state.in_flight_version = null;
+            generation.* = undefined;
+            const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingGeneratedDocument;
+            log_version = doc.version;
+            log_opened = state.opened;
+            log_generated_bytes = doc.generated_text.len;
+            log_span_count = doc.code_map.len();
+        }
+        const state_ns = elapsedNs(middleware.io, state_start);
+
+        const notify_start = logStart(middleware.io);
+        switch (notify_kind) {
+            .none => {},
+            .change => {
+                const changes = text_changes orelse return error.MissingGeneratedDocument;
+                log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} generated_bytes={}", .{
+                    notify_uri,
+                    notify_version,
+                    changes.items.len,
+                    notify_generated_bytes,
+                });
+                try middleware.zls_transport.transport.writeNotification(
+                    middleware.io,
+                    middleware.allocator,
+                    "textDocument/didChange",
+                    lsp.ParamsType("textDocument/didChange"),
+                    .{
+                        .textDocument = .{ .uri = notify_uri, .version = notify_version },
+                        .contentChanges = changes.items,
+                    },
+                    .{ .emit_null_optional_fields = false },
+                );
+            },
+            .open => {
+                log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
+                    notify_uri,
+                    notify_version,
+                    notify_generated_bytes,
+                });
+                try middleware.zls_transport.transport.writeNotification(
+                    middleware.io,
+                    middleware.allocator,
+                    "textDocument/didOpen",
+                    lsp.ParamsType("textDocument/didOpen"),
+                    .{
+                        .textDocument = .{
+                            .uri = notify_uri,
+                            .languageId = .{ .custom_value = "zig" },
+                            .version = notify_version,
+                            .text = notify_text,
+                        },
+                    },
+                    .{ .emit_null_optional_fields = false },
+                );
+            },
+        }
+        const notify_ns = elapsedNs(middleware.io, notify_start);
+
+        log.debug("Zig sync -> uri={s} version={} opened={} generated_bytes={} spans={} elapsed_ns={}", .{
+            uri,
+            log_version,
+            log_opened,
+            log_generated_bytes,
+            log_span_count,
+            elapsedNs(middleware.io, start),
+        });
+        log.debug("Zig sync publish-phases uri={s} version={} kind={t} changes={} state_ns={} diff_ns={} notify_ns={} elapsed_ns={}", .{
+            uri,
+            log_version,
+            notify_kind,
+            log_change_count,
+            state_ns,
+            diff_ns,
+            notify_ns,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn forwardHover(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.HoverParams,
+    ) Error!?types.Hover {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward hover <- uri={s} source_position={any}", .{ source_uri, params.position });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward hover -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward hover -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward hover mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        var result = try middleware.request(arena, "textDocument/hover", mapped);
+        if (result) |*hover_result| try translateHover(hover_result, &translation_context);
+        log.debug("Zig forward hover -> uri={s} null={} elapsed_ns={}", .{
+            source_uri,
+            result == null,
+            elapsedNs(middleware.io, start),
+        });
+        return result;
+    }
+
+    fn forwardDeclaration(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.DeclarationParams,
+    ) Error!lsp.ResultType("textDocument/declaration") {
+        return try forwardDefinitionLike(
+            "textDocument/declaration",
+            "declaration",
+            middleware,
+            arena,
+            source_uri,
+            params.textDocument,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
+    }
+
+    fn forwardDefinition(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.DefinitionParams,
+    ) Error!lsp.ResultType("textDocument/definition") {
+        return try forwardDefinitionLike(
+            "textDocument/definition",
+            "definition",
+            middleware,
+            arena,
+            source_uri,
+            params.textDocument,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
+    }
+
+    fn forwardDefinitionLike(
+        comptime method: []const u8,
+        comptime label: []const u8,
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        text_document: types.TextDocumentIdentifier,
+        position: types.Position,
+        work_done_token: ?types.ProgressToken,
+        partial_result_token: ?types.ProgressToken,
+    ) Error!lsp.ResultType(method) {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward {s} <- uri={s} source_position={any}", .{ label, source_uri, position });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(position) orelse {
+            log.debug("Zig forward {s} -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                label,
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped: lsp.ParamsType(method) = .{
+            .textDocument = text_document,
+            .position = position,
+            .workDoneToken = work_done_token,
+            .partialResultToken = partial_result_token,
+        };
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(position)) orelse {
+            log.debug("Zig forward {s} -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                label,
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward {s} mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            label,
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        const result = (try middleware.request(arena, method, mapped)) orelse {
+            log.debug("Zig forward {s} -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                label,
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated = try translateDefinition(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
+        log.debug("Zig forward {s} -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+            label,
+            source_uri,
+            definitionResultCount(result),
+            definitionResultCount(translated),
+            translated == null,
+            elapsedNs(middleware.io, start),
+        });
+        return translated;
+    }
+
+    fn forwardReferences(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.ReferenceParams,
+    ) Error!lsp.ResultType("textDocument/references") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward references <- uri={s} source_position={any} include_declaration={}", .{
+            source_uri,
+            params.position,
+            params.context.includeDeclaration,
+        });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward references -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward references -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward references mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse {
+            log.debug("Zig forward references -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated = try translateLocations(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
+        log.debug("Zig forward references -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            result.len,
+            if (translated) |locations| locations.len else 0,
+            translated == null,
+            elapsedNs(middleware.io, start),
+        });
+        return translated;
+    }
+
+    fn forwardDocumentHighlight(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.DocumentHighlightParams,
+    ) Error!lsp.ResultType("textDocument/documentHighlight") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward documentHighlight <- uri={s} source_position={any}", .{ source_uri, params.position });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward documentHighlight -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward documentHighlight -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward documentHighlight mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        const result = (try middleware.request(arena, "textDocument/documentHighlight", mapped)) orelse {
+            log.debug("Zig forward documentHighlight -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated = try translateDocumentHighlights(arena, result, &translation_context);
+        log.debug("Zig forward documentHighlight -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            result.len,
+            if (translated) |highlights| highlights.len else 0,
+            translated == null,
+            elapsedNs(middleware.io, start),
+        });
+        return translated;
+    }
+
+    fn forwardCompletion(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.CompletionParams,
+    ) Error!lsp.ResultType("textDocument/completion") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward completion <- uri={s} source_position={any}", .{ source_uri, params.position });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward completion -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward completion -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward completion mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        var result = try middleware.request(arena, "textDocument/completion", mapped);
+        const zls_count = completionResultCount(result);
+        try translateCompletionResult(arena, &result, &translation_context);
+        log.debug("Zig forward completion -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            zls_count,
+            completionResultCount(result),
+            result == null,
+            elapsedNs(middleware.io, start),
+        });
+        return result;
+    }
+
+    fn forwardSignatureHelp(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.SignatureHelpParams,
+    ) Error!lsp.ResultType("textDocument/signatureHelp") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward signatureHelp <- uri={s} source_position={any}", .{ source_uri, params.position });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward signatureHelp -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward signatureHelp -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward signatureHelp mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        const result = try middleware.request(arena, "textDocument/signatureHelp", mapped);
+        log.debug("Zig forward signatureHelp -> uri={s} result_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            if (result) |help| help.signatures.len else 0,
+            result == null,
+            elapsedNs(middleware.io, start),
+        });
+        return result;
+    }
+
+    fn forwardInlayHint(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.InlayHintParams,
+    ) Error!lsp.ResultType("textDocument/inlayHint") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward inlayHint <- uri={s} source_range={any}", .{ source_uri, params.range });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        var mapped_range: ?types.Range = null;
+        var active_span_index: ?usize = null;
+        var spans_scanned: usize = 0;
+        var spans_intersected: usize = 0;
+
+        var source_order_index = code_map.firstSourceIndexPossiblyIntersecting(params.range);
+        while (source_order_index < code_map.src_order.items.len) : (source_order_index += 1) {
+            spans_scanned += 1;
+            const span_index = code_map.src_order.items[source_order_index];
+            const source_range = sourceRangeFromTsRange(code_map.src_range.items[span_index]);
+            if (!positionLessThan(source_range.start, params.range.end)) break;
+
+            const request_range = rangeIntersection(params.range, source_range) orelse continue;
+            spans_intersected += 1;
+            const mapped_start = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.start);
+            const mapped_end = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.end);
+            mapped_range = rangeUnion(mapped_range, .{
+                .start = mapped_start,
+                .end = mapped_end,
+            });
+            active_span_index = active_span_index orelse span_index;
+        }
+
+        const resolved_range = mapped_range orelse {
+            log.debug("Zig forward inlayHint -> uri={s} result=null reason=unmapped_range spans_scanned={} spans_intersected={} elapsed_ns={}", .{
+                source_uri,
+                spans_scanned,
+                spans_intersected,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const resolved_active_span_index = active_span_index orelse {
+            log.debug("Zig forward inlayHint -> uri={s} result=null reason=no_active_span spans_scanned={} spans_intersected={} elapsed_ns={}", .{
+                source_uri,
+                spans_scanned,
+                spans_intersected,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.range = resolved_range;
+        log.debug("Zig forward inlayHint mapped uri={s} generated_uri={s} source_range={any} generated_range={any} spans_scanned={} spans_intersected={} active_span={}", .{
+            source_uri,
+            doc.generated_uri,
+            params.range,
+            resolved_range,
+            spans_scanned,
+            spans_intersected,
+            resolved_active_span_index,
+        });
+
+        const result = (try middleware.request(arena, "textDocument/inlayHint", mapped)) orelse {
+            log.debug("Zig forward inlayHint -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        if (result.len == 0) {
+            log.debug("Zig forward inlayHint -> uri={s} result=null reason=zls_empty elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        }
+
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = resolved_active_span_index,
+        };
+        defer translation_context.deinit();
+
+        const translated = try translateInlayHints(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
+        log.debug("Zig forward inlayHint -> uri={s} zls_count={} translated_count={} dropped_count={} elapsed_ns={}", .{
+            source_uri,
+            result.len,
+            translated.len,
+            result.len - translated.len,
+            elapsedNs(middleware.io, start),
+        });
+        return if (translated.len == 0) null else translated;
+    }
+
+    fn forwardDocumentSymbols(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+    ) Error!?[]const types.DocumentSymbol {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward documentSymbol <- uri={s}", .{source_uri});
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const request_result = try middleware.request(arena, "textDocument/documentSymbol", .{
+            .textDocument = .{ .uri = doc.generated_uri },
+        });
+        const result = request_result orelse {
+            log.debug("Zig forward documentSymbol -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = null,
+        };
+        defer translation_context.deinit();
+        const translated = try translateDocumentSymbols(arena, result, &translation_context);
+        log.debug("Zig forward documentSymbol -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            documentSymbolResultCount(request_result),
+            if (translated) |symbols| symbols.len else 0,
+            translated == null,
+            elapsedNs(middleware.io, start),
+        });
+        return translated;
+    }
+
+    fn forwardSemanticTokensFull(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.SemanticTokensParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward semanticTokens/full <- uri={s}", .{source_uri});
+        const doc = try middleware.documentReady(source_uri);
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+
+        const result = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
+            log.debug("Zig forward semanticTokens/full -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(result.data));
+        const source_result_id = try middleware.storeSemanticTokensSnapshot(
+            source_uri,
+            doc.source_text,
+            result.resultId,
+            translated_data,
+        );
+
+        log.debug("Zig forward semanticTokens/full -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            source_uri,
+            result.data.len / 5,
+            translated_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+        return .{
+            .resultId = source_result_id,
+            .data = translated_data,
+        };
+    }
+
+    fn forwardSemanticTokensFullDelta(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.SemanticTokensDeltaParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward semanticTokens/full/delta <- uri={s} previous={s}", .{ source_uri, params.previousResultId });
+        const doc = try middleware.documentReady(source_uri);
+        const snapshot = middleware.semanticTokensSnapshot(source_uri, params.previousResultId) orelse {
+            const full = (try middleware.forwardSemanticTokensFull(arena, source_uri, .{
+                .textDocument = params.textDocument,
+                .workDoneToken = params.workDoneToken,
+                .partialResultToken = params.partialResultToken,
+            })) orelse return null;
+            return .{ .semantic_tokens = full };
+        };
+        return try middleware.semanticTokensFullAsDelta(arena, source_uri, doc, snapshot, .{
+            .textDocument = params.textDocument,
+            .workDoneToken = params.workDoneToken,
+            .partialResultToken = params.partialResultToken,
+        }, start);
+
+        // ZLS 0.16.0 does not advertise or implement semanticTokens/full/delta, and
+        // its full responses do not include resultId. Keep the native forwarding path
+        // here because the translation work is already done, but avoid a known-null
+        // round trip until ZLS advertises delta support.
+        //
+        // const zls_previous_result_id = snapshot.zls_result_id orelse {
+        //     return try middleware.semanticTokensFullAsDelta(arena, source_uri, doc, snapshot, .{
+        //         .textDocument = params.textDocument,
+        //         .workDoneToken = params.workDoneToken,
+        //         .partialResultToken = params.partialResultToken,
+        //     }, start);
+        // };
+        //
+        // const zls_result = (try middleware.request(arena, "textDocument/semanticTokens/full/delta", .{
+        //     .textDocument = .{ .uri = doc.generated_uri },
+        //     .previousResultId = zls_previous_result_id,
+        //     .workDoneToken = params.workDoneToken,
+        //     .partialResultToken = params.partialResultToken,
+        // })) orelse {
+        //     log.debug("Zig forward semanticTokens/full/delta -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+        //         source_uri,
+        //         elapsedNs(middleware.io, start),
+        //     });
+        //     return null;
+        // };
+        //
+        // To re-enable this path, reintroduce a generated-data snapshot and preserve
+        // ZLS's generated token data before the in-place source translation above.
+        // const current_generated_data, const zls_result_id = switch (zls_result) {
+        //     .semantic_tokens => |tokens| .{ tokens.data, tokens.resultId },
+        //     .semantic_tokens_delta => |delta| .{
+        //         try applySemanticTokenEdits(arena, preserved_generated_data, delta.edits),
+        //         delta.resultId,
+        //     },
+        // };
+        // const current_source_data = try middleware.translateSemanticTokensForDocument(arena, doc, current_generated_data);
+        // const source_edits = try semanticTokenDeltaEdits(arena, snapshot.source_data, current_source_data);
+        // const source_result_id = try middleware.storeSemanticTokensSnapshot(
+        //     source_uri,
+        //     zls_result_id,
+        //     current_generated_data,
+        //     current_source_data,
+        // );
+        //
+        // log.debug("Zig forward semanticTokens/full/delta -> uri={s} source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+        //     source_uri,
+        //     source_edits.len,
+        //     current_generated_data.len / 5,
+        //     current_source_data.len / 5,
+        //     elapsedNs(middleware.io, start),
+        // });
+        // return .{ .semantic_tokens_delta = .{
+        //     .resultId = source_result_id,
+        //     .edits = source_edits,
+        // } };
+    }
+
+    fn forwardSemanticTokensRange(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.SemanticTokensRangeParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/range") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward semanticTokens/range <- uri={s} source_range={any}", .{ source_uri, params.range });
+        const doc = try middleware.documentReady(source_uri);
+        const resolved_range = (try sourceRangeToGeneratedRange(
+            middleware.allocator,
+            &doc.code_map,
+            doc.source_text,
+            doc.generated_text,
+            params.range,
+        )) orelse {
+            log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=unmapped_range elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.range = resolved_range;
+        const result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
+            log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(result.data));
+
+        log.debug("Zig forward semanticTokens/range -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            source_uri,
+            result.data.len / 5,
+            translated_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+        return .{
+            .resultId = null,
+            .data = translated_data,
+        };
+    }
+
+    fn forwardRename(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        params: types.RenameParams,
+    ) Error!lsp.ResultType("textDocument/rename") {
+        const start = logStart(middleware.io);
+        log.debug("Zig forward rename <- uri={s} source_position={any} new_name_len={}", .{
+            source_uri,
+            params.position,
+            params.newName.len,
+        });
+        const doc = try middleware.documentReady(source_uri);
+        const code_map = &doc.code_map;
+        const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
+            log.debug("Zig forward rename -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = span_index,
+        };
+        defer translation_context.deinit();
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
+            log.debug("Zig forward rename -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
+                source_uri,
+                span_index,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        log.debug("Zig forward rename mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
+            source_uri,
+            doc.generated_uri,
+            span_index,
+            mapped.position,
+        });
+
+        const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse {
+            log.debug("Zig forward rename -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated = try translateWorkspaceEdit(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
+        log.debug("Zig forward rename -> uri={s} zls_edit_count={} translated_edit_count={} null={} elapsed_ns={}", .{
+            source_uri,
+            workspaceEditCount(result),
+            if (translated) |edit| workspaceEditCount(edit) else 0,
+            translated == null,
+            elapsedNs(middleware.io, start),
+        });
+        return translated;
+    }
+
+    fn semanticTokensSnapshot(
+        middleware: *Middleware,
+        source_uri: []const u8,
+        source_result_id: []const u8,
+    ) ?*SemanticTokensSnapshot {
+        const state = middleware.documents.getPtr(source_uri) orelse return null;
+        for (state.semantic_tokens.items) |*snapshot| {
+            if (std.mem.eql(u8, snapshot.source_result_id, source_result_id)) return snapshot;
+        }
+        return null;
+    }
+
+    fn storeSemanticTokensSnapshot(
+        middleware: *Middleware,
+        source_uri: []const u8,
+        source_text: []const u8,
+        zls_result_id: ?[]const u8,
+        source_data: []const u32,
+    ) OOM![]const u8 {
+        const owned_source_data = try middleware.allocator.dupe(u32, source_data);
+        errdefer middleware.allocator.free(owned_source_data);
+        return try middleware.storeSemanticTokensSnapshotOwned(source_uri, source_text, zls_result_id, owned_source_data);
+    }
+
+    fn storeSemanticTokensSnapshotOwned(
+        middleware: *Middleware,
+        source_uri: []const u8,
+        source_text: []const u8,
+        zls_result_id: ?[]const u8,
+        owned_source_data: []u32,
+    ) OOM![]const u8 {
+        const state = middleware.documents.getPtr(source_uri) orelse unreachable;
+        const source_result_id = try std.fmt.allocPrint(
+            middleware.allocator,
+            "lsp-zitron-semantic-{d}",
+            .{state.next_semantic_tokens_result_id},
+        );
+        errdefer middleware.allocator.free(source_result_id);
+        state.next_semantic_tokens_result_id += 1;
+
+        const owned_zls_result_id = if (zls_result_id) |result_id|
+            try middleware.allocator.dupe(u8, result_id)
+        else
+            null;
+        errdefer if (owned_zls_result_id) |result_id| middleware.allocator.free(result_id);
+        const owned_source_text = try middleware.allocator.dupe(u8, source_text);
+        errdefer middleware.allocator.free(owned_source_text);
+        errdefer middleware.allocator.free(owned_source_data);
+        const owned_source_index = try semanticTokenIndexFromData(middleware.allocator, owned_source_data);
+        errdefer middleware.allocator.free(owned_source_index);
+
+        const snapshot = SemanticTokensSnapshot{
+            .source_result_id = source_result_id,
+            .zls_result_id = owned_zls_result_id,
+            .source_text = owned_source_text,
+            .source_data = owned_source_data,
+            .source_index = owned_source_index,
+        };
+        try state.semantic_tokens.append(middleware.allocator, snapshot);
+        const max_snapshots = 8;
+        while (state.semantic_tokens.items.len > max_snapshots) {
+            var old = state.semantic_tokens.orderedRemove(0);
+            old.deinit(middleware.allocator);
+        }
+        return source_result_id;
+    }
+
+    fn translateSemanticTokensForDocument(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        doc: *GeneratedDocument,
+        data: []u32,
+    ) Error![]const u32 {
+        return try middleware.translateSemanticTokensForDocumentRange(arena, doc, data, null);
+    }
+
+    fn translateSemanticTokensForDocumentRange(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        doc: *GeneratedDocument,
+        data: []u32,
+        source_filter: ?types.Range,
+    ) Error![]const u32 {
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = &doc.code_map,
+            .source_text = doc.source_text,
+            .generated_text = doc.generated_text,
+            .cache = &translation_cache,
+            .active_span_index = null,
+        };
+        defer translation_context.deinit();
+        return try translateSemanticTokenData(arena, data, &translation_context, source_filter);
+    }
+
+    fn semanticTokensFullAsDelta(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        doc: *GeneratedDocument,
+        snapshot: *const SemanticTokensSnapshot,
+        params: types.SemanticTokensParams,
+        start: std.Io.Timestamp,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
+        const range_delta = middleware.semanticTokensRangeAsDelta(arena, source_uri, doc, snapshot, params, start) catch |err| switch (err) {
+            error.UnexpectedResponse => blk: {
+                log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=unexpected_response", .{source_uri});
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (range_delta) |delta| {
+            return delta;
+        }
+
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.generated_uri };
+        const zls_start = logStart(middleware.io);
+        const full = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
+            log.debug("Zig forward semanticTokens/full/delta -> uri={s} result=null reason=zls_full_null elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const zls_ns = elapsedNs(middleware.io, zls_start);
+        const translate_start = logStart(middleware.io);
+        const current_source_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(full.data));
+        const translate_ns = elapsedNs(middleware.io, translate_start);
+        const diff_start = logStart(middleware.io);
+        const source_edits = try semanticTokenDeltaEdits(arena, snapshot.source_data, current_source_data);
+        const diff_ns = elapsedNs(middleware.io, diff_start);
+        const store_start = logStart(middleware.io);
+        const source_result_id = try middleware.storeSemanticTokensSnapshot(
+            source_uri,
+            doc.source_text,
+            full.resultId,
+            current_source_data,
+        );
+        const store_ns = elapsedNs(middleware.io, store_start);
+        log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=full_diff source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            source_uri,
+            source_edits.len,
+            full.data.len / 5,
+            current_source_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+        log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=full_diff zls_ns={} translate_ns={} diff_ns={} store_ns={} elapsed_ns={}", .{
+            source_uri,
+            zls_ns,
+            translate_ns,
+            diff_ns,
+            store_ns,
+            elapsedNs(middleware.io, start),
+        });
+        return .{ .semantic_tokens_delta = .{
+            .resultId = source_result_id,
+            .edits = source_edits,
+        } };
+    }
+
+    fn semanticTokensRangeAsDelta(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        doc: *GeneratedDocument,
+        snapshot: *const SemanticTokensSnapshot,
+        params: types.SemanticTokensParams,
+        start: std.Io.Timestamp,
+    ) Error!?lsp.ResultType("textDocument/semanticTokens/full/delta") {
+        const dirty_start = logStart(middleware.io);
+        const dirty = try semanticDirtyRangeFromDiff(arena, snapshot.source_text, doc.source_text) orelse {
+            const dirty_ns = elapsedNs(middleware.io, dirty_start);
+            log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=empty_delta source_edits=0 elapsed_ns={}", .{
+                source_uri,
+                elapsedNs(middleware.io, start),
+            });
+            log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=empty_delta dirty_ns={} elapsed_ns={}", .{
+                source_uri,
+                dirty_ns,
+                elapsedNs(middleware.io, start),
+            });
+            return .{ .semantic_tokens_delta = .{
+                .resultId = snapshot.source_result_id,
+                .edits = &.{},
+            } };
+        };
+        const dirty_ns = elapsedNs(middleware.io, dirty_start);
+        const previous_source_range = expandSemanticDirtyRange(dirty.previous);
+        const current_source_range = expandSemanticDirtyRange(dirty.current);
+        const map_start = logStart(middleware.io);
+        const generated_range = (try sourceRangeToGeneratedRange(
+            middleware.allocator,
+            &doc.code_map,
+            doc.source_text,
+            doc.generated_text,
+            current_source_range,
+        )) orelse {
+            log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=unmapped_dirty_range", .{source_uri});
+            return null;
+        };
+        const map_ns = elapsedNs(middleware.io, map_start);
+
+        const mapped: types.SemanticTokensRangeParams = .{
+            .textDocument = .{ .uri = doc.generated_uri },
+            .range = generated_range,
+            .workDoneToken = params.workDoneToken,
+            .partialResultToken = params.partialResultToken,
+        };
+        const zls_start = logStart(middleware.io);
+        const range_result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
+            log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=zls_range_null", .{source_uri});
+            return null;
+        };
+        const zls_ns = elapsedNs(middleware.io, zls_start);
+        const translate_start = logStart(middleware.io);
+        const current_range_data = try middleware.translateSemanticTokensForDocumentRange(
+            arena,
+            doc,
+            @constCast(range_result.data),
+            current_source_range,
+        );
+        const translate_ns = elapsedNs(middleware.io, translate_start);
+        const splice_start = logStart(middleware.io);
+        const source_edit = try semanticTokenRangeDeltaEdit(
+            arena,
+            snapshot.source_index,
+            previous_source_range,
+            current_range_data,
+            semanticDirtyLineDelta(dirty),
+        );
+        const splice_ns = elapsedNs(middleware.io, splice_start);
+        errdefer freeSemanticTokenEdits(arena, source_edit);
+
+        const apply_start = logStart(middleware.io);
+        const current_source_data = try applySemanticTokenEdits(
+            middleware.allocator,
+            snapshot.source_data,
+            source_edit,
+        );
+        const apply_ns = elapsedNs(middleware.io, apply_start);
+        errdefer middleware.allocator.free(current_source_data);
+
+        const store_start = logStart(middleware.io);
+        const source_result_id = try middleware.storeSemanticTokensSnapshotOwned(
+            source_uri,
+            doc.source_text,
+            null,
+            current_source_data,
+        );
+        const store_ns = elapsedNs(middleware.io, store_start);
+
+        log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=range_diff source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            source_uri,
+            source_edit.len,
+            range_result.data.len / 5,
+            current_range_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+        log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=range_diff dirty_ns={} map_ns={} zls_ns={} translate_ns={} splice_ns={} apply_ns={} store_ns={} elapsed_ns={}", .{
+            source_uri,
+            dirty_ns,
+            map_ns,
+            zls_ns,
+            translate_ns,
+            splice_ns,
+            apply_ns,
+            store_ns,
+            elapsedNs(middleware.io, start),
+        });
+        return .{ .semantic_tokens_delta = .{
+            .resultId = source_result_id,
+            .edits = source_edit,
+        } };
+    }
+
+    fn aliasCodeBlockRenameEdits(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        source_uri: []const u8,
+        alias_name: []const u8,
+        new_name: []const u8,
+        source_ranges: []const ts.Range,
+        offset_encoding: lsp.offsets.Encoding,
+    ) Error!?[]const types.TextEdit {
+        const start = logStart(middleware.io);
+        log.debug("Zig alias rename <- uri={s} ranges={} alias_len={} new_name_len={}", .{
+            source_uri,
+            source_ranges.len,
+            alias_name.len,
+            new_name.len,
+        });
+        const doc = try middleware.documentReady(source_uri);
+        var edits: std.ArrayList(types.TextEdit) = .empty;
+        errdefer edits.deinit(arena);
+        var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer seen_starts.deinit(arena);
+        var translation_cache: SpanTranslatorCache = .{};
+        defer translation_cache.deinit(middleware.allocator);
+
+        for (source_ranges) |source_range| {
+            const span_index = doc.code_map.indexForSourceRange(source_range) orelse {
+                log.debug("Zig alias rename -> uri={s} result=null reason=unmapped_source_range elapsed_ns={}", .{
+                    source_uri,
+                    elapsedNs(middleware.io, start),
+                });
+                return null;
+            };
+            const translator = try translation_cache.get(
+                middleware.allocator,
+                &doc.code_map,
+                doc.source_text,
+                doc.generated_text,
+                span_index,
+            );
+
+            try appendAliasRenameEditsFromDiff(
+                arena,
+                &edits,
+                &seen_starts,
+                doc.source_text,
+                source_range,
+                doc.generated_text,
+                doc.code_map.gen_span.items[span_index].generated_range,
+                translator.difference.edits.items,
+                alias_name,
+                new_name,
+                offset_encoding,
+            );
+        }
+
+        const result = try edits.toOwnedSlice(arena);
+        log.debug("Zig alias rename -> uri={s} edit_count={} elapsed_ns={}", .{
+            source_uri,
+            result.len,
+            elapsedNs(middleware.io, start),
+        });
+        return result;
+    }
+
+    fn initializeZls(middleware: *Middleware) Error!void {
+        const start = logStart(middleware.io);
+        const id = middleware.nextRequestId();
+        log.debug("ZLS <- initialize id={any}", .{id});
+        const number_id = switch (id) {
+            .number => |number| number,
+            .string => unreachable,
+        };
+        middleware.response_mutex.lockUncancelable(middleware.io);
+        errdefer middleware.response_mutex.unlock(middleware.io);
+        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
+        middleware.response_mutex.unlock(middleware.io);
+        errdefer {
+            middleware.response_mutex.lockUncancelable(middleware.io);
+            _ = middleware.pending_responses.remove(number_id);
+            middleware.response_mutex.unlock(middleware.io);
+        }
+
+        try middleware.zls_transport.transport.writeRequest(
+            middleware.io,
+            middleware.allocator,
+            id,
+            "initialize",
+            lsp.ParamsType("initialize"),
+            zlsInitializeParams(),
+            .{ .emit_null_optional_fields = false },
+        );
+        const wait_start = logStart(middleware.io);
+        const initialize_response = try middleware.waitResponseForId(id);
+        defer middleware.allocator.free(initialize_response);
+        log.debug("ZLS -> initialize id={any} response_bytes={} wait_ns={}", .{
+            id,
+            initialize_response.len,
+            elapsedNs(middleware.io, wait_start),
+        });
+
+        const parse_start = logStart(middleware.io);
+        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, initialize_response, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        const result_value = switch (parsed.value) {
+            .response => |response| switch (response.result_or_error) {
+                .result => |maybe_result| maybe_result,
+                .@"error" => return error.RequestFailed,
+            },
+            else => return error.UnexpectedResponse,
+        };
+        if (result_value == null or result_value.? == .null) return error.UnexpectedResponse;
+
+        const initialize_result = try std.json.parseFromValue(types.InitializeResult, middleware.allocator, result_value.?, .{
+            .ignore_unknown_fields = true,
+        });
+        defer initialize_result.deinit();
+        log.debug("ZLS initialize parsed id={any} parse_ns={}", .{
+            id,
+            elapsedNs(middleware.io, parse_start),
+        });
+
+        if (initialize_result.value.capabilities.completionProvider) |completion_options| {
+            if (completion_options.triggerCharacters) |trigger_characters| {
+                freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
+                middleware.zls_completion_triggers = try dupeStringSlices(middleware.allocator, trigger_characters);
+            }
+        }
+        warnIfZlsSemanticTokenLegendDrift(initialize_result.value.capabilities.semanticTokensProvider);
+
+        log.debug("ZLS <- initialized", .{});
+        try middleware.zls_transport.transport.writeNotification(
+            middleware.io,
+            middleware.allocator,
+            "initialized",
+            lsp.ParamsType("initialized"),
+            .{},
+            .{ .emit_null_optional_fields = false },
+        );
+        log.debug("ZLS initialize complete id={any} triggers={} elapsed_ns={}", .{
+            id,
+            middleware.zls_completion_triggers.len,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn shutdownZls(middleware: *Middleware) Error!void {
+        log.info("Stopping ZLS middleware", .{});
+        const start = logStart(middleware.io);
+        const id = middleware.nextRequestId();
+        log.debug("ZLS <- shutdown id={any}", .{id});
+        const number_id = switch (id) {
+            .number => |number| number,
+            .string => unreachable,
+        };
+        middleware.response_mutex.lockUncancelable(middleware.io);
+        errdefer middleware.response_mutex.unlock(middleware.io);
+        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
+        middleware.response_mutex.unlock(middleware.io);
+        errdefer {
+            middleware.response_mutex.lockUncancelable(middleware.io);
+            _ = middleware.pending_responses.remove(number_id);
+            middleware.response_mutex.unlock(middleware.io);
+        }
+
+        try middleware.zls_transport.transport.writeRequest(
+            middleware.io,
+            middleware.allocator,
+            id,
+            "shutdown",
+            lsp.ParamsType("shutdown"),
+            {},
+            .{ .emit_null_optional_fields = false },
+        );
+        const wait_start = logStart(middleware.io);
+        const json_message = try middleware.waitResponseForId(id);
+        log.debug("ZLS -> shutdown id={any} response_bytes={} wait_ns={}", .{
+            id,
+            json_message.len,
+            elapsedNs(middleware.io, wait_start),
+        });
+        middleware.allocator.free(json_message);
+        log.debug("ZLS <- exit", .{});
+        try middleware.zls_transport.transport.writeNotification(
+            middleware.io,
+            middleware.allocator,
+            "exit",
+            lsp.ParamsType("exit"),
+            {},
+            .{ .emit_null_optional_fields = false },
+        );
+        middleware.zls_child.stdin.?.close(middleware.io);
+        middleware.zls_child.stdin = null;
+        _ = try middleware.zls_child.wait(middleware.io);
+        log.debug("ZLS shutdown complete id={any} elapsed_ns={}", .{ id, elapsedNs(middleware.io, start) });
+    }
+
+    fn request(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        comptime method: []const u8,
+        params: lsp.ParamsType(method),
+    ) Error!lsp.ResultType(method) {
+        const start = logStart(middleware.io);
+        const id = middleware.nextRequestId();
+        log.debug("ZLS <- {s} id={any}", .{ method, id });
+        const number_id = switch (id) {
+            .number => |number| number,
+            .string => unreachable,
+        };
+        middleware.response_mutex.lockUncancelable(middleware.io);
+        errdefer middleware.response_mutex.unlock(middleware.io);
+        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
+        middleware.response_mutex.unlock(middleware.io);
+        errdefer {
+            middleware.response_mutex.lockUncancelable(middleware.io);
+            _ = middleware.pending_responses.remove(number_id);
+            middleware.response_mutex.unlock(middleware.io);
+        }
+
+        try middleware.zls_transport.transport.writeRequest(
+            middleware.io,
+            middleware.allocator,
+            id,
+            method,
+            lsp.ParamsType(method),
+            params,
+            .{ .emit_null_optional_fields = false },
+        );
+
+        const wait_start = logStart(middleware.io);
+        const json_message = try middleware.waitResponseForId(id);
+        const wait_ns = elapsedNs(middleware.io, wait_start);
+        log.debug("ZLS -> {s} id={any} response_bytes={} wait_ns={}", .{
+            method,
+            id,
+            json_message.len,
+            wait_ns,
+        });
+        const parse_start = logStart(middleware.io);
+        defer middleware.allocator.free(json_message);
+        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, arena, json_message, .{
+            .ignore_unknown_fields = true,
+        });
+        const parse_ns = elapsedNs(middleware.io, parse_start);
+
+        const result_value = switch (parsed.value) {
+            .response => |response| switch (response.result_or_error) {
+                .result => |maybe_result| maybe_result,
+                .@"error" => {
+                    log.warn("ZLS '{s}' request failed id={any}", .{ method, id });
+                    return error.RequestFailed;
+                },
+            },
+            else => return error.UnexpectedResponse,
+        };
+        if (result_value == null or result_value.? == .null) {
+            log.debug("ZLS parsed {s} id={any} result=null parse_ns={} elapsed_ns={}", .{
+                method,
+                id,
+                parse_ns,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        }
+
+        const typed_parse_start = logStart(middleware.io);
+        const typed = try std.json.parseFromValue(lsp.ResultType(method), arena, result_value.?, .{
+            .ignore_unknown_fields = true,
+        });
+        log.debug("ZLS parsed {s} id={any} result=success parse_ns={} typed_parse_ns={} elapsed_ns={}", .{
+            method,
+            id,
+            parse_ns,
+            elapsedNs(middleware.io, typed_parse_start),
+            elapsedNs(middleware.io, start),
+        });
+        return typed.value;
+    }
+
+    fn waitResponseForId(middleware: *Middleware, id: lsp.JsonRPCMessage.ID) Error![]u8 {
+        const number_id = switch (id) {
+            .number => |number| number,
+            .string => return error.UnexpectedResponse,
+        };
+
+        middleware.response_mutex.lockUncancelable(middleware.io);
+        defer middleware.response_mutex.unlock(middleware.io);
+
+        while (true) {
+            if (middleware.pending_responses.getPtr(number_id)) |pending| {
+                if (pending.response) |response| {
+                    _ = middleware.pending_responses.remove(number_id);
+                    return response;
+                }
+            } else {
+                return error.UnexpectedResponse;
+            }
+            if (middleware.reader_failed) return error.UnexpectedResponse;
+            middleware.response_cond.waitUncancelable(middleware.io, &middleware.response_mutex);
+        }
+    }
+
+    fn nextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
+        const id = middleware.next_request_id;
+        middleware.next_request_id += 1;
+        return .{ .number = id };
+    }
+
+    fn documentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
+        const state = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
+        const doc = state.currentGeneration() orelse return error.MissingGeneratedDocument;
+        if (doc.generation_error != null) return error.RequestFailed;
+        return doc;
+    }
+
+    fn documentForGeneratedUri(middleware: *Middleware, generated_uri: []const u8) ?*DocumentState {
+        var it = middleware.documents.iterator();
+        while (it.next()) |entry| {
+            const current = entry.value_ptr.current orelse continue;
+            if (std.mem.eql(u8, current.generated_uri, generated_uri)) return entry.value_ptr;
+        }
+        return null;
+    }
+
+    fn handleZlsDiagnostics(
+        middleware: *Middleware,
+        params_value: ?std.json.Value,
+    ) Error!?PublishedDiagnostics {
+        const value = params_value orelse return null;
+        const parsed = try std.json.parseFromValue(types.PublishDiagnosticsParams, middleware.allocator, value, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        const params = parsed.value;
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+
+        const state = middleware.documentForGeneratedUri(params.uri) orelse {
+            log.debug("ZLS diagnostics ignored uri={s} reason=unknown_generated_uri count={}", .{
+                params.uri,
+                params.diagnostics.len,
+            });
+            return null;
+        };
+        const doc = state.currentForVersion(params.version) orelse {
+            const current_version = if (state.current) |current| current.version else null;
+            log.debug("ZLS diagnostics ignored uri={s} reason=stale_or_ambiguous_version zls_version={?} current_version={?} count={}", .{
+                params.uri,
+                params.version,
+                current_version,
+                params.diagnostics.len,
+            });
+            return null;
+        };
+
+        if (params.version == null and state.in_flight_version != null) {
+            log.debug("ZLS diagnostics ignored uri={s} reason=null_version_in_flight current_version={} count={}", .{
+                params.uri,
+                doc.version,
+                params.diagnostics.len,
+            });
+            return null;
+        }
+
+        freeStoredDiagnostics(middleware.allocator, doc.zls_diagnostics);
+        doc.zls_diagnostics = try translateZlsDiagnostics(middleware.allocator, doc, params.diagnostics);
+        doc.zls_diagnostics_version = params.version orelse doc.version;
+        log.debug("ZLS diagnostics stored source_uri={s} generated_uri={s} zls_version={?} current_version={} zls_count={} translated_count={}", .{
+            doc.source_uri,
+            doc.generated_uri,
+            params.version,
+            doc.version,
+            params.diagnostics.len,
+            doc.zls_diagnostics.len,
+        });
+        for (doc.zls_diagnostics, 0..) |diagnostic, index| {
+            if (index >= 3) break;
+            log.debug("ZLS diagnostic detail source_uri={s} index={} range={any} severity={?} message={s}", .{
+                doc.source_uri,
+                index,
+                diagnostic.range,
+                diagnostic.severity,
+                diagnostic.message,
+            });
+        }
+        return .{
+            .source_uri = try middleware.allocator.dupe(u8, doc.source_uri),
+            .version = doc.version,
+        };
+    }
+
+    fn readerMain(middleware: *Middleware) void {
+        while (true) {
+            const json_message = middleware.zls_transport.transport.readJsonMessage(
+                middleware.io,
+                middleware.allocator,
+            ) catch |err| {
+                log.debug("ZLS reader stopped: {}", .{err});
+                middleware.response_mutex.lockUncancelable(middleware.io);
+                middleware.reader_failed = true;
+                middleware.response_cond.broadcast(middleware.io);
+                middleware.response_mutex.unlock(middleware.io);
+                return;
+            };
+
+            const consumed = middleware.handleZlsMessage(json_message) catch |err| blk: {
+                log.warn("ZLS message ignored: {}", .{err});
+                break :blk false;
+            };
+            if (!consumed) middleware.allocator.free(json_message);
+        }
+    }
+
+    fn handleZlsMessage(middleware: *Middleware, json_message: []u8) Error!bool {
+        log.debug("ZLS read message bytes={}", .{json_message.len});
+        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, json_message, .{
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+
+        switch (parsed.value) {
+            .response => |response| {
+                const id = response.id orelse {
+                    log.debug("ZLS ignored response response_has_id=false", .{});
+                    return false;
+                };
+                const number_id = switch (id) {
+                    .number => |number| number,
+                    .string => {
+                        log.debug("ZLS ignored response id={any} reason=string_id", .{id});
+                        return false;
+                    },
+                };
+
+                middleware.response_mutex.lockUncancelable(middleware.io);
+                defer middleware.response_mutex.unlock(middleware.io);
+                if (middleware.pending_responses.getPtr(number_id)) |pending| {
+                    pending.response = json_message;
+                    middleware.response_cond.broadcast(middleware.io);
+                    return true;
+                }
+                log.debug("ZLS ignored response id={any} reason=unknown_id", .{id});
+                return false;
+            },
+            .request => |zls_request| {
+                log.debug("ZLS ignored request method={s}", .{zls_request.method});
+                return false;
+            },
+            .notification => |notification| {
+                if (std.mem.eql(u8, notification.method, "textDocument/publishDiagnostics")) {
+                    if (try middleware.handleZlsDiagnostics(notification.params)) |published| {
+                        if (middleware.diagnostics_context) |context| {
+                            if (middleware.diagnostics_publisher) |publisher| {
+                                publisher(context, published.source_uri, published.version);
+                            }
+                        }
+                        middleware.allocator.free(published.source_uri);
+                    }
+                } else {
+                    log.debug("ZLS ignored notification method={s}", .{notification.method});
+                }
+                return false;
+            },
+        }
+    }
 };
 
 const PendingResponse = struct {
@@ -191,16 +2086,14 @@ const SemanticTokensSnapshot = struct {
     }
 };
 
-pub fn disabled() ZigMiddleware {
-    return .{ .mode = .disabled };
-}
+pub const disabled: ZigMiddleware = .{ .mode = .disabled };
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     return initImpl(io, allocator) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             log.warn("Zig middleware disabled: {}", .{err});
-            return disabled();
+            return .disabled;
         },
     };
 }
@@ -553,460 +2446,6 @@ fn suppressForwardRequestFailure(comptime operation: []const u8, source_uri: []c
     }
 }
 
-fn middlewareSemanticTokensSnapshot(
-    middleware: *Middleware,
-    source_uri: []const u8,
-    source_result_id: []const u8,
-) ?*SemanticTokensSnapshot {
-    const state = middleware.documents.getPtr(source_uri) orelse return null;
-    for (state.semantic_tokens.items) |*snapshot| {
-        if (std.mem.eql(u8, snapshot.source_result_id, source_result_id)) return snapshot;
-    }
-    return null;
-}
-
-fn middlewareStoreSemanticTokensSnapshot(
-    middleware: *Middleware,
-    source_uri: []const u8,
-    source_text: []const u8,
-    zls_result_id: ?[]const u8,
-    source_data: []const u32,
-) OOM![]const u8 {
-    const owned_source_data = try middleware.allocator.dupe(u32, source_data);
-    errdefer middleware.allocator.free(owned_source_data);
-    return try middleware.storeSemanticTokensSnapshotOwned(source_uri, source_text, zls_result_id, owned_source_data);
-}
-
-fn middlewareStoreSemanticTokensSnapshotOwned(
-    middleware: *Middleware,
-    source_uri: []const u8,
-    source_text: []const u8,
-    zls_result_id: ?[]const u8,
-    owned_source_data: []u32,
-) OOM![]const u8 {
-    const state = middleware.documents.getPtr(source_uri) orelse unreachable;
-    const source_result_id = try std.fmt.allocPrint(
-        middleware.allocator,
-        "lsp-zitron-semantic-{d}",
-        .{state.next_semantic_tokens_result_id},
-    );
-    errdefer middleware.allocator.free(source_result_id);
-    state.next_semantic_tokens_result_id += 1;
-
-    const owned_zls_result_id = if (zls_result_id) |result_id|
-        try middleware.allocator.dupe(u8, result_id)
-    else
-        null;
-    errdefer if (owned_zls_result_id) |result_id| middleware.allocator.free(result_id);
-    const owned_source_text = try middleware.allocator.dupe(u8, source_text);
-    errdefer middleware.allocator.free(owned_source_text);
-    errdefer middleware.allocator.free(owned_source_data);
-    const owned_source_index = try semanticTokenIndexFromData(middleware.allocator, owned_source_data);
-    errdefer middleware.allocator.free(owned_source_index);
-
-    const snapshot = SemanticTokensSnapshot{
-        .source_result_id = source_result_id,
-        .zls_result_id = owned_zls_result_id,
-        .source_text = owned_source_text,
-        .source_data = owned_source_data,
-        .source_index = owned_source_index,
-    };
-    try state.semantic_tokens.append(middleware.allocator, snapshot);
-    const max_snapshots = 8;
-    while (state.semantic_tokens.items.len > max_snapshots) {
-        var old = state.semantic_tokens.orderedRemove(0);
-        old.deinit(middleware.allocator);
-    }
-    return source_result_id;
-}
-
-fn middlewareTranslateSemanticTokensForDocument(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    doc: *GeneratedDocument,
-    data: []u32,
-) Error![]const u32 {
-    return try middleware.translateSemanticTokensForDocumentRange(arena, doc, data, null);
-}
-
-fn middlewareTranslateSemanticTokensForDocumentRange(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    doc: *GeneratedDocument,
-    data: []u32,
-    source_filter: ?types.Range,
-) Error![]const u32 {
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = &doc.code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = null,
-    };
-    defer translation_context.deinit();
-    return try translateSemanticTokenData(arena, data, &translation_context, source_filter);
-}
-
-fn middlewareDeinit(middleware: *Middleware) void {
-    freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
-    middleware.shutdownZls() catch |err| {
-        log.warn("ZLS shutdown failed: {}", .{err});
-        middleware.zls_child.kill(middleware.io);
-    };
-    if (middleware.reader_thread) |thread| {
-        thread.join();
-        middleware.reader_thread = null;
-    }
-
-    middleware.documents_mutex.lockUncancelable(middleware.io);
-    defer middleware.documents_mutex.unlock(middleware.io);
-    var it = middleware.documents.iterator();
-    while (it.next()) |entry| {
-        middleware.allocator.free(entry.key_ptr.*);
-        entry.value_ptr.deinit(middleware.allocator);
-    }
-    middleware.documents.deinit(middleware.allocator);
-
-    var pending_it = middleware.pending_responses.iterator();
-    while (pending_it.next()) |entry| {
-        if (entry.value_ptr.response) |response| middleware.allocator.free(response);
-    }
-    middleware.pending_responses.deinit(middleware.allocator);
-    middleware.allocator.free(middleware.zls_read_buffer);
-}
-
-fn middlewareSyncDocument(
-    middleware: *Middleware,
-    uri: []const u8,
-    version: i32,
-    source_text: []const u8,
-    source_root: ts.Node,
-    semantic_dirty_range: ?SemanticDirtyRange,
-) Error!void {
-    const start = logStart(middleware.io);
-    log.debug("Zig sync <- uri={s} version={} source_bytes={}", .{ uri, version, source_text.len });
-
-    const generation_id = blk: {
-        middleware.documents_mutex.lockUncancelable(middleware.io);
-        defer middleware.documents_mutex.unlock(middleware.io);
-
-        const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
-        if (!gop.found_existing) {
-            errdefer _ = middleware.documents.remove(uri);
-            gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
-            errdefer middleware.allocator.free(gop.key_ptr.*);
-            gop.value_ptr.* = .{
-                .current = null,
-                .latest_requested_version = version,
-                .in_flight_version = version,
-                .opened = false,
-                .zls_sync_count = 0,
-                .zls_synced_generation_id = null,
-            };
-            log.debug("Zig sync doc-created uri={s}", .{uri});
-        } else {
-            gop.value_ptr.latest_requested_version = version;
-            gop.value_ptr.in_flight_version = version;
-        }
-
-        const id = middleware.next_generation_id;
-        middleware.next_generation_id += 1;
-        break :blk id;
-    };
-
-    var source_path = try filePathFromUri(middleware.allocator, uri);
-    errdefer if (source_path.len != 0) middleware.allocator.free(source_path);
-    var generated_uri = try generatedUriForSourceUri(middleware.allocator, uri);
-    errdefer if (generated_uri.len != 0) middleware.allocator.free(generated_uri);
-    var owned_source_text = try middleware.allocator.dupe(u8, source_text);
-    errdefer if (owned_source_text.len != 0) middleware.allocator.free(owned_source_text);
-
-    const generation_start = logStart(middleware.io);
-    var generation_ns: i96 = 0;
-    var diagnostics_ns: i96 = 0;
-    var code_map_ns: i96 = 0;
-    var publish_ns: i96 = 0;
-    const generated = runZitron(middleware.allocator, middleware.io, source_path, source_text) catch |err| {
-        generation_ns = elapsedNs(middleware.io, generation_start);
-        log.warn("Zitron generation failed for '{s}': {}", .{ source_path, err });
-        const generation_error = try middleware.allocator.dupe(u8, @errorName(err));
-        errdefer middleware.allocator.free(generation_error);
-        const empty_generated = try middleware.allocator.alloc(u8, 0);
-        errdefer middleware.allocator.free(empty_generated);
-        var generation = GeneratedDocument{
-            .generation_id = generation_id,
-            .source_uri = try middleware.allocator.dupe(u8, uri),
-            .source_path = source_path,
-            .source_text = owned_source_text,
-            .generated_uri = generated_uri,
-            .generated_text = empty_generated,
-            .code_map = .{},
-            .generation_error = generation_error,
-            .grammar_diagnostics = &.{},
-            .zls_diagnostics = &.{},
-            .zls_diagnostics_version = null,
-            .semantic_dirty_range = semantic_dirty_range,
-            .version = version,
-            .opened = false,
-        };
-        source_path = &.{};
-        generated_uri = &.{};
-        owned_source_text = &.{};
-        errdefer generation.deinit(middleware.allocator);
-        const publish_start = logStart(middleware.io);
-        try middleware.publishGeneration(uri, &generation, start);
-        publish_ns = elapsedNs(middleware.io, publish_start);
-        log.debug("Zig sync phases uri={s} version={} generation_ns={} diagnostics_ns={} code_map_ns={} publish_ns={} elapsed_ns={}", .{
-            uri,
-            version,
-            generation_ns,
-            diagnostics_ns,
-            code_map_ns,
-            publish_ns,
-            elapsedNs(middleware.io, start),
-        });
-        return;
-    };
-    generation_ns = elapsedNs(middleware.io, generation_start);
-    defer middleware.allocator.free(generated.stderr);
-
-    const diagnostics_start = logStart(middleware.io);
-    var grammar_diagnostics = try parseZitronDiagnostics(middleware.allocator, generated.stderr);
-    diagnostics_ns = elapsedNs(middleware.io, diagnostics_start);
-    errdefer if (grammar_diagnostics.len != 0) freeStoredDiagnostics(middleware.allocator, grammar_diagnostics);
-
-    var generation_error: ?[]u8 = null;
-    errdefer if (generation_error) |message| middleware.allocator.free(message);
-    var generated_text: []u8 = undefined;
-    var generated_text_needs_free = false;
-    errdefer if (generated_text_needs_free) middleware.allocator.free(generated_text);
-    var code_map: CodeMap = .{};
-    var code_map_needs_deinit = true;
-    errdefer if (code_map_needs_deinit) code_map.deinit(middleware.allocator);
-
-    if (zitronOutputFailedWithoutStdout(generated.term, generated.stdout.len)) {
-        log.warn("Zitron generation exited unsuccessfully for '{s}': {s}", .{ source_path, generated.stderr });
-        middleware.allocator.free(generated.stdout);
-        generated_text = try middleware.allocator.alloc(u8, 0);
-        generation_error = try middleware.allocator.dupe(u8, generated.stderr);
-    } else {
-        generated_text = generated.stdout;
-        generated_text_needs_free = true;
-        if (zitronTermFailed(generated.term)) {
-            log.debug("Zitron generation exited with errors for '{s}' but produced stdout; publishing generated text: {s}", .{
-                source_path,
-                generated.stderr,
-            });
-        }
-        log.debug("Zig sync generated uri={s} generated_bytes={} stderr_bytes={} elapsed_ns={}", .{
-            uri,
-            generated_text.len,
-            generated.stderr.len,
-            elapsedNs(middleware.io, generation_start),
-        });
-        const code_map_start = logStart(middleware.io);
-        try code_map.update(middleware.allocator, source_root, source_text, generated_text, source_path);
-        code_map_ns = elapsedNs(middleware.io, code_map_start);
-        log.debug("Zig sync code-map uri={s} spans={}", .{ uri, code_map.len() });
-    }
-
-    var generation = GeneratedDocument{
-        .generation_id = generation_id,
-        .source_uri = try middleware.allocator.dupe(u8, uri),
-        .source_path = source_path,
-        .source_text = owned_source_text,
-        .generated_uri = generated_uri,
-        .generated_text = generated_text,
-        .code_map = code_map,
-        .generation_error = generation_error,
-        .grammar_diagnostics = grammar_diagnostics,
-        .zls_diagnostics = &.{},
-        .zls_diagnostics_version = null,
-        .semantic_dirty_range = semantic_dirty_range,
-        .version = version,
-        .opened = false,
-    };
-    source_path = &.{};
-    generated_uri = &.{};
-    owned_source_text = &.{};
-    grammar_diagnostics = &.{};
-    generation_error = null;
-    generated_text_needs_free = false;
-    code_map_needs_deinit = false;
-    errdefer generation.deinit(middleware.allocator);
-    const publish_start = logStart(middleware.io);
-    try middleware.publishGeneration(uri, &generation, start);
-    publish_ns = elapsedNs(middleware.io, publish_start);
-    log.debug("Zig sync phases uri={s} version={} generation_ns={} diagnostics_ns={} code_map_ns={} publish_ns={} elapsed_ns={}", .{
-        uri,
-        version,
-        generation_ns,
-        diagnostics_ns,
-        code_map_ns,
-        publish_ns,
-        elapsedNs(middleware.io, start),
-    });
-}
-
-fn middlewarePublishGeneration(
-    middleware: *Middleware,
-    uri: []const u8,
-    generation: *GeneratedDocument,
-    start: std.Io.Timestamp,
-) Error!void {
-    var text_changes: ?diff.TextChanges = null;
-    defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
-    var notify_kind: enum { none, open, change } = .none;
-    var notify_uri: []const u8 = &.{};
-    var notify_version: i32 = 0;
-    var notify_text: []const u8 = &.{};
-    var notify_generated_bytes: usize = 0;
-    var log_version: i32 = 0;
-    var log_opened = false;
-    var log_generated_bytes: usize = 0;
-    var log_span_count: usize = 0;
-    var log_change_count: usize = 0;
-    var diff_ns: i96 = 0;
-
-    const state_start = logStart(middleware.io);
-    {
-        middleware.documents_mutex.lockUncancelable(middleware.io);
-        defer middleware.documents_mutex.unlock(middleware.io);
-
-        const state = middleware.documents.getPtr(uri) orelse {
-            log.debug("Zig sync stale generation dropped uri={s} version={} reason=closed", .{ uri, generation.version });
-            generation.deinit(middleware.allocator);
-            generation.* = undefined;
-            return;
-        };
-        if (generation.version != state.latest_requested_version) {
-            log.debug("Zig sync stale generation dropped uri={s} version={} latest={}", .{
-                uri,
-                generation.version,
-                state.latest_requested_version,
-            });
-            generation.deinit(middleware.allocator);
-            generation.* = undefined;
-            return;
-        }
-
-        const send_to_zls = generation.generation_error == null;
-        if (send_to_zls and state.opened) {
-            const current = state.current orelse return error.MissingGeneratedDocument;
-            const diff_start = logStart(middleware.io);
-            text_changes = try diff.textChanges(middleware.allocator, current.generated_text, generation.generated_text, .@"utf-8");
-            diff_ns = elapsedNs(middleware.io, diff_start);
-        }
-
-        if (send_to_zls) {
-            notify_uri = generation.generated_uri;
-            notify_version = generation.version;
-            notify_generated_bytes = generation.generated_text.len;
-            if (state.opened) {
-                const changes = text_changes orelse return error.MissingGeneratedDocument;
-                log_change_count = changes.items.len;
-                if (changes.items.len != 0) {
-                    notify_kind = .change;
-                    state.zls_sync_count += 1;
-                    state.zls_synced_generation_id = generation.generation_id;
-                } else {
-                    log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
-                        generation.generated_uri,
-                        generation.version,
-                    });
-                }
-            } else {
-                notify_kind = .open;
-                notify_text = generation.generated_text;
-                state.opened = true;
-                state.zls_sync_count += 1;
-                state.zls_synced_generation_id = generation.generation_id;
-            }
-        }
-
-        if (state.current) |*old| old.deinit(middleware.allocator);
-        state.current = generation.*;
-        state.in_flight_version = null;
-        generation.* = undefined;
-        const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingGeneratedDocument;
-        log_version = doc.version;
-        log_opened = state.opened;
-        log_generated_bytes = doc.generated_text.len;
-        log_span_count = doc.code_map.len();
-    }
-    const state_ns = elapsedNs(middleware.io, state_start);
-
-    const notify_start = logStart(middleware.io);
-    switch (notify_kind) {
-        .none => {},
-        .change => {
-            const changes = text_changes orelse return error.MissingGeneratedDocument;
-            log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} generated_bytes={}", .{
-                notify_uri,
-                notify_version,
-                changes.items.len,
-                notify_generated_bytes,
-            });
-            try middleware.zls_transport.transport.writeNotification(
-                middleware.io,
-                middleware.allocator,
-                "textDocument/didChange",
-                lsp.ParamsType("textDocument/didChange"),
-                .{
-                    .textDocument = .{ .uri = notify_uri, .version = notify_version },
-                    .contentChanges = changes.items,
-                },
-                .{ .emit_null_optional_fields = false },
-            );
-        },
-        .open => {
-            log.debug("ZLS <- textDocument/didOpen uri={s} version={} generated_bytes={}", .{
-                notify_uri,
-                notify_version,
-                notify_generated_bytes,
-            });
-            try middleware.zls_transport.transport.writeNotification(
-                middleware.io,
-                middleware.allocator,
-                "textDocument/didOpen",
-                lsp.ParamsType("textDocument/didOpen"),
-                .{
-                    .textDocument = .{
-                        .uri = notify_uri,
-                        .languageId = .{ .custom_value = "zig" },
-                        .version = notify_version,
-                        .text = notify_text,
-                    },
-                },
-                .{ .emit_null_optional_fields = false },
-            );
-        },
-    }
-    const notify_ns = elapsedNs(middleware.io, notify_start);
-
-    log.debug("Zig sync -> uri={s} version={} opened={} generated_bytes={} spans={} elapsed_ns={}", .{
-        uri,
-        log_version,
-        log_opened,
-        log_generated_bytes,
-        log_span_count,
-        elapsedNs(middleware.io, start),
-    });
-    log.debug("Zig sync publish-phases uri={s} version={} kind={t} changes={} state_ns={} diff_ns={} notify_ns={} elapsed_ns={}", .{
-        uri,
-        log_version,
-        notify_kind,
-        log_change_count,
-        state_ns,
-        diff_ns,
-        notify_ns,
-        elapsedNs(middleware.io, start),
-    });
-}
-
 fn zitronOutputFailedWithoutStdout(term: std.process.Child.Term, stdout_len: usize) bool {
     return zitronTermFailed(term) and stdout_len == 0;
 }
@@ -1080,74 +2519,6 @@ fn freeStoredDiagnostic(allocator: std.mem.Allocator, diagnostic: types.Diagnost
     if (diagnostic.tags) |tags| allocator.free(tags);
 }
 
-fn middlewareHandleZlsDiagnostics(
-    middleware: *Middleware,
-    params_value: ?std.json.Value,
-) Error!?PublishedDiagnostics {
-    const value = params_value orelse return null;
-    const parsed = try std.json.parseFromValue(types.PublishDiagnosticsParams, middleware.allocator, value, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-
-    const params = parsed.value;
-    middleware.documents_mutex.lockUncancelable(middleware.io);
-    defer middleware.documents_mutex.unlock(middleware.io);
-
-    const state = middleware.documentForGeneratedUri(params.uri) orelse {
-        log.debug("ZLS diagnostics ignored uri={s} reason=unknown_generated_uri count={}", .{
-            params.uri,
-            params.diagnostics.len,
-        });
-        return null;
-    };
-    const doc = state.currentForVersion(params.version) orelse {
-        const current_version = if (state.current) |current| current.version else null;
-        log.debug("ZLS diagnostics ignored uri={s} reason=stale_or_ambiguous_version zls_version={?} current_version={?} count={}", .{
-            params.uri,
-            params.version,
-            current_version,
-            params.diagnostics.len,
-        });
-        return null;
-    };
-
-    if (params.version == null and state.in_flight_version != null) {
-        log.debug("ZLS diagnostics ignored uri={s} reason=null_version_in_flight current_version={} count={}", .{
-            params.uri,
-            doc.version,
-            params.diagnostics.len,
-        });
-        return null;
-    }
-
-    freeStoredDiagnostics(middleware.allocator, doc.zls_diagnostics);
-    doc.zls_diagnostics = try translateZlsDiagnostics(middleware.allocator, doc, params.diagnostics);
-    doc.zls_diagnostics_version = params.version orelse doc.version;
-    log.debug("ZLS diagnostics stored source_uri={s} generated_uri={s} zls_version={?} current_version={} zls_count={} translated_count={}", .{
-        doc.source_uri,
-        doc.generated_uri,
-        params.version,
-        doc.version,
-        params.diagnostics.len,
-        doc.zls_diagnostics.len,
-    });
-    for (doc.zls_diagnostics, 0..) |diagnostic, index| {
-        if (index >= 3) break;
-        log.debug("ZLS diagnostic detail source_uri={s} index={} range={any} severity={?} message={s}", .{
-            doc.source_uri,
-            index,
-            diagnostic.range,
-            diagnostic.severity,
-            diagnostic.message,
-        });
-    }
-    return .{
-        .source_uri = try middleware.allocator.dupe(u8, doc.source_uri),
-        .version = doc.version,
-    };
-}
-
 fn translateZlsDiagnostics(
     allocator: std.mem.Allocator,
     doc: *GeneratedDocument,
@@ -1214,1077 +2585,6 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
         .number => |number| .{ .number = number },
         .string => |string| .{ .string = try allocator.dupe(u8, string) },
     };
-}
-
-fn middlewareCloseDocument(middleware: *Middleware, uri: []const u8) void {
-    const start = logStart(middleware.io);
-    log.debug("Zig close <- uri={s}", .{uri});
-
-    const removed = blk: {
-        middleware.documents_mutex.lockUncancelable(middleware.io);
-        defer middleware.documents_mutex.unlock(middleware.io);
-        break :blk middleware.documents.fetchRemove(uri) orelse return;
-    };
-
-    middleware.allocator.free(removed.key);
-    var state = removed.value;
-    if (state.opened) {
-        if (state.currentGeneration()) |generation| {
-            log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.generated_uri});
-            middleware.zls_transport.transport.writeNotification(
-                middleware.io,
-                middleware.allocator,
-                "textDocument/didClose",
-                lsp.ParamsType("textDocument/didClose"),
-                .{ .textDocument = .{ .uri = generation.generated_uri } },
-                .{ .emit_null_optional_fields = false },
-            ) catch {};
-        }
-    }
-    state.deinit(middleware.allocator);
-    log.debug("Zig close -> uri={s} elapsed_ns={}", .{ uri, elapsedNs(middleware.io, start) });
-}
-
-fn middlewareForwardHover(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.HoverParams,
-) Error!?types.Hover {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward hover <- uri={s} source_position={any}", .{ source_uri, params.position });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward hover -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward hover -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward hover mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    var result = try middleware.request(arena, "textDocument/hover", mapped);
-    if (result) |*hover_result| try translateHover(hover_result, &translation_context);
-    log.debug("Zig forward hover -> uri={s} null={} elapsed_ns={}", .{
-        source_uri,
-        result == null,
-        elapsedNs(middleware.io, start),
-    });
-    return result;
-}
-
-fn middlewareForwardDefinition(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.DefinitionParams,
-) Error!lsp.ResultType("textDocument/definition") {
-    return try middlewareForwardDefinitionLike(
-        "textDocument/definition",
-        "definition",
-        middleware,
-        arena,
-        source_uri,
-        params.textDocument,
-        params.position,
-        params.workDoneToken,
-        params.partialResultToken,
-    );
-}
-
-fn middlewareForwardDeclaration(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.DeclarationParams,
-) Error!lsp.ResultType("textDocument/declaration") {
-    return try middlewareForwardDefinitionLike(
-        "textDocument/declaration",
-        "declaration",
-        middleware,
-        arena,
-        source_uri,
-        params.textDocument,
-        params.position,
-        params.workDoneToken,
-        params.partialResultToken,
-    );
-}
-
-fn middlewareForwardDefinitionLike(
-    comptime method: []const u8,
-    comptime label: []const u8,
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    text_document: types.TextDocumentIdentifier,
-    position: types.Position,
-    work_done_token: ?types.ProgressToken,
-    partial_result_token: ?types.ProgressToken,
-) Error!lsp.ResultType(method) {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward {s} <- uri={s} source_position={any}", .{ label, source_uri, position });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(position) orelse {
-        log.debug("Zig forward {s} -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            label,
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped: lsp.ParamsType(method) = .{
-        .textDocument = text_document,
-        .position = position,
-        .workDoneToken = work_done_token,
-        .partialResultToken = partial_result_token,
-    };
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(position)) orelse {
-        log.debug("Zig forward {s} -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            label,
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward {s} mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        label,
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    const result = (try middleware.request(arena, method, mapped)) orelse {
-        log.debug("Zig forward {s} -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            label,
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated = try translateDefinition(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
-    log.debug("Zig forward {s} -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
-        label,
-        source_uri,
-        definitionResultCount(result),
-        definitionResultCount(translated),
-        translated == null,
-        elapsedNs(middleware.io, start),
-    });
-    return translated;
-}
-
-fn middlewareForwardReferences(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.ReferenceParams,
-) Error!lsp.ResultType("textDocument/references") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward references <- uri={s} source_position={any} include_declaration={}", .{
-        source_uri,
-        params.position,
-        params.context.includeDeclaration,
-    });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward references -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward references -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward references mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse {
-        log.debug("Zig forward references -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated = try translateLocations(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
-    log.debug("Zig forward references -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        result.len,
-        if (translated) |locations| locations.len else 0,
-        translated == null,
-        elapsedNs(middleware.io, start),
-    });
-    return translated;
-}
-
-fn middlewareForwardDocumentHighlight(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.DocumentHighlightParams,
-) Error!lsp.ResultType("textDocument/documentHighlight") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward documentHighlight <- uri={s} source_position={any}", .{ source_uri, params.position });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward documentHighlight mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    const result = (try middleware.request(arena, "textDocument/documentHighlight", mapped)) orelse {
-        log.debug("Zig forward documentHighlight -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated = try translateDocumentHighlights(arena, result, &translation_context);
-    log.debug("Zig forward documentHighlight -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        result.len,
-        if (translated) |highlights| highlights.len else 0,
-        translated == null,
-        elapsedNs(middleware.io, start),
-    });
-    return translated;
-}
-
-fn middlewareForwardCompletion(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.CompletionParams,
-) Error!lsp.ResultType("textDocument/completion") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward completion <- uri={s} source_position={any}", .{ source_uri, params.position });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward completion -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward completion -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward completion mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    var result = try middleware.request(arena, "textDocument/completion", mapped);
-    const zls_count = completionResultCount(result);
-    try translateCompletionResult(arena, &result, &translation_context);
-    log.debug("Zig forward completion -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        zls_count,
-        completionResultCount(result),
-        result == null,
-        elapsedNs(middleware.io, start),
-    });
-    return result;
-}
-
-fn middlewareForwardSignatureHelp(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.SignatureHelpParams,
-) Error!lsp.ResultType("textDocument/signatureHelp") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward signatureHelp <- uri={s} source_position={any}", .{ source_uri, params.position });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward signatureHelp -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward signatureHelp -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward signatureHelp mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    const result = try middleware.request(arena, "textDocument/signatureHelp", mapped);
-    log.debug("Zig forward signatureHelp -> uri={s} result_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        if (result) |help| help.signatures.len else 0,
-        result == null,
-        elapsedNs(middleware.io, start),
-    });
-    return result;
-}
-
-fn middlewareForwardInlayHint(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.InlayHintParams,
-) Error!lsp.ResultType("textDocument/inlayHint") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward inlayHint <- uri={s} source_range={any}", .{ source_uri, params.range });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    var mapped_range: ?types.Range = null;
-    var active_span_index: ?usize = null;
-    var spans_scanned: usize = 0;
-    var spans_intersected: usize = 0;
-
-    var source_order_index = code_map.firstSourceIndexPossiblyIntersecting(params.range);
-    while (source_order_index < code_map.src_order.items.len) : (source_order_index += 1) {
-        spans_scanned += 1;
-        const span_index = code_map.src_order.items[source_order_index];
-        const source_range = sourceRangeFromTsRange(code_map.src_range.items[span_index]);
-        if (!positionLessThan(source_range.start, params.range.end)) break;
-
-        const request_range = rangeIntersection(params.range, source_range) orelse continue;
-        spans_intersected += 1;
-        const mapped_start = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.start);
-        const mapped_end = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.end);
-        mapped_range = rangeUnion(mapped_range, .{
-            .start = mapped_start,
-            .end = mapped_end,
-        });
-        active_span_index = active_span_index orelse span_index;
-    }
-
-    const resolved_range = mapped_range orelse {
-        log.debug("Zig forward inlayHint -> uri={s} result=null reason=unmapped_range spans_scanned={} spans_intersected={} elapsed_ns={}", .{
-            source_uri,
-            spans_scanned,
-            spans_intersected,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const resolved_active_span_index = active_span_index orelse {
-        log.debug("Zig forward inlayHint -> uri={s} result=null reason=no_active_span spans_scanned={} spans_intersected={} elapsed_ns={}", .{
-            source_uri,
-            spans_scanned,
-            spans_intersected,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.range = resolved_range;
-    log.debug("Zig forward inlayHint mapped uri={s} generated_uri={s} source_range={any} generated_range={any} spans_scanned={} spans_intersected={} active_span={}", .{
-        source_uri,
-        doc.generated_uri,
-        params.range,
-        resolved_range,
-        spans_scanned,
-        spans_intersected,
-        resolved_active_span_index,
-    });
-
-    const result = (try middleware.request(arena, "textDocument/inlayHint", mapped)) orelse {
-        log.debug("Zig forward inlayHint -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    if (result.len == 0) {
-        log.debug("Zig forward inlayHint -> uri={s} result=null reason=zls_empty elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    }
-
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = resolved_active_span_index,
-    };
-    defer translation_context.deinit();
-
-    const translated = try translateInlayHints(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
-    log.debug("Zig forward inlayHint -> uri={s} zls_count={} translated_count={} dropped_count={} elapsed_ns={}", .{
-        source_uri,
-        result.len,
-        translated.len,
-        result.len - translated.len,
-        elapsedNs(middleware.io, start),
-    });
-    return if (translated.len == 0) null else translated;
-}
-
-fn middlewareForwardDocumentSymbols(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-) Error!?[]const types.DocumentSymbol {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward documentSymbol <- uri={s}", .{source_uri});
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const request_result = try middleware.request(arena, "textDocument/documentSymbol", .{
-        .textDocument = .{ .uri = doc.generated_uri },
-    });
-    const result = request_result orelse {
-        log.debug("Zig forward documentSymbol -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = null,
-    };
-    defer translation_context.deinit();
-    const translated = try translateDocumentSymbols(arena, result, &translation_context);
-    log.debug("Zig forward documentSymbol -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        documentSymbolResultCount(request_result),
-        if (translated) |symbols| symbols.len else 0,
-        translated == null,
-        elapsedNs(middleware.io, start),
-    });
-    return translated;
-}
-
-fn middlewareForwardSemanticTokensFull(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.SemanticTokensParams,
-) Error!lsp.ResultType("textDocument/semanticTokens/full") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward semanticTokens/full <- uri={s}", .{source_uri});
-    const doc = try middleware.documentReady(source_uri);
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-
-    const result = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
-        log.debug("Zig forward semanticTokens/full -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(result.data));
-    const source_result_id = try middleware.storeSemanticTokensSnapshot(
-        source_uri,
-        doc.source_text,
-        result.resultId,
-        translated_data,
-    );
-
-    log.debug("Zig forward semanticTokens/full -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-        source_uri,
-        result.data.len / 5,
-        translated_data.len / 5,
-        elapsedNs(middleware.io, start),
-    });
-    return .{
-        .resultId = source_result_id,
-        .data = translated_data,
-    };
-}
-
-fn middlewareForwardSemanticTokensFullDelta(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.SemanticTokensDeltaParams,
-) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward semanticTokens/full/delta <- uri={s} previous={s}", .{ source_uri, params.previousResultId });
-    const doc = try middleware.documentReady(source_uri);
-    const snapshot = middleware.semanticTokensSnapshot(source_uri, params.previousResultId) orelse {
-        const full = (try middlewareForwardSemanticTokensFull(middleware, arena, source_uri, .{
-            .textDocument = params.textDocument,
-            .workDoneToken = params.workDoneToken,
-            .partialResultToken = params.partialResultToken,
-        })) orelse return null;
-        return .{ .semantic_tokens = full };
-    };
-    return try middleware.semanticTokensFullAsDelta(arena, source_uri, doc, snapshot, .{
-        .textDocument = params.textDocument,
-        .workDoneToken = params.workDoneToken,
-        .partialResultToken = params.partialResultToken,
-    }, start);
-
-    // ZLS 0.16.0 does not advertise or implement semanticTokens/full/delta, and
-    // its full responses do not include resultId. Keep the native forwarding path
-    // here because the translation work is already done, but avoid a known-null
-    // round trip until ZLS advertises delta support.
-    //
-    // const zls_previous_result_id = snapshot.zls_result_id orelse {
-    //     return try middleware.semanticTokensFullAsDelta(arena, source_uri, doc, snapshot, .{
-    //         .textDocument = params.textDocument,
-    //         .workDoneToken = params.workDoneToken,
-    //         .partialResultToken = params.partialResultToken,
-    //     }, start);
-    // };
-    //
-    // const zls_result = (try middleware.request(arena, "textDocument/semanticTokens/full/delta", .{
-    //     .textDocument = .{ .uri = doc.generated_uri },
-    //     .previousResultId = zls_previous_result_id,
-    //     .workDoneToken = params.workDoneToken,
-    //     .partialResultToken = params.partialResultToken,
-    // })) orelse {
-    //     log.debug("Zig forward semanticTokens/full/delta -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-    //         source_uri,
-    //         elapsedNs(middleware.io, start),
-    //     });
-    //     return null;
-    // };
-    //
-    // To re-enable this path, reintroduce a generated-data snapshot and preserve
-    // ZLS's generated token data before the in-place source translation above.
-    // const current_generated_data, const zls_result_id = switch (zls_result) {
-    //     .semantic_tokens => |tokens| .{ tokens.data, tokens.resultId },
-    //     .semantic_tokens_delta => |delta| .{
-    //         try applySemanticTokenEdits(arena, preserved_generated_data, delta.edits),
-    //         delta.resultId,
-    //     },
-    // };
-    // const current_source_data = try middleware.translateSemanticTokensForDocument(arena, doc, current_generated_data);
-    // const source_edits = try semanticTokenDeltaEdits(arena, snapshot.source_data, current_source_data);
-    // const source_result_id = try middleware.storeSemanticTokensSnapshot(
-    //     source_uri,
-    //     zls_result_id,
-    //     current_generated_data,
-    //     current_source_data,
-    // );
-    //
-    // log.debug("Zig forward semanticTokens/full/delta -> uri={s} source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-    //     source_uri,
-    //     source_edits.len,
-    //     current_generated_data.len / 5,
-    //     current_source_data.len / 5,
-    //     elapsedNs(middleware.io, start),
-    // });
-    // return .{ .semantic_tokens_delta = .{
-    //     .resultId = source_result_id,
-    //     .edits = source_edits,
-    // } };
-}
-
-fn middlewareSemanticTokensFullAsDelta(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    doc: *GeneratedDocument,
-    snapshot: *const SemanticTokensSnapshot,
-    params: types.SemanticTokensParams,
-    start: std.Io.Timestamp,
-) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
-    const range_delta = middleware.semanticTokensRangeAsDelta(arena, source_uri, doc, snapshot, params, start) catch |err| switch (err) {
-        error.UnexpectedResponse => blk: {
-            log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=unexpected_response", .{source_uri});
-            break :blk null;
-        },
-        else => return err,
-    };
-    if (range_delta) |delta| {
-        return delta;
-    }
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    const zls_start = logStart(middleware.io);
-    const full = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
-        log.debug("Zig forward semanticTokens/full/delta -> uri={s} result=null reason=zls_full_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const zls_ns = elapsedNs(middleware.io, zls_start);
-    const translate_start = logStart(middleware.io);
-    const current_source_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(full.data));
-    const translate_ns = elapsedNs(middleware.io, translate_start);
-    const diff_start = logStart(middleware.io);
-    const source_edits = try semanticTokenDeltaEdits(arena, snapshot.source_data, current_source_data);
-    const diff_ns = elapsedNs(middleware.io, diff_start);
-    const store_start = logStart(middleware.io);
-    const source_result_id = try middleware.storeSemanticTokensSnapshot(
-        source_uri,
-        doc.source_text,
-        full.resultId,
-        current_source_data,
-    );
-    const store_ns = elapsedNs(middleware.io, store_start);
-    log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=full_diff source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-        source_uri,
-        source_edits.len,
-        full.data.len / 5,
-        current_source_data.len / 5,
-        elapsedNs(middleware.io, start),
-    });
-    log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=full_diff zls_ns={} translate_ns={} diff_ns={} store_ns={} elapsed_ns={}", .{
-        source_uri,
-        zls_ns,
-        translate_ns,
-        diff_ns,
-        store_ns,
-        elapsedNs(middleware.io, start),
-    });
-    return .{ .semantic_tokens_delta = .{
-        .resultId = source_result_id,
-        .edits = source_edits,
-    } };
-}
-
-fn middlewareSemanticTokensRangeAsDelta(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    doc: *GeneratedDocument,
-    snapshot: *const SemanticTokensSnapshot,
-    params: types.SemanticTokensParams,
-    start: std.Io.Timestamp,
-) Error!?lsp.ResultType("textDocument/semanticTokens/full/delta") {
-    const dirty_start = logStart(middleware.io);
-    const dirty = try semanticDirtyRangeFromDiff(arena, snapshot.source_text, doc.source_text) orelse {
-        const dirty_ns = elapsedNs(middleware.io, dirty_start);
-        log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=empty_delta source_edits=0 elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=empty_delta dirty_ns={} elapsed_ns={}", .{
-            source_uri,
-            dirty_ns,
-            elapsedNs(middleware.io, start),
-        });
-        return .{ .semantic_tokens_delta = .{
-            .resultId = snapshot.source_result_id,
-            .edits = &.{},
-        } };
-    };
-    const dirty_ns = elapsedNs(middleware.io, dirty_start);
-    const previous_source_range = expandSemanticDirtyRange(dirty.previous);
-    const current_source_range = expandSemanticDirtyRange(dirty.current);
-    const map_start = logStart(middleware.io);
-    const generated_range = (try sourceRangeToGeneratedRange(
-        middleware.allocator,
-        &doc.code_map,
-        doc.source_text,
-        doc.generated_text,
-        current_source_range,
-    )) orelse {
-        log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=unmapped_dirty_range", .{source_uri});
-        return null;
-    };
-    const map_ns = elapsedNs(middleware.io, map_start);
-
-    const mapped: types.SemanticTokensRangeParams = .{
-        .textDocument = .{ .uri = doc.generated_uri },
-        .range = generated_range,
-        .workDoneToken = params.workDoneToken,
-        .partialResultToken = params.partialResultToken,
-    };
-    const zls_start = logStart(middleware.io);
-    const range_result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
-        log.debug("Zig forward semanticTokens/full/delta range-skip uri={s} reason=zls_range_null", .{source_uri});
-        return null;
-    };
-    const zls_ns = elapsedNs(middleware.io, zls_start);
-    const translate_start = logStart(middleware.io);
-    const current_range_data = try middleware.translateSemanticTokensForDocumentRange(
-        arena,
-        doc,
-        @constCast(range_result.data),
-        current_source_range,
-    );
-    const translate_ns = elapsedNs(middleware.io, translate_start);
-    const splice_start = logStart(middleware.io);
-    const source_edit = try semanticTokenRangeDeltaEdit(
-        arena,
-        snapshot.source_index,
-        previous_source_range,
-        current_range_data,
-        semanticDirtyLineDelta(dirty),
-    );
-    const splice_ns = elapsedNs(middleware.io, splice_start);
-    errdefer freeSemanticTokenEdits(arena, source_edit);
-
-    const apply_start = logStart(middleware.io);
-    const current_source_data = try applySemanticTokenEdits(
-        middleware.allocator,
-        snapshot.source_data,
-        source_edit,
-    );
-    const apply_ns = elapsedNs(middleware.io, apply_start);
-    errdefer middleware.allocator.free(current_source_data);
-
-    const store_start = logStart(middleware.io);
-    const source_result_id = try middleware.storeSemanticTokensSnapshotOwned(
-        source_uri,
-        doc.source_text,
-        null,
-        current_source_data,
-    );
-    const store_ns = elapsedNs(middleware.io, store_start);
-
-    log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=range_diff source_edits={} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-        source_uri,
-        source_edit.len,
-        range_result.data.len / 5,
-        current_range_data.len / 5,
-        elapsedNs(middleware.io, start),
-    });
-    log.debug("Zig forward semanticTokens/full/delta phases uri={s} route=range_diff dirty_ns={} map_ns={} zls_ns={} translate_ns={} splice_ns={} apply_ns={} store_ns={} elapsed_ns={}", .{
-        source_uri,
-        dirty_ns,
-        map_ns,
-        zls_ns,
-        translate_ns,
-        splice_ns,
-        apply_ns,
-        store_ns,
-        elapsedNs(middleware.io, start),
-    });
-    return .{ .semantic_tokens_delta = .{
-        .resultId = source_result_id,
-        .edits = source_edit,
-    } };
-}
-
-fn middlewareForwardSemanticTokensRange(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.SemanticTokensRangeParams,
-) Error!lsp.ResultType("textDocument/semanticTokens/range") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward semanticTokens/range <- uri={s} source_range={any}", .{ source_uri, params.range });
-    const doc = try middleware.documentReady(source_uri);
-    const resolved_range = (try sourceRangeToGeneratedRange(
-        middleware.allocator,
-        &doc.code_map,
-        doc.source_text,
-        doc.generated_text,
-        params.range,
-    )) orelse {
-        log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=unmapped_range elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.range = resolved_range;
-    const result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
-        log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(result.data));
-
-    log.debug("Zig forward semanticTokens/range -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-        source_uri,
-        result.data.len / 5,
-        translated_data.len / 5,
-        elapsedNs(middleware.io, start),
-    });
-    return .{
-        .resultId = null,
-        .data = translated_data,
-    };
-}
-
-fn middlewareForwardRename(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    params: types.RenameParams,
-) Error!lsp.ResultType("textDocument/rename") {
-    const start = logStart(middleware.io);
-    log.debug("Zig forward rename <- uri={s} source_position={any} new_name_len={}", .{
-        source_uri,
-        params.position,
-        params.newName.len,
-    });
-    const doc = try middleware.documentReady(source_uri);
-    const code_map = &doc.code_map;
-    const span_index = code_map.sourceSpanIndexForPosition(params.position) orelse {
-        log.debug("Zig forward rename -> uri={s} result=null reason=unmapped_source elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-    var translation_context = RequestTranslationContext{
-        .allocator = middleware.allocator,
-        .map = code_map,
-        .source_text = doc.source_text,
-        .generated_text = doc.generated_text,
-        .cache = &translation_cache,
-        .active_span_index = span_index,
-    };
-    defer translation_context.deinit();
-
-    var mapped = params;
-    mapped.textDocument = .{ .uri = doc.generated_uri };
-    mapped.position = (try translation_context.sourcePositionToGenerated(params.position)) orelse {
-        log.debug("Zig forward rename -> uri={s} result=null reason=mutated_source span={} elapsed_ns={}", .{
-            source_uri,
-            span_index,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    log.debug("Zig forward rename mapped uri={s} generated_uri={s} span={} generated_position={any}", .{
-        source_uri,
-        doc.generated_uri,
-        span_index,
-        mapped.position,
-    });
-
-    const result = (try middleware.request(arena, "textDocument/rename", mapped)) orelse {
-        log.debug("Zig forward rename -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-            source_uri,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    };
-    const translated = try translateWorkspaceEdit(arena, result, &translation_context, doc.generated_uri, doc.source_uri);
-    log.debug("Zig forward rename -> uri={s} zls_edit_count={} translated_edit_count={} null={} elapsed_ns={}", .{
-        source_uri,
-        workspaceEditCount(result),
-        if (translated) |edit| workspaceEditCount(edit) else 0,
-        translated == null,
-        elapsedNs(middleware.io, start),
-    });
-    return translated;
-}
-
-fn middlewareAliasCodeBlockRenameEdits(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    source_uri: []const u8,
-    alias_name: []const u8,
-    new_name: []const u8,
-    source_ranges: []const ts.Range,
-    offset_encoding: lsp.offsets.Encoding,
-) Error!?[]const types.TextEdit {
-    const start = logStart(middleware.io);
-    log.debug("Zig alias rename <- uri={s} ranges={} alias_len={} new_name_len={}", .{
-        source_uri,
-        source_ranges.len,
-        alias_name.len,
-        new_name.len,
-    });
-    const doc = try middleware.documentReady(source_uri);
-    var edits: std.ArrayList(types.TextEdit) = .empty;
-    errdefer edits.deinit(arena);
-    var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
-    defer seen_starts.deinit(arena);
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(middleware.allocator);
-
-    for (source_ranges) |source_range| {
-        const span_index = doc.code_map.indexForSourceRange(source_range) orelse {
-            log.debug("Zig alias rename -> uri={s} result=null reason=unmapped_source_range elapsed_ns={}", .{
-                source_uri,
-                elapsedNs(middleware.io, start),
-            });
-            return null;
-        };
-        const translator = try translation_cache.get(
-            middleware.allocator,
-            &doc.code_map,
-            doc.source_text,
-            doc.generated_text,
-            span_index,
-        );
-
-        try appendAliasRenameEditsFromDiff(
-            arena,
-            &edits,
-            &seen_starts,
-            doc.source_text,
-            source_range,
-            doc.generated_text,
-            doc.code_map.gen_span.items[span_index].generated_range,
-            translator.difference.edits.items,
-            alias_name,
-            new_name,
-            offset_encoding,
-        );
-    }
-
-    const result = try edits.toOwnedSlice(arena);
-    log.debug("Zig alias rename -> uri={s} edit_count={} elapsed_ns={}", .{
-        source_uri,
-        result.len,
-        elapsedNs(middleware.io, start),
-    });
-    return result;
 }
 
 /// Mapping between original Zitron code blocks and generated Zig code.
@@ -4870,90 +5170,6 @@ fn checkZitron(allocator: std.mem.Allocator, io: std.Io) Error!void {
     }
 }
 
-fn middlewareInitializeZls(middleware: *Middleware) Error!void {
-    const start = logStart(middleware.io);
-    const id = middleware.nextRequestId();
-    log.debug("ZLS <- initialize id={any}", .{id});
-    const number_id = switch (id) {
-        .number => |number| number,
-        .string => unreachable,
-    };
-    middleware.response_mutex.lockUncancelable(middleware.io);
-    errdefer middleware.response_mutex.unlock(middleware.io);
-    try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-    middleware.response_mutex.unlock(middleware.io);
-    errdefer {
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        _ = middleware.pending_responses.remove(number_id);
-        middleware.response_mutex.unlock(middleware.io);
-    }
-
-    try middleware.zls_transport.transport.writeRequest(
-        middleware.io,
-        middleware.allocator,
-        id,
-        "initialize",
-        lsp.ParamsType("initialize"),
-        zlsInitializeParams(),
-        .{ .emit_null_optional_fields = false },
-    );
-    const wait_start = logStart(middleware.io);
-    const initialize_response = try middleware.waitResponseForId(id);
-    defer middleware.allocator.free(initialize_response);
-    log.debug("ZLS -> initialize id={any} response_bytes={} wait_ns={}", .{
-        id,
-        initialize_response.len,
-        elapsedNs(middleware.io, wait_start),
-    });
-
-    const parse_start = logStart(middleware.io);
-    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, initialize_response, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-
-    const result_value = switch (parsed.value) {
-        .response => |response| switch (response.result_or_error) {
-            .result => |maybe_result| maybe_result,
-            .@"error" => return error.RequestFailed,
-        },
-        else => return error.UnexpectedResponse,
-    };
-    if (result_value == null or result_value.? == .null) return error.UnexpectedResponse;
-
-    const initialize_result = try std.json.parseFromValue(types.InitializeResult, middleware.allocator, result_value.?, .{
-        .ignore_unknown_fields = true,
-    });
-    defer initialize_result.deinit();
-    log.debug("ZLS initialize parsed id={any} parse_ns={}", .{
-        id,
-        elapsedNs(middleware.io, parse_start),
-    });
-
-    if (initialize_result.value.capabilities.completionProvider) |completion_options| {
-        if (completion_options.triggerCharacters) |trigger_characters| {
-            freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
-            middleware.zls_completion_triggers = try dupeStringSlices(middleware.allocator, trigger_characters);
-        }
-    }
-    warnIfZlsSemanticTokenLegendDrift(initialize_result.value.capabilities.semanticTokensProvider);
-
-    log.debug("ZLS <- initialized", .{});
-    try middleware.zls_transport.transport.writeNotification(
-        middleware.io,
-        middleware.allocator,
-        "initialized",
-        lsp.ParamsType("initialized"),
-        .{},
-        .{ .emit_null_optional_fields = false },
-    );
-    log.debug("ZLS initialize complete id={any} triggers={} elapsed_ns={}", .{
-        id,
-        middleware.zls_completion_triggers.len,
-        elapsedNs(middleware.io, start),
-    });
-}
-
 const zls_position_encodings = [_]types.PositionEncodingKind{.@"utf-8"};
 const zls_hover_content_formats = [_]types.MarkupKind{ .markdown, .plaintext };
 const zls_diagnostic_tags = [_]types.DiagnosticTag{ .Unnecessary, .Deprecated };
@@ -5104,260 +5320,6 @@ fn freeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) vo
     if (slices.len == 0) return;
     for (slices) |slice| allocator.free(slice);
     allocator.free(slices);
-}
-
-fn middlewareShutdownZls(middleware: *Middleware) Error!void {
-    log.info("Stopping ZLS middleware", .{});
-    const start = logStart(middleware.io);
-    const id = middleware.nextRequestId();
-    log.debug("ZLS <- shutdown id={any}", .{id});
-    const number_id = switch (id) {
-        .number => |number| number,
-        .string => unreachable,
-    };
-    middleware.response_mutex.lockUncancelable(middleware.io);
-    errdefer middleware.response_mutex.unlock(middleware.io);
-    try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-    middleware.response_mutex.unlock(middleware.io);
-    errdefer {
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        _ = middleware.pending_responses.remove(number_id);
-        middleware.response_mutex.unlock(middleware.io);
-    }
-
-    try middleware.zls_transport.transport.writeRequest(
-        middleware.io,
-        middleware.allocator,
-        id,
-        "shutdown",
-        lsp.ParamsType("shutdown"),
-        {},
-        .{ .emit_null_optional_fields = false },
-    );
-    const wait_start = logStart(middleware.io);
-    const json_message = try middleware.waitResponseForId(id);
-    log.debug("ZLS -> shutdown id={any} response_bytes={} wait_ns={}", .{
-        id,
-        json_message.len,
-        elapsedNs(middleware.io, wait_start),
-    });
-    middleware.allocator.free(json_message);
-    log.debug("ZLS <- exit", .{});
-    try middleware.zls_transport.transport.writeNotification(
-        middleware.io,
-        middleware.allocator,
-        "exit",
-        lsp.ParamsType("exit"),
-        {},
-        .{ .emit_null_optional_fields = false },
-    );
-    middleware.zls_child.stdin.?.close(middleware.io);
-    middleware.zls_child.stdin = null;
-    _ = try middleware.zls_child.wait(middleware.io);
-    log.debug("ZLS shutdown complete id={any} elapsed_ns={}", .{ id, elapsedNs(middleware.io, start) });
-}
-
-fn middlewareRequest(
-    middleware: *Middleware,
-    arena: std.mem.Allocator,
-    comptime method: []const u8,
-    params: lsp.ParamsType(method),
-) Error!lsp.ResultType(method) {
-    const start = logStart(middleware.io);
-    const id = middleware.nextRequestId();
-    log.debug("ZLS <- {s} id={any}", .{ method, id });
-    const number_id = switch (id) {
-        .number => |number| number,
-        .string => unreachable,
-    };
-    middleware.response_mutex.lockUncancelable(middleware.io);
-    errdefer middleware.response_mutex.unlock(middleware.io);
-    try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-    middleware.response_mutex.unlock(middleware.io);
-    errdefer {
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        _ = middleware.pending_responses.remove(number_id);
-        middleware.response_mutex.unlock(middleware.io);
-    }
-
-    try middleware.zls_transport.transport.writeRequest(
-        middleware.io,
-        middleware.allocator,
-        id,
-        method,
-        lsp.ParamsType(method),
-        params,
-        .{ .emit_null_optional_fields = false },
-    );
-
-    const wait_start = logStart(middleware.io);
-    const json_message = try middleware.waitResponseForId(id);
-    const wait_ns = elapsedNs(middleware.io, wait_start);
-    log.debug("ZLS -> {s} id={any} response_bytes={} wait_ns={}", .{
-        method,
-        id,
-        json_message.len,
-        wait_ns,
-    });
-    const parse_start = logStart(middleware.io);
-    defer middleware.allocator.free(json_message);
-    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, arena, json_message, .{
-        .ignore_unknown_fields = true,
-    });
-    const parse_ns = elapsedNs(middleware.io, parse_start);
-
-    const result_value = switch (parsed.value) {
-        .response => |response| switch (response.result_or_error) {
-            .result => |maybe_result| maybe_result,
-            .@"error" => {
-                log.warn("ZLS '{s}' request failed id={any}", .{ method, id });
-                return error.RequestFailed;
-            },
-        },
-        else => return error.UnexpectedResponse,
-    };
-    if (result_value == null or result_value.? == .null) {
-        log.debug("ZLS parsed {s} id={any} result=null parse_ns={} elapsed_ns={}", .{
-            method,
-            id,
-            parse_ns,
-            elapsedNs(middleware.io, start),
-        });
-        return null;
-    }
-
-    const typed_parse_start = logStart(middleware.io);
-    const typed = try std.json.parseFromValue(lsp.ResultType(method), arena, result_value.?, .{
-        .ignore_unknown_fields = true,
-    });
-    log.debug("ZLS parsed {s} id={any} result=success parse_ns={} typed_parse_ns={} elapsed_ns={}", .{
-        method,
-        id,
-        parse_ns,
-        elapsedNs(middleware.io, typed_parse_start),
-        elapsedNs(middleware.io, start),
-    });
-    return typed.value;
-}
-
-fn middlewareWaitResponseForId(middleware: *Middleware, id: lsp.JsonRPCMessage.ID) Error![]u8 {
-    const number_id = switch (id) {
-        .number => |number| number,
-        .string => return error.UnexpectedResponse,
-    };
-
-    middleware.response_mutex.lockUncancelable(middleware.io);
-    defer middleware.response_mutex.unlock(middleware.io);
-
-    while (true) {
-        if (middleware.pending_responses.getPtr(number_id)) |pending| {
-            if (pending.response) |response| {
-                _ = middleware.pending_responses.remove(number_id);
-                return response;
-            }
-        } else {
-            return error.UnexpectedResponse;
-        }
-        if (middleware.reader_failed) return error.UnexpectedResponse;
-        middleware.response_cond.waitUncancelable(middleware.io, &middleware.response_mutex);
-    }
-}
-
-fn middlewareReaderMain(middleware: *Middleware) void {
-    while (true) {
-        const json_message = middleware.zls_transport.transport.readJsonMessage(
-            middleware.io,
-            middleware.allocator,
-        ) catch |err| {
-            log.debug("ZLS reader stopped: {}", .{err});
-            middleware.response_mutex.lockUncancelable(middleware.io);
-            middleware.reader_failed = true;
-            middleware.response_cond.broadcast(middleware.io);
-            middleware.response_mutex.unlock(middleware.io);
-            return;
-        };
-
-        const consumed = middleware.handleZlsMessage(json_message) catch |err| blk: {
-            log.warn("ZLS message ignored: {}", .{err});
-            break :blk false;
-        };
-        if (!consumed) middleware.allocator.free(json_message);
-    }
-}
-
-fn middlewareHandleZlsMessage(middleware: *Middleware, json_message: []u8) Error!bool {
-    log.debug("ZLS read message bytes={}", .{json_message.len});
-    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, json_message, .{
-        .ignore_unknown_fields = true,
-    });
-    defer parsed.deinit();
-
-    switch (parsed.value) {
-        .response => |response| {
-            const id = response.id orelse {
-                log.debug("ZLS ignored response response_has_id=false", .{});
-                return false;
-            };
-            const number_id = switch (id) {
-                .number => |number| number,
-                .string => {
-                    log.debug("ZLS ignored response id={any} reason=string_id", .{id});
-                    return false;
-                },
-            };
-
-            middleware.response_mutex.lockUncancelable(middleware.io);
-            defer middleware.response_mutex.unlock(middleware.io);
-            if (middleware.pending_responses.getPtr(number_id)) |pending| {
-                pending.response = json_message;
-                middleware.response_cond.broadcast(middleware.io);
-                return true;
-            }
-            log.debug("ZLS ignored response id={any} reason=unknown_id", .{id});
-            return false;
-        },
-        .request => |request| {
-            log.debug("ZLS ignored request method={s}", .{request.method});
-            return false;
-        },
-        .notification => |notification| {
-            if (std.mem.eql(u8, notification.method, "textDocument/publishDiagnostics")) {
-                if (try middleware.handleZlsDiagnostics(notification.params)) |published| {
-                    if (middleware.diagnostics_context) |context| {
-                        if (middleware.diagnostics_publisher) |publisher| {
-                            publisher(context, published.source_uri, published.version);
-                        }
-                    }
-                    middleware.allocator.free(published.source_uri);
-                }
-            } else {
-                log.debug("ZLS ignored notification method={s}", .{notification.method});
-            }
-            return false;
-        },
-    }
-}
-
-fn middlewareNextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
-    const id = middleware.next_request_id;
-    middleware.next_request_id += 1;
-    return .{ .number = id };
-}
-
-fn middlewareDocumentReady(middleware: *Middleware, source_uri: []const u8) Error!*GeneratedDocument {
-    const state = middleware.documents.getPtr(source_uri) orelse return error.MissingGeneratedDocument;
-    const doc = state.currentGeneration() orelse return error.MissingGeneratedDocument;
-    if (doc.generation_error != null) return error.RequestFailed;
-    return doc;
-}
-
-fn middlewareDocumentForGeneratedUri(middleware: *Middleware, generated_uri: []const u8) ?*DocumentState {
-    var it = middleware.documents.iterator();
-    while (it.next()) |entry| {
-        const current = entry.value_ptr.current orelse continue;
-        if (std.mem.eql(u8, current.generated_uri, generated_uri)) return entry.value_ptr;
-    }
-    return null;
 }
 
 const ZitronResult = struct {
