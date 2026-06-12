@@ -2391,7 +2391,7 @@ pub const CodeMap = struct {
         map.fast_column_mapping.clearRetainingCapacity();
         map.src_order.clearRetainingCapacity();
 
-        try map.collectSpans(allocator, source_root, source_text, generated_text, source_path, generated_text);
+        try map.collectSpans(allocator, source_root, source_text, generated_text, source_path);
         try map.rebuildSourceOrder(allocator);
     }
 
@@ -2457,9 +2457,8 @@ pub const CodeMap = struct {
         allocator: std.mem.Allocator,
         source_root: ts.Node,
         source_text: []const u8,
-        generated_text: []const u8,
+        generated_text: []u8,
         source_path: []const u8,
-        extraction_text: ?[]u8,
     ) OOM!void {
         var generated_line: u32 = 0;
         var generated_offset: usize = 0;
@@ -2470,7 +2469,7 @@ pub const CodeMap = struct {
             const next_generated_offset = if (line_end < generated_text.len) line_end + 1 else line_end;
 
             if (parseLineDirective(line)) |directive| {
-                if (extraction_text) |text| extractLineDirective(text, generated_offset, directive);
+                extractLineDirective(generated_text, generated_offset, directive);
                 try map.processActiveSpan(allocator, &active_span, generated_line, generated_offset);
                 if (std.mem.eql(u8, directive.path, source_path)) {
                     if (zigCodeSpanForLine(source_text, source_root, directive.line)) |source_span| {
