@@ -1689,9 +1689,8 @@ fn middlewareForwardInlayHint(
 
         const request_range = rangeIntersection(params.range, source_range) orelse continue;
         spans_intersected += 1;
-        const span = code_map.gen_span.items[span_index];
-        const mapped_start = span.sourcePositionToGenerated(request_range.start);
-        const mapped_end = span.sourcePositionToGenerated(request_range.end);
+        const mapped_start = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.start);
+        const mapped_end = code_map.sourcePositionToGeneratedInSpanFromText(span_index, doc.source_text, request_range.end);
         mapped_range = rangeUnion(mapped_range, .{
             .start = mapped_start,
             .end = mapped_end,
@@ -2407,20 +2406,98 @@ pub const CodeMap = struct {
     /// Translates a source position to generated coordinates by finding the
     /// earliest span that contains the source line and preserving the column.
     pub fn sourcePositionToGenerated(map: *const CodeMap, position: types.Position) ?types.Position {
-        const span = map.findSource(position.line) orelse return null;
-        return span.sourcePositionToGenerated(position);
+        const source_order_index = map.findSourceIndex(position.line) orelse return null;
+        const span_index = map.src_order.items[source_order_index];
+        return map.sourcePositionToGeneratedInSpan(span_index, position);
     }
 
     /// Translates a generated position back to source coordinates by finding the
     /// generated-order span containing the generated line and preserving column.
     pub fn generatedPositionToSource(map: *const CodeMap, position: types.Position) ?types.Position {
-        const span = map.findGenerated(position.line) orelse return null;
-        return span.generatedPositionToSource(position);
+        const span_index = map.findGeneratedIndex(position.line) orelse return null;
+        return map.generatedPositionToSourceInSpan(span_index, position);
     }
 
     fn sourceSpanIndexForPosition(map: *const CodeMap, position: types.Position) ?usize {
         const source_order_index = map.findSourceIndex(position.line) orelse return null;
         return map.src_order.items[source_order_index];
+    }
+
+    fn sourcePositionToGeneratedInSpan(map: *const CodeMap, span_index: usize, position: types.Position) types.Position {
+        const span = map.gen_span.items[span_index];
+        return span.sourcePositionToGenerated(position);
+    }
+
+    fn generatedPositionToSourceInSpan(map: *const CodeMap, span_index: usize, position: types.Position) types.Position {
+        const span = map.gen_span.items[span_index];
+        return span.generatedPositionToSource(position);
+    }
+
+    fn sourcePositionToGeneratedInSpanFromText(
+        map: *const CodeMap,
+        span_index: usize,
+        source_text: []const u8,
+        position: types.Position,
+    ) types.Position {
+        const span = map.gen_span.items[span_index];
+        var translated = span.sourcePositionToGenerated(position);
+        if (map.fast_column_mapping.items[span_index] and position.line == span.source_line) {
+            translated.character = translated.character -| map.fastFirstLineSourceColumn(span_index, source_text);
+        }
+        return translated;
+    }
+
+    fn generatedPositionToSourceInSpanFromText(
+        map: *const CodeMap,
+        span_index: usize,
+        source_text: []const u8,
+        position: types.Position,
+    ) types.Position {
+        const span = map.gen_span.items[span_index];
+        var translated = span.generatedPositionToSource(position);
+        if (map.fast_column_mapping.items[span_index] and position.line == span.generated_line) {
+            translated.character += map.fastFirstLineSourceColumn(span_index, source_text);
+        }
+        return translated;
+    }
+
+    fn fastFirstLineSourceColumn(map: *const CodeMap, span_index: usize, source_text: []const u8) u32 {
+        const range = map.src_range.items[span_index];
+        if (map.gen_span.items[span_index].source_line != range.start_point.row) return 0;
+
+        var column = range.start_point.column;
+        if (column == 0) return column;
+
+        const start = @min(range.start_byte, source_text.len);
+        const prefix = source_text[lineStartBefore(source_text, start)..start];
+        if (!linePrefixHasFastCodeDirective(prefix)) return 0;
+
+        var index = range.start_byte;
+        const end = @min(range.end_byte, source_text.len);
+        while (index < end and source_text[index] != '\n') : (index += 1) {
+            switch (source_text[index]) {
+                ' ', '\t' => column += 1,
+                else => break,
+            }
+        }
+        return column;
+    }
+
+    fn lineStartBefore(source_text: []const u8, end: usize) usize {
+        var index = end;
+        while (index > 0 and source_text[index - 1] != '\n') index -= 1;
+        return index;
+    }
+
+    fn linePrefixHasFastCodeDirective(prefix: []const u8) bool {
+        const open_brace = std.mem.lastIndexOfScalar(u8, prefix, '{') orelse return false;
+        const before_brace = std.mem.trim(u8, prefix[0..open_brace], " \t");
+        const name_end = std.mem.indexOfAny(u8, before_brace, " \t") orelse before_brace.len;
+        const name = before_brace[0..name_end];
+        return std.mem.eql(u8, name, "code") or
+            std.mem.eql(u8, name, "include") or
+            std.mem.eql(u8, name, "%code") or
+            std.mem.eql(u8, name, "%include");
     }
 
     /// Translates a generated range only when every generated line in the range is
@@ -2947,6 +3024,13 @@ const RequestTranslationContext = struct {
         span_index: usize,
         position: types.Position,
     ) OOM!?types.Position {
+        if (context.map.fast_column_mapping.items[span_index]) {
+            const source_index = lsp.offsets.positionToIndex(context.source_text, position, .@"utf-8");
+            const src_range = context.map.src_range.items[span_index];
+            if (source_index < src_range.start_byte or source_index > src_range.end_byte) return null;
+            return context.map.sourcePositionToGeneratedInSpanFromText(span_index, context.source_text, position);
+        }
+
         const translator = try context.translatorForSpanIndex(span_index);
         const source_index = lsp.offsets.positionToIndex(context.source_text, position, .@"utf-8");
         if (source_index < translator.src_range.start_byte or source_index > translator.src_range.end_byte) return null;
@@ -2954,11 +3038,26 @@ const RequestTranslationContext = struct {
     }
 
     fn generatedRangeToSource(context: *RequestTranslationContext, range: types.Range) OOM!?types.Range {
+        const span_index = context.map.generatedSpanIndexForRange(range) orelse return null;
+        if (context.map.fast_column_mapping.items[span_index]) {
+            return .{
+                .start = context.map.generatedPositionToSourceInSpanFromText(span_index, context.source_text, range.start),
+                .end = context.map.generatedPositionToSourceInSpanFromText(span_index, context.source_text, range.end),
+            };
+        }
+
         const translator = try context.translatorForGeneratedRange(range) orelse return null;
         return translator.generatedRangeToSource(range);
     }
 
     fn generatedPositionToSource(context: *RequestTranslationContext, position: types.Position) OOM!?types.Position {
+        const span_index = context.map.findGeneratedIndex(position.line) orelse return null;
+        const span = context.map.gen_span.items[span_index];
+        if (position.line == span.generatedEnd() and position.character != 0) return null;
+        if (context.map.fast_column_mapping.items[span_index]) {
+            return context.map.generatedPositionToSourceInSpanFromText(span_index, context.source_text, position);
+        }
+
         const translator = try context.translatorForGeneratedPosition(position) orelse return null;
         return sharedPosition(translator.generatedPositionToSource(position));
     }
@@ -3442,11 +3541,10 @@ fn sourceRangeToGeneratedRange(
         if (!positionLessThan(span_source_range.start, source_range.end)) break;
 
         const request_range = rangeIntersection(source_range, span_source_range) orelse continue;
-        const span = code_map.gen_span.items[span_index];
         const generated_range = if (code_map.fast_column_mapping.items[span_index])
             types.Range{
-                .start = span.sourcePositionToGenerated(request_range.start),
-                .end = span.sourcePositionToGenerated(request_range.end),
+                .start = code_map.sourcePositionToGeneratedInSpanFromText(span_index, source_text, request_range.start),
+                .end = code_map.sourcePositionToGeneratedInSpanFromText(span_index, source_text, request_range.end),
             }
         else
             types.Range{
@@ -4144,10 +4242,9 @@ fn translateSemanticTokenRangeFromMapping(
     if (!rangeContainsRange(mapping.generated_range, generated_range)) return null;
 
     if (mapping.fast_column_mapping) {
-        const span = map.map.gen_span.items[span_index];
         return .{
-            .start = span.generatedPositionToSource(generated_range.start),
-            .end = span.generatedPositionToSource(generated_range.end),
+            .start = map.map.generatedPositionToSourceInSpanFromText(span_index, map.source_text, generated_range.start),
+            .end = map.map.generatedPositionToSourceInSpanFromText(span_index, map.source_text, generated_range.end),
         };
     }
 
@@ -5641,6 +5738,92 @@ test "code map marks directive shortcuts as fast column mappings" {
     try std.testing.expect(map.fast_column_mapping.items[0]);
     try std.testing.expect(map.fast_column_mapping.items[1]);
     try std.testing.expect(!map.fast_column_mapping.items[2]);
+}
+
+test "directive shortcut fast mapping honors first-line source column skew" {
+    const source =
+        \\%code { const code_answer = 2; }
+        \\%include { const include_answer = 1; }
+    ;
+    const generated =
+        \\// #line 1 source.zy
+        \\const code_answer = 2;
+        \\// #line 2 source.zy
+        \\const include_answer = 1;
+    ;
+
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
+    defer map.deinit(testing_allocator);
+
+    try expectEqual(@as(usize, 2), map.len());
+    try std.testing.expect(map.fast_column_mapping.items[0]);
+    try std.testing.expect(map.fast_column_mapping.items[1]);
+
+    const source_code_answer = std.mem.indexOf(u8, source, "code_answer").?;
+    const generated_code_answer = std.mem.indexOf(u8, generated, "code_answer").?;
+    const source_include_answer = std.mem.indexOf(u8, source, "include_answer").?;
+    const generated_include_answer = std.mem.indexOf(u8, generated, "include_answer").?;
+
+    try expectEqual(types.Range{
+        .start = lsp.offsets.indexToPosition(generated, generated_code_answer, .@"utf-8"),
+        .end = lsp.offsets.indexToPosition(generated, generated_code_answer + "code_answer".len, .@"utf-8"),
+    }, (try sourceRangeToGeneratedRange(
+        testing_allocator,
+        &map,
+        source,
+        generated,
+        .{
+            .start = lsp.offsets.indexToPosition(source, source_code_answer, .@"utf-8"),
+            .end = lsp.offsets.indexToPosition(source, source_code_answer + "code_answer".len, .@"utf-8"),
+        },
+    )).?);
+
+    try expectEqual(types.Range{
+        .start = lsp.offsets.indexToPosition(generated, generated_include_answer, .@"utf-8"),
+        .end = lsp.offsets.indexToPosition(generated, generated_include_answer + "include_answer".len, .@"utf-8"),
+    }, (try sourceRangeToGeneratedRange(
+        testing_allocator,
+        &map,
+        source,
+        generated,
+        .{
+            .start = lsp.offsets.indexToPosition(source, source_include_answer, .@"utf-8"),
+            .end = lsp.offsets.indexToPosition(source, source_include_answer + "include_answer".len, .@"utf-8"),
+        },
+    )).?);
+
+    var cache: SpanTranslatorCache = .{};
+    defer cache.deinit(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .source_text = source,
+        .generated_text = generated,
+        .cache = &cache,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var generated_tokens = [_]u32{
+        1, 6, "code_answer".len,    8, 0,
+        2, 6, "include_answer".len, 8, 0,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = try translateSemanticTokenData(
+        arena_state.allocator(),
+        &generated_tokens,
+        &context,
+        null,
+    );
+
+    try expectEqualSlices(u32, &.{
+        0, 14, "code_answer".len,    8, 0,
+        1, 17, "include_answer".len, 8, 0,
+    }, translated);
+    try expectEqual(@as(usize, 0), cache.len());
 }
 
 test "code map reports optimized-away code blocks as unmapped" {
