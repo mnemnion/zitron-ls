@@ -4,6 +4,7 @@ source: []u8,
 version: i32,
 parsed: ParseSummary,
 tree: *ts.Tree,
+parser: *ts.Parser,
 
 const Document = @This();
 
@@ -69,7 +70,12 @@ pub const Error = OOM || ts.Query.Error || error{
 
 /// Creates a live document from source text and parses it immediately.
 pub fn init(allocator: std.mem.Allocator, version: i32, text: []const u8) Error!Document {
-    const parsed = try parseDocument(text);
+    const parser = ts.Parser.create();
+    errdefer parser.destroy();
+
+    try parser.setLanguage(zitronLanguage());
+
+    const parsed = try parseDocument(parser, text);
     errdefer parsed.tree.destroy();
 
     const text_copy = try allocator.dupe(u8, text);
@@ -80,6 +86,7 @@ pub fn init(allocator: std.mem.Allocator, version: i32, text: []const u8) Error!
         .version = version,
         .parsed = parsed.summary,
         .tree = parsed.tree,
+        .parser = parser,
     };
 }
 
@@ -87,15 +94,23 @@ pub fn init(allocator: std.mem.Allocator, version: i32, text: []const u8) Error!
 pub fn deinit(document: *Document, allocator: std.mem.Allocator) void {
     allocator.free(document.source);
     document.tree.destroy();
+    document.parser.destroy();
 }
 
 /// Replaces the document contents with a fresh parse of the given text.
 pub fn replace(document: *Document, allocator: std.mem.Allocator, version: i32, text: []const u8) Error!void {
-    var replacement = try init(allocator, version, text);
-    errdefer replacement.deinit(allocator);
+    const parsed = try parseDocument(document.parser, text);
+    errdefer parsed.tree.destroy();
 
-    document.deinit(allocator);
-    document.* = replacement;
+    const text_copy = try allocator.dupe(u8, text);
+    errdefer allocator.free(text_copy);
+
+    allocator.free(document.source);
+    document.tree.destroy();
+    document.source = text_copy;
+    document.version = version;
+    document.parsed = parsed.summary;
+    document.tree = parsed.tree;
 }
 
 /// Applies incremental content changes and reparses against the edited tree.
@@ -120,7 +135,7 @@ pub fn updateIncremental(
         edited_old_tree.edit(input_edit);
     }
 
-    const parsed = try parseDocumentIncremental(applied_change.text, edited_old_tree);
+    const parsed = try parseDocumentIncremental(document.parser, applied_change.text, edited_old_tree);
     errdefer parsed.tree.destroy();
 
     const text_copy = try allocator.dupe(u8, applied_change.text);
@@ -128,11 +143,13 @@ pub fn updateIncremental(
 
     allocator.free(document.source);
     document.tree.destroy();
+    const parser = document.parser;
     document.* = .{
         .source = text_copy,
         .version = version,
         .parsed = parsed.summary,
         .tree = parsed.tree,
+        .parser = parser,
     };
     return changeRangeFromInputEdits(applied_change.input_edits.items);
 }
@@ -1005,16 +1022,11 @@ fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
         (lhs.line == rhs.line and lhs.character < rhs.character);
 }
 
-fn parseDocument(source: []const u8) Error!ParsedDocument {
-    return parseDocumentIncremental(source, null);
+fn parseDocument(parser: *ts.Parser, source: []const u8) Error!ParsedDocument {
+    return parseDocumentIncremental(parser, source, null);
 }
 
-fn parseDocumentIncremental(source: []const u8, old_tree: ?*const ts.Tree) Error!ParsedDocument {
-    const parser = ts.Parser.create();
-    defer parser.destroy();
-
-    try parser.setLanguage(zitronLanguage());
-
+fn parseDocumentIncremental(parser: *ts.Parser, source: []const u8, old_tree: ?*const ts.Tree) Error!ParsedDocument {
     const tree = parser.parseString(source, old_tree) orelse return error.ParseFailed;
     const root = tree.rootNode();
     return .{
@@ -1908,6 +1920,34 @@ test "updateIncremental accepts same-line insert after nonzero column" {
     try expectEqualStrings("rule ::= TOKEN.", document.source);
     try expectEqualStrings("source_file", document.parsed.root_kind);
     try expect(!document.parsed.has_error);
+}
+
+test "document keeps one parser across reparses" {
+    var document = try Document.init(testing_allocator, 1, "rule ::= TOKEN.");
+    defer document.deinit(testing_allocator);
+
+    const parser = document.parser;
+    const insert_position = lsp.offsets.indexToPosition(document.source, document.source.len, .@"utf-8");
+    _ = try document.updateIncremental(
+        testing_allocator,
+        2,
+        &.{
+            .{ .text_document_content_change_partial = .{
+                .range = .{
+                    .start = insert_position,
+                    .end = insert_position,
+                },
+                .rangeLength = 0,
+                .text = "\n",
+            } },
+        },
+        .@"utf-8",
+    );
+
+    try expectEqual(parser, document.parser);
+
+    try document.replace(testing_allocator, 3, "other ::= TOKEN.");
+    try expectEqual(parser, document.parser);
 }
 
 test "resolution and references work without server" {
