@@ -808,7 +808,7 @@ fn middlewareSyncDocument(
             elapsedNs(middleware.io, generation_start),
         });
         const code_map_start = logStart(middleware.io);
-        try code_map.updateExtractingLineDirectives(middleware.allocator, source_root, source_text, generated_text, source_path);
+        try code_map.update(middleware.allocator, source_root, source_text, generated_text, source_path);
         code_map_ns = elapsedNs(middleware.io, code_map_start);
         log.debug("Zig sync code-map uri={s} spans={}", .{ uri, code_map.len() });
     }
@@ -2376,44 +2376,9 @@ pub const CodeMap = struct {
         fast_column_mapping: bool,
     };
 
-    /// Parses generated Zig into an initial map by delegating to `update`, so the
-    /// initial build and incremental rebuild use the same span coalescing rules.
-    pub fn parse(
-        allocator: std.mem.Allocator,
-        source_root: ts.Node,
-        source_text: []const u8,
-        generated_text: []const u8,
-        source_path: []const u8,
-    ) OOM!CodeMap {
-        var map: CodeMap = .{};
-        errdefer map.deinit(allocator);
-        try map.update(allocator, source_root, source_text, generated_text, source_path);
-        return map;
-    }
-
-    /// Rebuilds this map from freshly generated Zig while retaining the backing
-    /// allocations. The number of spans should usually stay stable, so this avoids
-    /// churn without carrying incremental tree state.
-    pub fn update(
-        map: *CodeMap,
-        allocator: std.mem.Allocator,
-        source_root: ts.Node,
-        source_text: []const u8,
-        generated_text: []const u8,
-        source_path: []const u8,
-    ) OOM!void {
-        map.gen_span.clearRetainingCapacity();
-        map.src_range.clearRetainingCapacity();
-        map.fast_column_mapping.clearRetainingCapacity();
-        map.src_order.clearRetainingCapacity();
-
-        try map.collectSpans(allocator, source_root, source_text, generated_text, source_path, null);
-        try map.rebuildSourceOrder(allocator);
-    }
-
     /// Rebuilds the map and extracts volatile `#line` payloads from the generated
-    /// buffer before it is sent to ZLS.
-    pub fn updateExtractingLineDirectives(
+    /// buffer before it is stored or sent to ZLS.
+    pub fn update(
         map: *CodeMap,
         allocator: std.mem.Allocator,
         source_root: ts.Node,
@@ -5371,20 +5336,14 @@ fn parseCodeMapForTest(source_text: []const u8, generated_text: []const u8, sour
 
     const tree = try parseZitronTreeForTest(effective_source);
     defer tree.destroy();
-    return try CodeMap.parse(testing_allocator, tree.rootNode(), effective_source, generated_text, source_path);
-}
 
-fn updateCodeMapForTest(map: *CodeMap, source_text: []const u8, generated_text: []const u8, source_path: []const u8) !void {
-    var allocated_source: ?[]u8 = null;
-    defer if (allocated_source) |source| testing_allocator.free(source);
-    const effective_source = if (std.mem.indexOf(u8, source_text, "// #line") == null) source_text else source: {
-        allocated_source = try genericZigCodeSourceForGeneratedTest(generated_text);
-        break :source allocated_source.?;
-    };
+    const generated = try testing_allocator.dupe(u8, generated_text);
+    defer testing_allocator.free(generated);
 
-    const tree = try parseZitronTreeForTest(effective_source);
-    defer tree.destroy();
-    try map.update(testing_allocator, tree.rootNode(), effective_source, generated_text, source_path);
+    var map: CodeMap = .{};
+    errdefer map.deinit(testing_allocator);
+    try map.update(testing_allocator, tree.rootNode(), effective_source, generated, source_path);
+    return map;
 }
 
 fn makeTestGeneratedDocument(
@@ -5542,7 +5501,7 @@ test "code map extraction scrubs line directive digits without losing map" {
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
 
-    try map.updateExtractingLineDirectives(testing_allocator, tree.rootNode(), source, extracted, "source.zy");
+    try map.update(testing_allocator, tree.rootNode(), source, extracted, "source.zy");
 
     try expectEqualStrings(expected, extracted);
     try expectEqual(@as(usize, 2), map.len());
@@ -5599,88 +5558,6 @@ test "code map stores one span for a multi-line mapped range" {
         .line = 3,
         .character = 9,
     }).?);
-}
-
-test "code map update reuses allocation and applies changed spans" {
-    const original =
-        \\// #line 10 source.zy
-        \\const a = 1;
-        \\const b = 2;
-        \\// #line 20 source.zy
-        \\const c = 3;
-        \\// #line 30 source.zy
-        \\const d = 4;
-    ;
-
-    var map = try parseCodeMapForTest(original, original, "source.zy");
-    defer map.deinit(testing_allocator);
-
-    const gen_span_capacity = map.gen_span.capacity;
-    const src_range_capacity = map.src_range.capacity;
-    const src_order_capacity = map.src_order.capacity;
-
-    try updateCodeMapForTest(&map, original, original, "source.zy");
-    try expectEqual(gen_span_capacity, map.gen_span.capacity);
-    try expectEqual(src_range_capacity, map.src_range.capacity);
-    try expectEqual(src_order_capacity, map.src_order.capacity);
-
-    const shifted =
-        \\// #line 10 source.zy
-        \\const a = 1;
-        \\const b = 2;
-        \\// #line 80 source.zig
-        \\const generated_only = true;
-        \\// #line 21 source.zy
-        \\const c = 3;
-        \\// #line 90 source.zig
-        \\// #line 33 source.zy
-        \\const d = 4;
-    ;
-    try updateCodeMapForTest(&map, shifted, shifted, "source.zy");
-
-    try expectEqual(gen_span_capacity, map.gen_span.capacity);
-    try expectEqual(src_range_capacity, map.src_range.capacity);
-    try expectEqual(src_order_capacity, map.src_order.capacity);
-    try expectEqual(types.Position{ .line = 20, .character = 4 }, map.generatedPositionToSource(.{
-        .line = 6,
-        .character = 4,
-    }).?);
-    try expectEqual(types.Position{ .line = 32, .character = 4 }, map.generatedPositionToSource(.{
-        .line = 9,
-        .character = 4,
-    }).?);
-    try expectEqual(types.Position{ .line = 9, .character = 4 }, map.sourcePositionToGenerated(.{
-        .line = 32,
-        .character = 4,
-    }).?);
-}
-
-test "code map update retains capacity after growing and shrinking" {
-    const one_span =
-        \\// #line 10 source.zy
-        \\const a = 1;
-    ;
-    const two_spans =
-        \\// #line 10 source.zy
-        \\const a = 1;
-        \\// #line 20 source.zy
-        \\const b = 2;
-    ;
-
-    var map = try parseCodeMapForTest(one_span, one_span, "source.zy");
-    defer map.deinit(testing_allocator);
-
-    try updateCodeMapForTest(&map, two_spans, two_spans, "source.zy");
-    try expectEqual(@as(usize, 2), map.len());
-    const grown_gen_span_capacity = map.gen_span.capacity;
-    const grown_src_range_capacity = map.src_range.capacity;
-    const grown_src_order_capacity = map.src_order.capacity;
-
-    try updateCodeMapForTest(&map, one_span, one_span, "source.zy");
-    try expectEqual(@as(usize, 1), map.len());
-    try expectEqual(grown_gen_span_capacity, map.gen_span.capacity);
-    try expectEqual(grown_src_range_capacity, map.src_range.capacity);
-    try expectEqual(grown_src_order_capacity, map.src_order.capacity);
 }
 
 test "code map handles duplicate line directives deterministically" {
@@ -5783,7 +5660,7 @@ test "code map reports optimized-away code blocks as unmapped" {
 
     const tree = try parseZitronTreeForTest(source);
     defer tree.destroy();
-    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), source, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     defer map.deinit(testing_allocator);
 
     const mapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 1) orelse return error.UnexpectedCodeMap).range;
@@ -5811,7 +5688,7 @@ test "alias code block rename refuses unmapped source blocks" {
     defer tree.destroy();
     const mapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 1) orelse return error.UnexpectedCodeMap).range;
     const unmapped_range = (zigCodeSpanForLine(source, tree.rootNode(), 4) orelse return error.UnexpectedCodeMap).range;
-    var map = try CodeMap.parse(testing_allocator, tree.rootNode(), source, generated, "source.zy");
+    var map = try parseCodeMapForTest(source, generated, "source.zy");
     errdefer map.deinit(testing_allocator);
 
     var middleware: Middleware = .{
@@ -7675,7 +7552,11 @@ test "span translator cache is lazy and resets across regeneration" {
     try expectEqual(@as(usize, 1), cache.len());
 
     cache.reset(testing_allocator);
-    try updateCodeMapForTest(&map, source, updated_generated, "source.zy");
+    const updated_tree = try parseZitronTreeForTest(source);
+    defer updated_tree.destroy();
+    const updated = try testing_allocator.dupe(u8, updated_generated);
+    defer testing_allocator.free(updated);
+    try map.update(testing_allocator, updated_tree.rootNode(), source, updated, "source.zy");
     try expectEqual(@as(usize, 0), cache.len());
 
     _ = try cache.get(testing_allocator, &map, source, updated_generated, 0);
