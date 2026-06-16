@@ -8,6 +8,8 @@ pub const server_name = "lsp_zitron";
 
 const server_version = "0.0.1";
 const zitron_completion_triggers = [_][]const u8{ "%", "(" };
+const zitron_signature_help_triggers = [_][]const u8{ "(", ";", "," };
+const zitron_signature_help_retriggers = [_][]const u8{ ";", "," };
 
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
@@ -15,6 +17,11 @@ fn zitronLanguage() *const ts.Language {
 
 /// Errors that can occur while loading the configured fixture source.
 pub const FixtureError = std.Io.Dir.ReadFileAllocError;
+
+const DefinitionLikeRoute = enum {
+    declaration,
+    definition,
+};
 
 fn positionEncodingKind(encoding: lsp.offsets.Encoding) types.PositionEncodingKind {
     return switch (encoding) {
@@ -43,12 +50,26 @@ fn serverCapabilities(
                 zls_completion_triggers,
             ) catch &zitron_completion_triggers,
         },
+        .signatureHelpProvider = .{
+            .triggerCharacters = &zitron_signature_help_triggers,
+            .retriggerCharacters = &zitron_signature_help_retriggers,
+        },
         .hoverProvider = .{ .bool = true },
+        .declarationProvider = .{ .bool = true },
         .definitionProvider = .{ .bool = true },
         .referencesProvider = .{ .bool = true },
+        .documentHighlightProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
         .renameProvider = .{ .bool = true },
         .inlayHintProvider = .{ .inlay_hint_options = .{} },
+        .semanticTokensProvider = .{ .semantic_tokens_options = .{
+            .legend = .{
+                .tokenTypes = &ZigMiddleware.semantic_token_types,
+                .tokenModifiers = &ZigMiddleware.semantic_token_modifiers,
+            },
+            .range = .{ .bool = true },
+            .full = .{ .semantic_tokens_full_delta = .{ .delta = true } },
+        } },
     };
 }
 
@@ -107,7 +128,7 @@ pub const Server = struct {
             .tags_query = tags_query,
             .rename_query = rename_query,
             .offset_encoding = .@"utf-16",
-            .zig_middleware = ZigMiddleware.disabled(),
+            .zig_middleware = .disabled,
             .client_transport = null,
             .io = null,
         };
@@ -197,6 +218,68 @@ pub const Server = struct {
         );
     }
 
+    fn definitionLikeAtPosition(
+        server: *Server,
+        route: DefinitionLikeRoute,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        position: types.Position,
+        work_done_token: ?types.ProgressToken,
+        partial_result_token: ?types.ProgressToken,
+    ) Error!lsp.ResultType("textDocument/definition") {
+        const doc = server.getDocument(uri) orelse return null;
+        return switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, position)) {
+            .no_match => null,
+            .unsupported_zig_code => switch (route) {
+                .declaration => try server.zig_middleware.forwardDeclaration(arena, uri, .{
+                    .textDocument = .{ .uri = uri },
+                    .position = position,
+                    .workDoneToken = work_done_token,
+                    .partialResultToken = partial_result_token,
+                }),
+                .definition => try server.zig_middleware.forwardDefinition(arena, uri, .{
+                    .textDocument = .{ .uri = uri },
+                    .position = position,
+                    .workDoneToken = work_done_token,
+                    .partialResultToken = partial_result_token,
+                }),
+            },
+            .symbol => |symbol| switch (symbol.kind) {
+                .rule_definition, .action_definition => .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            symbol.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                },
+                .rule_reference => if (doc.findRuleDefinition(
+                    server.tags_query,
+                    symbol.symbol_name,
+                )) |definition| .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
+                .terminal_reference => null,
+                .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
+            },
+        };
+    }
+
     /// LSP `initialize` handler required by `lsp-kit`.
     pub fn initialize(
         server: *Server,
@@ -279,6 +362,7 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
+            null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
@@ -301,7 +385,7 @@ pub const Server = struct {
             params.contentChanges.len,
         });
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
-        try doc.updateIncremental(
+        const change_range = try doc.updateIncremental(
             server.allocator,
             params.textDocument.version,
             params.contentChanges,
@@ -312,6 +396,10 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
+            if (change_range) |range| .{
+                .previous = range.previous,
+                .current = range.current,
+            } else null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
@@ -411,6 +499,51 @@ pub const Server = struct {
         return result;
     }
 
+    /// LSP `textDocument/signatureHelp` handler for Zitron named actions.
+    pub fn @"textDocument/signatureHelp"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SignatureHelpParams,
+    ) Error!lsp.ResultType("textDocument/signatureHelp") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/signatureHelp uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/signatureHelp uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position)) {
+            const result = try server.zig_middleware.forwardSignatureHelp(arena, params.textDocument.uri, params);
+            log.debug("LSP -> textDocument/signatureHelp uri={s} route=zig result_count={} null={} elapsed_ns={}", .{
+                params.textDocument.uri,
+                if (result) |help| help.signatures.len else 0,
+                result == null,
+                server.logElapsedNs(start),
+            });
+            return result;
+        }
+
+        const result = try completion.signatureHelp(
+            arena,
+            doc.source,
+            doc.tree.rootNode(),
+            params.position,
+            server.offset_encoding,
+        );
+        log.debug("LSP -> textDocument/signatureHelp uri={s} route=zitron result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (result) |help| help.signatures.len else 0,
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
     /// LSP `textDocument/hover` handler for Zitron grammar symbols.
     pub fn @"textDocument/hover"(
         server: *Server,
@@ -475,51 +608,57 @@ pub const Server = struct {
             params.textDocument.uri,
             params.position,
         });
-        const doc = server.getDocument(params.textDocument.uri) orelse {
+        if (server.getDocument(params.textDocument.uri) == null) {
             log.debug("LSP -> textDocument/definition uri={s} result=null reason=missing_document elapsed_ns={}", .{
                 params.textDocument.uri,
                 server.logElapsedNs(start),
             });
             return null;
-        };
-        const result: lsp.ResultType("textDocument/definition") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
-            .no_match => null,
-            .unsupported_zig_code => try server.zig_middleware.forwardDefinition(arena, params.textDocument.uri, params),
-            .symbol => |symbol| switch (symbol.kind) {
-                .rule_definition, .action_definition => .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            symbol.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                },
-                .rule_reference => if (doc.findRuleDefinition(
-                    server.tags_query,
-                    symbol.symbol_name,
-                )) |definition| .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            definition.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                } else null,
-                .terminal_reference => null,
-                .action_implementation => if (doc.findActionDefinition(server.tags_query, symbol.symbol_name)) |definition| .{
-                    .definition = .{
-                        .location = doc.locationForNode(
-                            params.textDocument.uri,
-                            definition.name_node,
-                            server.offset_encoding,
-                        ),
-                    },
-                } else null,
-            },
-        };
+        }
+        const result = try server.definitionLikeAtPosition(
+            .definition,
+            arena,
+            params.textDocument.uri,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
         log.debug("LSP -> textDocument/definition uri={s} result_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            definitionResultCount(result),
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    /// LSP `textDocument/declaration` handler; Zig declarations and definitions are equivalent.
+    pub fn @"textDocument/declaration"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DeclarationParams,
+    ) Error!lsp.ResultType("textDocument/declaration") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/declaration uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        if (server.getDocument(params.textDocument.uri) == null) {
+            log.debug("LSP -> textDocument/declaration uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        }
+        const result = try server.definitionLikeAtPosition(
+            .declaration,
+            arena,
+            params.textDocument.uri,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
+        log.debug("LSP -> textDocument/declaration uri={s} result_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
             definitionResultCount(result),
             result == null,
@@ -562,6 +701,56 @@ pub const Server = struct {
         log.debug("LSP -> textDocument/references uri={s} result_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
             if (result) |locations| locations.len else 0,
+            result == null,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    /// LSP `textDocument/documentHighlight` handler for grammar-side and embedded Zig highlights.
+    pub fn @"textDocument/documentHighlight"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DocumentHighlightParams,
+    ) Error!lsp.ResultType("textDocument/documentHighlight") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/documentHighlight uri={s} position={any}", .{
+            params.textDocument.uri,
+            params.position,
+        });
+        const doc = server.getDocument(params.textDocument.uri) orelse {
+            log.debug("LSP -> textDocument/documentHighlight uri={s} result=null reason=missing_document elapsed_ns={}", .{
+                params.textDocument.uri,
+                server.logElapsedNs(start),
+            });
+            return null;
+        };
+        const local_highlights = try doc.documentHighlights(
+            server.tags_query,
+            arena,
+            params.position,
+            server.offset_encoding,
+        );
+        const zig_highlights = if (doc.containsZigCodeAtPosition(server.offset_encoding, params.position))
+            try server.zig_middleware.forwardDocumentHighlight(arena, params.textDocument.uri, params)
+        else
+            null;
+        var highlights: std.ArrayList(types.DocumentHighlight) = .empty;
+        if (local_highlights) |local| {
+            try highlights.appendSlice(arena, local);
+        }
+        if (zig_highlights) |forwarded| {
+            try highlights.appendSlice(arena, forwarded);
+        }
+        const result: lsp.ResultType("textDocument/documentHighlight") = if (highlights.items.len == 0)
+            null
+        else
+            try highlights.toOwnedSlice(arena);
+        log.debug("LSP -> textDocument/documentHighlight uri={s} local_count={} zig_count={} total_count={} null={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            if (local_highlights) |local| local.len else 0,
+            if (zig_highlights) |forwarded| forwarded.len else 0,
+            if (result) |result_highlights| result_highlights.len else 0,
             result == null,
             server.logElapsedNs(start),
         });
@@ -639,6 +828,72 @@ pub const Server = struct {
             params.textDocument.uri,
             local_symbols.len,
             owned_symbols.len,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/full"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/full uri={s}", .{params.textDocument.uri});
+        const result = try server.zig_middleware.forwardSemanticTokensFull(arena, params.textDocument.uri, params);
+        log.debug("LSP -> textDocument/semanticTokens/full uri={s} null={} token_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            if (result) |tokens| tokens.data.len / 5 else 0,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/full/delta"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensDeltaParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/full/delta uri={s} previous={s}", .{
+            params.textDocument.uri,
+            params.previousResultId,
+        });
+        const result = try server.zig_middleware.forwardSemanticTokensFullDelta(arena, params.textDocument.uri, params);
+        const token_count = if (result) |tokens| switch (tokens) {
+            .semantic_tokens => |full| full.data.len / 5,
+            .semantic_tokens_delta => 0,
+        } else 0;
+        const edit_count = if (result) |tokens| switch (tokens) {
+            .semantic_tokens => 0,
+            .semantic_tokens_delta => |delta| delta.edits.len,
+        } else 0;
+        log.debug("LSP -> textDocument/semanticTokens/full/delta uri={s} null={} token_count={} edit_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            token_count,
+            edit_count,
+            server.logElapsedNs(start),
+        });
+        return result;
+    }
+
+    pub fn @"textDocument/semanticTokens/range"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.SemanticTokensRangeParams,
+    ) Error!lsp.ResultType("textDocument/semanticTokens/range") {
+        const start = server.logStart();
+        log.debug("LSP <- textDocument/semanticTokens/range uri={s} range={any}", .{
+            params.textDocument.uri,
+            params.range,
+        });
+        const result = try server.zig_middleware.forwardSemanticTokensRange(arena, params.textDocument.uri, params);
+        log.debug("LSP -> textDocument/semanticTokens/range uri={s} null={} token_count={} elapsed_ns={}", .{
+            params.textDocument.uri,
+            result == null,
+            if (result) |tokens| tokens.data.len / 5 else 0,
             server.logElapsedNs(start),
         });
         return result;
@@ -831,6 +1086,29 @@ pub const Server = struct {
         return false;
     }
 
+    fn hasHighlightAt(highlights: []const types.DocumentHighlight, position: types.Position) bool {
+        for (highlights) |highlight| {
+            if (std.meta.eql(highlight.range.start, position)) return true;
+        }
+
+        return false;
+    }
+
+    fn expectHighlightAtWithKind(
+        highlights: []const types.DocumentHighlight,
+        position: types.Position,
+        expected_kind: ?types.DocumentHighlight.Kind,
+    ) !void {
+        for (highlights) |highlight| {
+            if (std.meta.eql(highlight.range.start, position)) {
+                try expectEqual(expected_kind, highlight.kind);
+                return;
+            }
+        }
+
+        return error.UnexpectedDocumentHighlights;
+    }
+
     fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
         return switch (symbol.kind) {
             .rule_definition => std.fmt.allocPrint(
@@ -955,10 +1233,18 @@ fn expectActionAliasCompletion(
 }
 
 test "server capabilities match the implemented handlers" {
+    const capabilities = serverCapabilities(testing_allocator, .@"utf-16", null);
     lsp.basic_server.validateServerCapabilities(
         Server,
-        serverCapabilities(testing_allocator, .@"utf-16", null),
+        capabilities,
     );
+
+    const signature_help = capabilities.signatureHelpProvider.?;
+    try expectEqualStrings("(", signature_help.triggerCharacters.?[0]);
+    try expectEqualStrings(";", signature_help.triggerCharacters.?[1]);
+    try expectEqualStrings(",", signature_help.triggerCharacters.?[2]);
+    try expectEqualStrings(";", signature_help.retriggerCharacters.?[0]);
+    try expectEqualStrings(",", signature_help.retriggerCharacters.?[1]);
 }
 
 test "server capabilities merge zls completion triggers" {
@@ -977,6 +1263,36 @@ test "server capabilities merge zls completion triggers" {
     try expectEqualStrings("(", triggers[1]);
     try expectEqualStrings(".", triggers[2]);
     try expectEqualStrings(":", triggers[3]);
+}
+
+test "server supports declaration as definition for grammar symbols" {
+    try expect(@hasDecl(Server, "textDocument/declaration"));
+    if (comptime @hasDecl(Server, "textDocument/declaration")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+
+        const sample = try loadFixtureAlloc(std.testing.io, testing_allocator);
+        defer testing_allocator.free(sample);
+
+        try server.putDocument("file:///samples/calc.zy", 1, sample);
+
+        const calc_rule_index = try byteIndexOf(sample, "calc ::= expr");
+        const declaration = (try server.@"textDocument/declaration"(testing_allocator, .{
+            .textDocument = .{ .uri = "file:///samples/calc.zy" },
+            .position = try positionOfTextAfter(sample, calc_rule_index + 1, "expr"),
+        })) orelse return error.UnexpectedDefinitionTarget;
+        switch (declaration) {
+            .definition => |target| switch (target) {
+                .location => |location| {
+                    try expectEqualStrings("file:///samples/calc.zy", location.uri);
+                    try expectEqual(@as(u32, 48), location.range.start.line);
+                    try expectEqual(@as(u32, 0), location.range.start.character);
+                },
+                else => return error.UnexpectedDefinitionTarget,
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        }
+    }
 }
 
 test "embedded tags query compiles for the zitron grammar" {
@@ -1169,6 +1485,53 @@ test "server returns rule action alias completions in house style" {
     }
 }
 
+test "server returns rule action signature help from aliases" {
+    try expect(@hasDecl(Server, "textDocument/signatureHelp"));
+    if (comptime @hasDecl(Server, "textDocument/signatureHelp")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+        defer arena_state.deinit();
+
+        const sample = "pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; ";
+        try server.putDocument("file:///samples/signature_help.zy", 1, sample);
+
+        const help = (try server.@"textDocument/signatureHelp"(arena_state.allocator(), .{
+            .textDocument = .{ .uri = "file:///samples/signature_help.zy" },
+            .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+        })) orelse return error.UnexpectedSignatureHelp;
+
+        try expectEqual(@as(usize, 1), help.signatures.len);
+        try expectEqualStrings("@on_pair2(P; K, V)", help.signatures[0].label);
+        try expectEqual(@as(u32, 1), help.activeParameter.?);
+    }
+}
+
+test "server returns impl signature help from named action definition" {
+    try expect(@hasDecl(Server, "textDocument/signatureHelp"));
+    if (comptime @hasDecl(Server, "textDocument/signatureHelp")) {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+        defer arena_state.deinit();
+
+        const sample =
+            \\pair(P) ::= m_form(K) discard m_form(V). @on_pair2(P; K, V)
+            \\%impl @on_pair2(P; K,
+        ;
+        try server.putDocument("file:///samples/impl_signature_help.zy", 1, sample);
+
+        const help = (try server.@"textDocument/signatureHelp"(arena_state.allocator(), .{
+            .textDocument = .{ .uri = "file:///samples/impl_signature_help.zy" },
+            .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+        })) orelse return error.UnexpectedSignatureHelp;
+
+        try expectEqual(@as(usize, 1), help.signatures.len);
+        try expectEqualStrings("@on_pair2(P; K, V)", help.signatures[0].label);
+        try expectEqual(@as(u32, 2), help.activeParameter.?);
+    }
+}
+
 test "server completes grammar particles including multiterminals" {
     var server = try Server.init(testing_allocator);
     defer server.deinit();
@@ -1258,7 +1621,7 @@ test "incremental tree-sitter reparse matches fresh parse" {
     var incremental = try Document.init(testing_allocator, 1, sample);
     defer incremental.deinit(testing_allocator);
 
-    try incremental.updateIncremental(testing_allocator, 2, &.{
+    _ = try incremental.updateIncremental(testing_allocator, 2, &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
@@ -1551,6 +1914,83 @@ test "hover definition and references operate on stored live document state" {
 
     const number_rhs_index = try byteIndexOf(sample, "factor(A) ::= NUMBER(N).");
     try expect(Server.hasLocationAt(number_references, "file:///samples/calc.zy", try positionOfTextAfter(sample, number_rhs_index, "NUMBER")));
+}
+
+test "document highlights cover directives identifiers and named actions" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/document_highlight.zy";
+    const sample =
+        \\%type expr f64
+        \\%type term f64
+        \\%token_type Token
+        \\calc ::= expr(A).
+        \\expr(A) ::= term(A) PLUS|MINUS PLUS. @on_expr(A)
+        \\term(A) ::= PLUS(A).
+        \\%impl @on_expr(A) { _ = A; }
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const directive_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "%type"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 2), directive_highlights.len);
+    try expect(Server.hasHighlightAt(directive_highlights, try positionOfText(sample, "%type")));
+    const second_type = try byteIndexOfAfter(sample, 1, "%type");
+    try expect(Server.hasHighlightAt(directive_highlights, lsp.offsets.indexToPosition(sample, second_type, test_offset_encoding)));
+    try Server.expectHighlightAtWithKind(directive_highlights, try positionOfText(sample, "%type"), null);
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const nonterminal_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "expr(A)"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 3), nonterminal_highlights.len);
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfTextAfter(sample, try byteIndexOf(sample, "%type expr"), "expr")));
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfText(sample, "expr(A) ::= term")));
+    const calc_ref = try byteIndexOf(sample, "calc ::= expr(A)");
+    try expect(Server.hasHighlightAt(nonterminal_highlights, try positionOfTextAfter(sample, calc_ref, "expr")));
+    try Server.expectHighlightAtWithKind(
+        nonterminal_highlights,
+        try positionOfText(sample, "expr(A) ::= term"),
+        .Write,
+    );
+    try Server.expectHighlightAtWithKind(
+        nonterminal_highlights,
+        try positionOfTextAfter(sample, calc_ref, "expr"),
+        .Read,
+    );
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const terminal_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "PLUS|MINUS"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 3), terminal_highlights.len);
+    try expect(Server.hasHighlightAt(terminal_highlights, try positionOfText(sample, "PLUS|MINUS")));
+    const second_plus = try byteIndexOfAfter(sample, try byteIndexOf(sample, "PLUS|MINUS") + 1, "PLUS");
+    try expect(Server.hasHighlightAt(terminal_highlights, lsp.offsets.indexToPosition(sample, second_plus, test_offset_encoding)));
+    const term_plus = try byteIndexOf(sample, "term(A) ::= PLUS(A)");
+    try expect(Server.hasHighlightAt(terminal_highlights, try positionOfTextAfter(sample, term_plus, "PLUS")));
+    try Server.expectHighlightAtWithKind(terminal_highlights, try positionOfText(sample, "PLUS|MINUS"), null);
+
+    _ = arena_state.reset(.retain_capacity);
+
+    const action_highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = try positionOfText(sample, "on_expr(A)"),
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 2), action_highlights.len);
+    try expect(Server.hasHighlightAt(action_highlights, try positionOfText(sample, "@on_expr(A)")));
+    const impl_action = try byteIndexOf(sample, "%impl @on_expr(A)");
+    try expect(Server.hasHighlightAt(action_highlights, try positionOfTextAfter(sample, impl_action, "@on_expr(A)")));
+    try Server.expectHighlightAtWithKind(action_highlights, try positionOfText(sample, "@on_expr(A)"), null);
 }
 
 test "document symbols operate on stored live document state" {

@@ -38,13 +38,13 @@ pub fn main(init: std.process.Init) Error!void {
     }).init(&transport.transport);
     server.setClientTransport(&safe_transport.transport);
 
-    try lsp.basic_server.run(
+    try handleServerRunResult(lsp.basic_server.run(
         init.io,
         init.gpa,
         &safe_transport.transport,
         &server,
         log.err,
-    );
+    ));
 }
 
 const SpinMutex = struct {
@@ -135,6 +135,13 @@ fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Args
     return result;
 }
 
+fn handleServerRunResult(result: Error!void) Error!void {
+    result catch |err| switch (err) {
+        error.EndOfStream => return,
+        else => return err,
+    };
+}
+
 test "exe mentioned" {
     var server = try zitron.Server.init(testing_allocator);
     defer server.deinit();
@@ -144,6 +151,11 @@ test "exe mentioned" {
     });
 
     try expectEqualStrings(zitron.server_name, result.serverInfo.?.name);
+}
+
+test "server loop treats stream end as expected shutdown" {
+    try handleServerRunResult(error.EndOfStream);
+    try std.testing.expectError(error.OutOfMemory, handleServerRunResult(error.OutOfMemory));
 }
 
 comptime {

@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     });
     const muad_diff_dep = b.dependency("muad_diff", .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSafe,
     });
 
     const lsp_zitron_mod = b.addModule("lsp_zitron", .{
