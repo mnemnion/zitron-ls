@@ -135,10 +135,14 @@ pub const Server = struct {
     }
 
     /// Creates a server instance with the production Zig middleware enabled.
-    pub fn initProduction(io: std.Io, allocator: std.mem.Allocator) Error!Server {
+    pub fn initProduction(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        environ_map: *const std.process.Environ.Map,
+    ) Error!Server {
         var server = try init(allocator);
         errdefer server.deinit();
-        server.zig_middleware = try ZigMiddleware.init(io, allocator);
+        server.zig_middleware = try ZigMiddleware.init(io, allocator, environ_map);
         server.io = io;
         return server;
     }
@@ -2426,6 +2430,7 @@ const std = @import("std");
 const OOM = std.mem.Allocator.Error;
 const Document = @import("Document.zig");
 const ZigMiddleware = @import("ZigMiddleware.zig");
+const ZlsAdapter = @import("zls.zig");
 const completion = @import("completion.zig");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
@@ -2440,4 +2445,5 @@ const log = std.log.scoped(.lsp_zitron);
 comptime {
     std.testing.refAllDecls(Document);
     std.testing.refAllDecls(ZigMiddleware);
+    std.testing.refAllDecls(ZlsAdapter);
 }

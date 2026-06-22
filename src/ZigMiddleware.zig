@@ -31,12 +31,17 @@ const Middleware = struct {
     diagnostics_publisher: ?DiagnosticsPublisher,
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
+    zls_library: ?ZlsAdapter = null,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
     next_request_id: i64,
 
     fn deinit(middleware: *Middleware) void {
         freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
+        if (middleware.zls_library) |*zls_library| {
+            zls_library.deinit();
+            middleware.zls_library = null;
+        }
         middleware.shutdownZls() catch |err| {
             log.warn("ZLS shutdown failed: {}", .{err});
             middleware.zls_child.kill(middleware.io);
@@ -250,6 +255,14 @@ const Middleware = struct {
         var state = removed.value;
         if (state.opened) {
             if (state.currentGeneration()) |generation| {
+                if (middleware.zls_library) |*zls_library| {
+                    log.debug("ZLS library <- textDocument/didClose uri={s}", .{generation.zig_uri});
+                    zls_library.closeDocument(middleware.allocator, generation.zig_uri) catch |err| {
+                        log.warn("ZLS library didClose failed uri={s}: {}", .{ generation.zig_uri, err });
+                    };
+                } else {
+                    log.warn("Zig library sync fallback backend=server method=textDocument/didClose uri={s} reason=nyi_library_backend", .{generation.zig_uri});
+                }
                 log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.zig_uri});
                 middleware.zls_transport.transport.writeNotification(
                     middleware.io,
@@ -318,6 +331,7 @@ const Middleware = struct {
             if (send_to_zls) {
                 notify_uri = generation.zig_uri;
                 notify_version = generation.version;
+                notify_text = generation.zig_text;
                 notify_zig_bytes = generation.zig_text.len;
                 if (state.opened) {
                     const changes = text_changes orelse return error.MissingZigDocument;
@@ -375,6 +389,7 @@ const Middleware = struct {
                     },
                     .{ .emit_null_optional_fields = false },
                 );
+                try middleware.syncLibraryChange(notify_uri, notify_version, notify_text);
             },
             .open => {
                 log.debug("ZLS <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
@@ -397,6 +412,7 @@ const Middleware = struct {
                     },
                     .{ .emit_null_optional_fields = false },
                 );
+                try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
             },
         }
         const notify_ns = elapsedNs(middleware.io, notify_start);
@@ -467,7 +483,13 @@ const Middleware = struct {
             mapped.position,
         });
 
-        var result = try middleware.request(arena, "textDocument/hover", mapped);
+        var result = if (middleware.zls_library) |*zls_library| blk: {
+            log.debug("Zig forward hover backend=library uri={s} zig_uri={s}", .{ zy_uri, doc.zig_uri });
+            break :blk try zls_library.request(arena, "textDocument/hover", mapped);
+        } else blk: {
+            log.warn("Zig forward hover fallback backend=server uri={s} reason=nyi_library_backend", .{zy_uri});
+            break :blk try middleware.request(arena, "textDocument/hover", mapped);
+        };
         if (result) |*hover_result| try translateHover(hover_result, &translation_context);
         log.debug("Zig forward hover -> uri={s} null={} elapsed_ns={}", .{
             zy_uri,
@@ -475,6 +497,46 @@ const Middleware = struct {
             elapsedNs(middleware.io, start),
         });
         return result;
+    }
+
+    fn syncLibraryOpen(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        const zls_library = if (middleware.zls_library) |*zls_library|
+            zls_library
+        else {
+            log.warn("Zig library sync fallback backend=server method=textDocument/didOpen uri={s} reason=nyi_library_backend", .{zig_uri});
+            return;
+        };
+        log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
+            zig_uri,
+            version,
+            zig_text.len,
+        });
+        try zls_library.openDocument(middleware.allocator, zig_uri, version, zig_text);
+    }
+
+    fn syncLibraryChange(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        const zls_library = if (middleware.zls_library) |*zls_library|
+            zls_library
+        else {
+            log.warn("Zig library sync fallback backend=server method=textDocument/didChange uri={s} reason=nyi_library_backend", .{zig_uri});
+            return;
+        };
+        log.debug("ZLS library <- textDocument/didChange uri={s} version={} zig_bytes={}", .{
+            zig_uri,
+            version,
+            zig_text.len,
+        });
+        try zls_library.replaceDocument(middleware.allocator, zig_uri, version, zig_text);
     }
 
     fn forwardDeclaration(
@@ -1703,6 +1765,7 @@ const Middleware = struct {
     ) Error!lsp.ResultType(method) {
         const start = logStart(middleware.io);
         const id = middleware.nextRequestId();
+        log.debug("ZLS request fallback backend=server method={s} reason=nyi_library_backend", .{method});
         log.debug("ZLS <- {s} id={any}", .{ method, id });
         const number_id = switch (id) {
             .number => |number| number,
@@ -1982,6 +2045,7 @@ pub const Error =
     std.process.Child.WaitError ||
     std.process.RunError ||
     std.Thread.SpawnError ||
+    ZlsAdapter.Error ||
     lsp.Transport.ReadError ||
     lsp.Transport.WriteError ||
     JsonParseError ||
@@ -2088,8 +2152,12 @@ const SemanticTokensSnapshot = struct {
 
 pub const disabled: ZigMiddleware = .{ .mode = .disabled };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
-    return initImpl(io, allocator) catch |err| switch (err) {
+pub fn init(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) Error!ZigMiddleware {
+    return initImpl(io, allocator, environ_map) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             log.warn("Zig middleware disabled: {}", .{err});
@@ -2098,7 +2166,11 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
     };
 }
 
-fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
+fn initImpl(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+) Error!ZigMiddleware {
     log.info("Starting ZLS middleware", .{});
     try checkZitron(allocator, io);
 
@@ -2132,6 +2204,7 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_library = null,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
         .next_request_id = 1,
@@ -2140,6 +2213,7 @@ fn initImpl(io: std.Io, allocator: std.mem.Allocator) Error!ZigMiddleware {
 
     mware.reader_thread = try std.Thread.spawn(.{}, Middleware.readerMain, .{mware});
     try mware.initializeZls();
+    mware.zls_library = try ZlsAdapter.initFromEnvironmentMap(io, allocator, environ_map);
     log.info("ZLS middleware enabled", .{});
     return .{ .mode = .{ .enabled = mware } };
 }
@@ -7952,6 +8026,7 @@ const dmp = @import("dmp");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
 const ts = @import("tree-sitter");
+const ZlsAdapter = @import("zls.zig");
 const zitron_grammar = @import("tree_sitter_zitron");
 const Diff = dmp.Diff;
 const Edit = dmp.Edit;

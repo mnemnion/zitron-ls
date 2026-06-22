@@ -29,6 +29,10 @@
             // .hash = "muad_diff-0.0.1-p0-XoRGIAwBmN7XLmC4Z6Sj7mqeiUaZvwoisN1hXF81b",
             .path = "../muad-diff/",
         },
+        .zls = .{
+            .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",
+            .hash = "zls-0.16.0-rmm5fs_JJgBG3dk5HwYK1FylE2_LMN0BYpX57tPzT-Xc",
+        },
     },
 
     .paths = .{

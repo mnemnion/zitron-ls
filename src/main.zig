@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) Error!void {
     }
     if (args.panic_smoke_test) @panic("panic-smoke-test");
 
-    var server = try zitron.Server.initProduction(init.io, init.gpa);
+    var server = try zitron.Server.initProduction(init.io, init.gpa, init.environ_map);
     defer server.deinit();
 
     var read_buffer: [4096]u8 = undefined;
