@@ -19,37 +19,17 @@ pub const SemanticDirtyRange = struct {
 const Middleware = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    zls_child: std.process.Child,
-    zls_transport: lsp.Transport.Stdio,
-    zls_read_buffer: []u8,
-    reader_thread: ?std.Thread,
-    response_mutex: std.Io.Mutex,
-    response_cond: std.Io.Condition,
-    pending_responses: std.AutoHashMapUnmanaged(i64, PendingResponse),
-    reader_failed: bool,
     diagnostics_context: ?*anyopaque,
     diagnostics_publisher: ?DiagnosticsPublisher,
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
-    zls_library: ?ZlsAdapter = null,
+    zls_library: ZlsAdapter = undefined,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
-    next_request_id: i64,
 
     fn deinit(middleware: *Middleware) void {
         freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
-        if (middleware.zls_library) |*zls_library| {
-            zls_library.deinit();
-            middleware.zls_library = null;
-        }
-        middleware.shutdownZls() catch |err| {
-            log.warn("ZLS shutdown failed: {}", .{err});
-            middleware.zls_child.kill(middleware.io);
-        };
-        if (middleware.reader_thread) |thread| {
-            thread.join();
-            middleware.reader_thread = null;
-        }
+        middleware.zls_library.deinit();
 
         middleware.documents_mutex.lockUncancelable(middleware.io);
         defer middleware.documents_mutex.unlock(middleware.io);
@@ -59,13 +39,6 @@ const Middleware = struct {
             entry.value_ptr.deinit(middleware.allocator);
         }
         middleware.documents.deinit(middleware.allocator);
-
-        var pending_it = middleware.pending_responses.iterator();
-        while (pending_it.next()) |entry| {
-            if (entry.value_ptr.response) |response| middleware.allocator.free(response);
-        }
-        middleware.pending_responses.deinit(middleware.allocator);
-        middleware.allocator.free(middleware.zls_read_buffer);
     }
 
     fn syncDocument(
@@ -255,23 +228,13 @@ const Middleware = struct {
         var state = removed.value;
         if (state.opened) {
             if (state.currentGeneration()) |generation| {
-                if (middleware.zls_library) |*zls_library| {
-                    log.debug("ZLS library <- textDocument/didClose uri={s}", .{generation.zig_uri});
-                    zls_library.closeDocument(middleware.allocator, generation.zig_uri) catch |err| {
-                        log.warn("ZLS library didClose failed uri={s}: {}", .{ generation.zig_uri, err });
-                    };
-                } else {
-                    log.warn("Zig library sync fallback backend=server method=textDocument/didClose uri={s} reason=nyi_library_backend", .{generation.zig_uri});
-                }
-                log.debug("ZLS <- textDocument/didClose uri={s}", .{generation.zig_uri});
-                middleware.zls_transport.transport.writeNotification(
-                    middleware.io,
-                    middleware.allocator,
-                    "textDocument/didClose",
-                    lsp.ParamsType("textDocument/didClose"),
-                    .{ .textDocument = .{ .uri = generation.zig_uri } },
-                    .{ .emit_null_optional_fields = false },
-                ) catch {};
+                log.debug("ZLS library <- textDocument/didClose uri={s}", .{generation.zig_uri});
+                middleware.zls_library.closeDocument(middleware.allocator, generation.zig_uri) catch |err| {
+                    log.warn("ZLS library didClose failed uri={s}: {}", .{ generation.zig_uri, err });
+                };
+                middleware.processCapturedZlsMessages() catch |err| {
+                    log.warn("ZLS library captured message ignored after didClose: {}", .{err});
+                };
             }
         }
         state.deinit(middleware.allocator);
@@ -372,46 +335,20 @@ const Middleware = struct {
             .none => {},
             .change => {
                 const changes = text_changes orelse return error.MissingZigDocument;
-                log.debug("ZLS <- textDocument/didChange uri={s} version={} changes={} zig_bytes={}", .{
+                log.debug("ZLS library <- textDocument/didChange uri={s} version={} changes={} zig_bytes={}", .{
                     notify_uri,
                     notify_version,
                     changes.items.len,
                     notify_zig_bytes,
                 });
-                try middleware.zls_transport.transport.writeNotification(
-                    middleware.io,
-                    middleware.allocator,
-                    "textDocument/didChange",
-                    lsp.ParamsType("textDocument/didChange"),
-                    .{
-                        .textDocument = .{ .uri = notify_uri, .version = notify_version },
-                        .contentChanges = changes.items,
-                    },
-                    .{ .emit_null_optional_fields = false },
-                );
                 try middleware.syncLibraryChange(notify_uri, notify_version, notify_text);
             },
             .open => {
-                log.debug("ZLS <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
+                log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
                     notify_uri,
                     notify_version,
                     notify_zig_bytes,
                 });
-                try middleware.zls_transport.transport.writeNotification(
-                    middleware.io,
-                    middleware.allocator,
-                    "textDocument/didOpen",
-                    lsp.ParamsType("textDocument/didOpen"),
-                    .{
-                        .textDocument = .{
-                            .uri = notify_uri,
-                            .languageId = .{ .custom_value = "zig" },
-                            .version = notify_version,
-                            .text = notify_text,
-                        },
-                    },
-                    .{ .emit_null_optional_fields = false },
-                );
                 try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
             },
         }
@@ -483,13 +420,8 @@ const Middleware = struct {
             mapped.position,
         });
 
-        var result = if (middleware.zls_library) |*zls_library| blk: {
-            log.debug("Zig forward hover backend=library uri={s} zig_uri={s}", .{ zy_uri, doc.zig_uri });
-            break :blk try zls_library.request(arena, "textDocument/hover", mapped);
-        } else blk: {
-            log.warn("Zig forward hover fallback backend=server uri={s} reason=nyi_library_backend", .{zy_uri});
-            break :blk try middleware.request(arena, "textDocument/hover", mapped);
-        };
+        log.debug("Zig forward hover backend=library uri={s} zig_uri={s}", .{ zy_uri, doc.zig_uri });
+        var result = try middleware.request(arena, "textDocument/hover", mapped);
         if (result) |*hover_result| try translateHover(hover_result, &translation_context);
         log.debug("Zig forward hover -> uri={s} null={} elapsed_ns={}", .{
             zy_uri,
@@ -505,18 +437,13 @@ const Middleware = struct {
         version: i32,
         zig_text: []const u8,
     ) Error!void {
-        const zls_library = if (middleware.zls_library) |*zls_library|
-            zls_library
-        else {
-            log.warn("Zig library sync fallback backend=server method=textDocument/didOpen uri={s} reason=nyi_library_backend", .{zig_uri});
-            return;
-        };
         log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
             zig_uri,
             version,
             zig_text.len,
         });
-        try zls_library.openDocument(middleware.allocator, zig_uri, version, zig_text);
+        try middleware.zls_library.openDocument(middleware.allocator, zig_uri, version, zig_text);
+        try middleware.processCapturedZlsMessages();
     }
 
     fn syncLibraryChange(
@@ -525,18 +452,13 @@ const Middleware = struct {
         version: i32,
         zig_text: []const u8,
     ) Error!void {
-        const zls_library = if (middleware.zls_library) |*zls_library|
-            zls_library
-        else {
-            log.warn("Zig library sync fallback backend=server method=textDocument/didChange uri={s} reason=nyi_library_backend", .{zig_uri});
-            return;
-        };
         log.debug("ZLS library <- textDocument/didChange uri={s} version={} zig_bytes={}", .{
             zig_uri,
             version,
             zig_text.len,
         });
-        try zls_library.replaceDocument(middleware.allocator, zig_uri, version, zig_text);
+        try middleware.zls_library.replaceDocument(middleware.allocator, zig_uri, version, zig_text);
+        try middleware.processCapturedZlsMessages();
     }
 
     fn forwardDeclaration(
@@ -1622,141 +1544,6 @@ const Middleware = struct {
         return result;
     }
 
-    fn initializeZls(middleware: *Middleware) Error!void {
-        const start = logStart(middleware.io);
-        const id = middleware.nextRequestId();
-        log.debug("ZLS <- initialize id={any}", .{id});
-        const number_id = switch (id) {
-            .number => |number| number,
-            .string => unreachable,
-        };
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        errdefer middleware.response_mutex.unlock(middleware.io);
-        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-        middleware.response_mutex.unlock(middleware.io);
-        errdefer {
-            middleware.response_mutex.lockUncancelable(middleware.io);
-            _ = middleware.pending_responses.remove(number_id);
-            middleware.response_mutex.unlock(middleware.io);
-        }
-
-        try middleware.zls_transport.transport.writeRequest(
-            middleware.io,
-            middleware.allocator,
-            id,
-            "initialize",
-            lsp.ParamsType("initialize"),
-            zlsInitializeParams(),
-            .{ .emit_null_optional_fields = false },
-        );
-        const wait_start = logStart(middleware.io);
-        const initialize_response = try middleware.waitResponseForId(id);
-        defer middleware.allocator.free(initialize_response);
-        log.debug("ZLS -> initialize id={any} response_bytes={} wait_ns={}", .{
-            id,
-            initialize_response.len,
-            elapsedNs(middleware.io, wait_start),
-        });
-
-        const parse_start = logStart(middleware.io);
-        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, initialize_response, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        const result_value = switch (parsed.value) {
-            .response => |response| switch (response.result_or_error) {
-                .result => |maybe_result| maybe_result,
-                .@"error" => return error.RequestFailed,
-            },
-            else => return error.UnexpectedResponse,
-        };
-        if (result_value == null or result_value.? == .null) return error.UnexpectedResponse;
-
-        const initialize_result = try std.json.parseFromValue(types.InitializeResult, middleware.allocator, result_value.?, .{
-            .ignore_unknown_fields = true,
-        });
-        defer initialize_result.deinit();
-        log.debug("ZLS initialize parsed id={any} parse_ns={}", .{
-            id,
-            elapsedNs(middleware.io, parse_start),
-        });
-
-        if (initialize_result.value.capabilities.completionProvider) |completion_options| {
-            if (completion_options.triggerCharacters) |trigger_characters| {
-                freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
-                middleware.zls_completion_triggers = try dupeStringSlices(middleware.allocator, trigger_characters);
-            }
-        }
-        warnIfZlsSemanticTokenLegendDrift(initialize_result.value.capabilities.semanticTokensProvider);
-
-        log.debug("ZLS <- initialized", .{});
-        try middleware.zls_transport.transport.writeNotification(
-            middleware.io,
-            middleware.allocator,
-            "initialized",
-            lsp.ParamsType("initialized"),
-            .{},
-            .{ .emit_null_optional_fields = false },
-        );
-        log.debug("ZLS initialize complete id={any} triggers={} elapsed_ns={}", .{
-            id,
-            middleware.zls_completion_triggers.len,
-            elapsedNs(middleware.io, start),
-        });
-    }
-
-    fn shutdownZls(middleware: *Middleware) Error!void {
-        log.info("Stopping ZLS middleware", .{});
-        const start = logStart(middleware.io);
-        const id = middleware.nextRequestId();
-        log.debug("ZLS <- shutdown id={any}", .{id});
-        const number_id = switch (id) {
-            .number => |number| number,
-            .string => unreachable,
-        };
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        errdefer middleware.response_mutex.unlock(middleware.io);
-        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-        middleware.response_mutex.unlock(middleware.io);
-        errdefer {
-            middleware.response_mutex.lockUncancelable(middleware.io);
-            _ = middleware.pending_responses.remove(number_id);
-            middleware.response_mutex.unlock(middleware.io);
-        }
-
-        try middleware.zls_transport.transport.writeRequest(
-            middleware.io,
-            middleware.allocator,
-            id,
-            "shutdown",
-            lsp.ParamsType("shutdown"),
-            {},
-            .{ .emit_null_optional_fields = false },
-        );
-        const wait_start = logStart(middleware.io);
-        const json_message = try middleware.waitResponseForId(id);
-        log.debug("ZLS -> shutdown id={any} response_bytes={} wait_ns={}", .{
-            id,
-            json_message.len,
-            elapsedNs(middleware.io, wait_start),
-        });
-        middleware.allocator.free(json_message);
-        log.debug("ZLS <- exit", .{});
-        try middleware.zls_transport.transport.writeNotification(
-            middleware.io,
-            middleware.allocator,
-            "exit",
-            lsp.ParamsType("exit"),
-            {},
-            .{ .emit_null_optional_fields = false },
-        );
-        middleware.zls_child.stdin.?.close(middleware.io);
-        middleware.zls_child.stdin = null;
-        _ = try middleware.zls_child.wait(middleware.io);
-        log.debug("ZLS shutdown complete id={any} elapsed_ns={}", .{ id, elapsedNs(middleware.io, start) });
-    }
-
     fn request(
         middleware: *Middleware,
         arena: std.mem.Allocator,
@@ -1764,110 +1551,27 @@ const Middleware = struct {
         params: lsp.ParamsType(method),
     ) Error!lsp.ResultType(method) {
         const start = logStart(middleware.io);
-        const id = middleware.nextRequestId();
-        log.debug("ZLS request fallback backend=server method={s} reason=nyi_library_backend", .{method});
-        log.debug("ZLS <- {s} id={any}", .{ method, id });
-        const number_id = switch (id) {
-            .number => |number| number,
-            .string => unreachable,
-        };
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        errdefer middleware.response_mutex.unlock(middleware.io);
-        try middleware.pending_responses.put(middleware.allocator, number_id, .{});
-        middleware.response_mutex.unlock(middleware.io);
-        errdefer {
-            middleware.response_mutex.lockUncancelable(middleware.io);
-            _ = middleware.pending_responses.remove(number_id);
-            middleware.response_mutex.unlock(middleware.io);
-        }
-
-        try middleware.zls_transport.transport.writeRequest(
-            middleware.io,
-            middleware.allocator,
-            id,
+        log.debug("ZLS library <- {s}", .{method});
+        const result = try middleware.zls_library.request(arena, method, params);
+        try middleware.processCapturedZlsMessages();
+        log.debug("ZLS library -> {s} elapsed_ns={}", .{
             method,
-            lsp.ParamsType(method),
-            params,
-            .{ .emit_null_optional_fields = false },
-        );
-
-        const wait_start = logStart(middleware.io);
-        const json_message = try middleware.waitResponseForId(id);
-        const wait_ns = elapsedNs(middleware.io, wait_start);
-        log.debug("ZLS -> {s} id={any} response_bytes={} wait_ns={}", .{
-            method,
-            id,
-            json_message.len,
-            wait_ns,
-        });
-        const parse_start = logStart(middleware.io);
-        defer middleware.allocator.free(json_message);
-        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, arena, json_message, .{
-            .ignore_unknown_fields = true,
-        });
-        const parse_ns = elapsedNs(middleware.io, parse_start);
-
-        const result_value = switch (parsed.value) {
-            .response => |response| switch (response.result_or_error) {
-                .result => |maybe_result| maybe_result,
-                .@"error" => {
-                    log.warn("ZLS '{s}' request failed id={any}", .{ method, id });
-                    return error.RequestFailed;
-                },
-            },
-            else => return error.UnexpectedResponse,
-        };
-        if (result_value == null or result_value.? == .null) {
-            log.debug("ZLS parsed {s} id={any} result=null parse_ns={} elapsed_ns={}", .{
-                method,
-                id,
-                parse_ns,
-                elapsedNs(middleware.io, start),
-            });
-            return null;
-        }
-
-        const typed_parse_start = logStart(middleware.io);
-        const typed = try std.json.parseFromValue(lsp.ResultType(method), arena, result_value.?, .{
-            .ignore_unknown_fields = true,
-        });
-        log.debug("ZLS parsed {s} id={any} result=success parse_ns={} typed_parse_ns={} elapsed_ns={}", .{
-            method,
-            id,
-            parse_ns,
-            elapsedNs(middleware.io, typed_parse_start),
             elapsedNs(middleware.io, start),
         });
-        return typed.value;
+        return result;
     }
 
-    fn waitResponseForId(middleware: *Middleware, id: lsp.JsonRPCMessage.ID) Error![]u8 {
-        const number_id = switch (id) {
-            .number => |number| number,
-            .string => return error.UnexpectedResponse,
-        };
+    fn processCapturedZlsMessages(middleware: *Middleware) Error!void {
+        const messages = try middleware.zls_library.drainCapturedMessages(middleware.allocator);
+        defer middleware.allocator.free(messages);
 
-        middleware.response_mutex.lockUncancelable(middleware.io);
-        defer middleware.response_mutex.unlock(middleware.io);
-
-        while (true) {
-            if (middleware.pending_responses.getPtr(number_id)) |pending| {
-                if (pending.response) |response| {
-                    _ = middleware.pending_responses.remove(number_id);
-                    return response;
-                }
-            } else {
-                return error.UnexpectedResponse;
-            }
-            if (middleware.reader_failed) return error.UnexpectedResponse;
-            middleware.response_cond.waitUncancelable(middleware.io, &middleware.response_mutex);
+        for (messages) |json_message| {
+            const consumed = middleware.handleZlsMessage(json_message) catch |err| blk: {
+                log.warn("ZLS library message ignored: {}", .{err});
+                break :blk false;
+            };
+            if (!consumed) middleware.allocator.free(json_message);
         }
-    }
-
-    fn nextRequestId(middleware: *Middleware) lsp.JsonRPCMessage.ID {
-        const id = middleware.next_request_id;
-        middleware.next_request_id += 1;
-        return .{ .number = id };
     }
 
     fn documentReady(middleware: *Middleware, zy_uri: []const u8) Error!*ZigDocument {
@@ -1954,28 +1658,6 @@ const Middleware = struct {
         };
     }
 
-    fn readerMain(middleware: *Middleware) void {
-        while (true) {
-            const json_message = middleware.zls_transport.transport.readJsonMessage(
-                middleware.io,
-                middleware.allocator,
-            ) catch |err| {
-                log.debug("ZLS reader stopped: {}", .{err});
-                middleware.response_mutex.lockUncancelable(middleware.io);
-                middleware.reader_failed = true;
-                middleware.response_cond.broadcast(middleware.io);
-                middleware.response_mutex.unlock(middleware.io);
-                return;
-            };
-
-            const consumed = middleware.handleZlsMessage(json_message) catch |err| blk: {
-                log.warn("ZLS message ignored: {}", .{err});
-                break :blk false;
-            };
-            if (!consumed) middleware.allocator.free(json_message);
-        }
-    }
-
     fn handleZlsMessage(middleware: *Middleware, json_message: []u8) Error!bool {
         log.debug("ZLS read message bytes={}", .{json_message.len});
         const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, middleware.allocator, json_message, .{
@@ -1985,26 +1667,7 @@ const Middleware = struct {
 
         switch (parsed.value) {
             .response => |response| {
-                const id = response.id orelse {
-                    log.debug("ZLS ignored response response_has_id=false", .{});
-                    return false;
-                };
-                const number_id = switch (id) {
-                    .number => |number| number,
-                    .string => {
-                        log.debug("ZLS ignored response id={any} reason=string_id", .{id});
-                        return false;
-                    },
-                };
-
-                middleware.response_mutex.lockUncancelable(middleware.io);
-                defer middleware.response_mutex.unlock(middleware.io);
-                if (middleware.pending_responses.getPtr(number_id)) |pending| {
-                    pending.response = json_message;
-                    middleware.response_cond.broadcast(middleware.io);
-                    return true;
-                }
-                log.debug("ZLS ignored response id={any} reason=unknown_id", .{id});
+                log.debug("ZLS ignored captured response id={?}", .{response.id});
                 return false;
             },
             .request => |zls_request| {
@@ -2030,10 +1693,6 @@ const Middleware = struct {
     }
 };
 
-const PendingResponse = struct {
-    response: ?[]u8 = null,
-};
-
 const PublishedDiagnostics = struct {
     zy_uri: []u8,
     version: i32,
@@ -2044,9 +1703,7 @@ pub const Error =
     std.process.SpawnError ||
     std.process.Child.WaitError ||
     std.process.RunError ||
-    std.Thread.SpawnError ||
     ZlsAdapter.Error ||
-    lsp.Transport.ReadError ||
     lsp.Transport.WriteError ||
     JsonParseError ||
     error{
@@ -2174,46 +1831,24 @@ fn initImpl(
     log.info("Starting ZLS middleware", .{});
     try checkZitron(allocator, io);
 
-    const read_buffer = try allocator.alloc(u8, 4096);
-    errdefer allocator.free(read_buffer);
+    var zls_library = try ZlsAdapter.initFromEnvironmentMap(io, allocator, environ_map);
+    errdefer zls_library.deinit();
+    const zls_completion_triggers = try dupeStringSlices(allocator, zls_library.completionTriggerCharacters());
+    errdefer freeStringSlices(allocator, zls_completion_triggers);
 
-    var child = try std.process.spawn(io, .{
-        .argv = &.{"zls"},
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .inherit,
-    });
-
-    const mware = allocator.create(Middleware) catch |err| {
-        child.kill(io);
-        return err;
-    };
+    const mware = try allocator.create(Middleware);
     errdefer allocator.destroy(mware);
     mware.* = .{
         .allocator = allocator,
         .io = io,
-        .zls_child = child,
-        .zls_transport = lsp.Transport.Stdio.init(read_buffer, child.stdout.?, child.stdin.?),
-        .zls_read_buffer = read_buffer,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
-        .zls_library = null,
-        .zls_completion_triggers = &.{},
+        .zls_library = zls_library,
+        .zls_completion_triggers = zls_completion_triggers,
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
-    errdefer mware.deinit();
-
-    mware.reader_thread = try std.Thread.spawn(.{}, Middleware.readerMain, .{mware});
-    try mware.initializeZls();
-    mware.zls_library = try ZlsAdapter.initFromEnvironmentMap(io, allocator, environ_map);
     log.info("ZLS middleware enabled", .{});
     return .{ .mode = .{ .enabled = mware } };
 }
@@ -5912,21 +5547,12 @@ test "alias code block rename refuses unmapped zy blocks" {
     var middleware: Middleware = .{
         .allocator = testing_allocator,
         .io = std.Options.debug_io,
-        .zls_child = undefined,
-        .zls_transport = undefined,
-        .zls_read_buffer = undefined,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
     const key = try testing_allocator.dupe(u8, uri);
     errdefer testing_allocator.free(key);
@@ -5999,21 +5625,12 @@ test "forward requests return null while generation has errors" {
     var middleware: Middleware = .{
         .allocator = testing_allocator,
         .io = std.Options.debug_io,
-        .zls_child = undefined,
-        .zls_transport = undefined,
-        .zls_read_buffer = undefined,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
     var zig_middleware: ZigMiddleware = .{ .mode = .{ .enabled = &middleware } };
 
@@ -6257,21 +5874,12 @@ test "ZLS diagnostics for stale generation do not replace current diagnostics" {
     var middleware: Middleware = .{
         .allocator = testing_allocator,
         .io = std.Options.debug_io,
-        .zls_child = undefined,
-        .zls_transport = undefined,
-        .zls_read_buffer = undefined,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
     const key = try testing_allocator.dupe(u8, uri);
     errdefer testing_allocator.free(key);
@@ -6323,21 +5931,12 @@ test "ZLS diagnostics with null version publish after repeated current syncs" {
     var middleware: Middleware = .{
         .allocator = testing_allocator,
         .io = std.Options.debug_io,
-        .zls_child = undefined,
-        .zls_transport = undefined,
-        .zls_read_buffer = undefined,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
     const key = try testing_allocator.dupe(u8, uri);
     errdefer testing_allocator.free(key);
@@ -7332,21 +6931,12 @@ test "semantic token range delta returns empty edit when zy is unchanged" {
     var middleware: Middleware = .{
         .allocator = testing_allocator,
         .io = std.Options.debug_io,
-        .zls_child = undefined,
-        .zls_transport = undefined,
-        .zls_read_buffer = undefined,
-        .reader_thread = null,
-        .response_mutex = .init,
-        .response_cond = .init,
-        .pending_responses = .empty,
-        .reader_failed = false,
         .diagnostics_context = null,
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
-        .next_request_id = 1,
     };
 
     var doc = try makeTestZigDocument(testing_allocator, uri, 2, zy, zig);

@@ -226,6 +226,169 @@ pub fn main(init: std.process.Init) Error!void {
     );
     try expectDocumentSymbolsResponse(init.io, allocator, &transport.transport);
 
+    const pik_init_position = try positionOfText(fixture_text, "Pik.init");
+    const pik_init_call_position = try positionAfterText(fixture_text, "Pik.init(");
+    const pik_member_position = try positionAfterText(fixture_text, "Pik.");
+    const full_range = lsp.types.flat.Range{
+        .start = lsp.types.flat.Position{ .line = 0, .character = 0 },
+        .end = lsp.offsets.indexToPosition(fixture_text, fixture_text.len, offset_encoding),
+    };
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 9 },
+        "textDocument/completion",
+        lsp.ParamsType("textDocument/completion"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_member_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 9);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 10 },
+        "textDocument/signatureHelp",
+        lsp.ParamsType("textDocument/signatureHelp"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_call_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 10);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 11 },
+        "textDocument/declaration",
+        lsp.ParamsType("textDocument/declaration"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 11);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 12 },
+        "textDocument/definition",
+        lsp.ParamsType("textDocument/definition"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 12);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 13 },
+        "textDocument/references",
+        lsp.ParamsType("textDocument/references"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_position,
+            .context = .{ .includeDeclaration = false },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 13);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 14 },
+        "textDocument/documentHighlight",
+        lsp.ParamsType("textDocument/documentHighlight"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 14);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 15 },
+        "textDocument/inlayHint",
+        lsp.ParamsType("textDocument/inlayHint"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .range = full_range,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 15);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 16 },
+        "textDocument/semanticTokens/full",
+        lsp.ParamsType("textDocument/semanticTokens/full"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 16);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 17 },
+        "textDocument/semanticTokens/range",
+        lsp.ParamsType("textDocument/semanticTokens/range"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .range = full_range,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 17);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 18 },
+        "textDocument/semanticTokens/full/delta",
+        lsp.ParamsType("textDocument/semanticTokens/full/delta"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .previousResultId = "smoke-missing-previous-result",
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 18);
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 19 },
+        "textDocument/rename",
+        lsp.ParamsType("textDocument/rename"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_init_position,
+            .newName = "smokeRenamed",
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectSuccessfulResponse(init.io, allocator, &transport.transport, 19);
+
     try transport.transport.writeNotification(
         init.io,
         allocator,
@@ -450,6 +613,34 @@ fn expectAnyResponse(
                 return error_set.UnexpectedResponse;
             }
             _ = response.result_or_error;
+        },
+        else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn expectSuccessfulResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    id: i64,
+) Error!void {
+    const json_message = try readResponseJsonMessage(io, allocator, transport, id);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .response => |response| {
+            if (response.id == null or !response.id.?.eql(.{ .number = id })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => {},
+                .@"error" => return error_set.UnexpectedResponse,
+            }
         },
         else => return error_set.UnexpectedResponse,
     }

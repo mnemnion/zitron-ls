@@ -1,15 +1,14 @@
 //! In-process adapter around upstream ZLS.
 //!
-//! `ZigMiddleware` owns one of these beside the spawned ZLS server. Ported
-//! methods call this adapter directly; unported methods keep using the server
-//! fallback until they are migrated.
+//! `ZigMiddleware` owns one of these for all embedded-Zig ZLS work.
 
 const Adapter = @This();
 
 io: std.Io,
 allocator: std.mem.Allocator,
 environ_map: *std.process.Environ.Map,
-config_manager: upstream.configuration.Manager,
+config_manager: *upstream.configuration.Manager,
+capture_transport: *CaptureTransport,
 server: *upstream.Server,
 completion_triggers: []const []const u8,
 
@@ -32,12 +31,14 @@ pub fn init(
     owned_environ_map.* = environ_map;
     errdefer owned_environ_map.deinit();
 
-    var config_manager = try upstream.configuration.Manager.init(io, allocator, owned_environ_map);
+    const config_manager = try allocator.create(upstream.configuration.Manager);
+    errdefer allocator.destroy(config_manager);
+    config_manager.* = try upstream.configuration.Manager.init(io, allocator, owned_environ_map);
     errdefer config_manager.deinit();
 
     var config: upstream.configuration.UnresolvedConfig = .{
         .semantic_tokens = .full,
-        .prefer_ast_check_as_child_process = false,
+        .prefer_ast_check_as_child_process = true,
         .inlay_hints_exclude_single_argument = false,
         .inlay_hints_show_builtin = true,
     };
@@ -45,13 +46,17 @@ pub fn init(
 
     var resolve_result = try config_manager.resolveConfiguration(allocator);
     resolve_result.deinit(allocator);
-    config_manager.config.prefer_ast_check_as_child_process = false;
+
+    const capture_transport = try allocator.create(CaptureTransport);
+    errdefer allocator.destroy(capture_transport);
+    capture_transport.* = CaptureTransport.init(allocator);
+    errdefer capture_transport.deinit();
 
     const server = try upstream.Server.create(.{
         .io = io,
         .allocator = allocator,
-        .transport = null,
-        .config_manager = &config_manager,
+        .transport = &capture_transport.transport,
+        .config_manager = config_manager,
     });
     errdefer server.destroy();
 
@@ -60,6 +65,7 @@ pub fn init(
         .allocator = allocator,
         .environ_map = owned_environ_map,
         .config_manager = config_manager,
+        .capture_transport = capture_transport,
         .server = server,
         .completion_triggers = &.{},
     };
@@ -80,6 +86,7 @@ pub fn init(
     }
 
     try adapter.server.sendNotificationSync(allocator, "initialized", .{});
+    adapter.discardCapturedMessages();
     return adapter;
 }
 
@@ -104,13 +111,12 @@ pub fn initFromEnvironment(
 }
 
 pub fn deinit(adapter: *Adapter) void {
-    if (adapter.server.status == .initialized) {
-        _ = adapter.server.sendRequestSync(adapter.allocator, "shutdown", {}) catch {};
-        adapter.server.sendNotificationSync(adapter.allocator, "exit", {}) catch {};
-    }
     adapter.server.destroy();
     freeStringSlices(adapter.allocator, adapter.completion_triggers);
     adapter.config_manager.deinit();
+    adapter.allocator.destroy(adapter.config_manager);
+    adapter.capture_transport.deinit();
+    adapter.allocator.destroy(adapter.capture_transport);
     adapter.environ_map.deinit();
     adapter.allocator.destroy(adapter.environ_map);
     adapter.* = undefined;
@@ -177,7 +183,18 @@ pub fn request(
     comptime method: []const u8,
     params: lsp.ParamsType(method),
 ) Error!lsp.ResultType(method) {
-    return adapter.server.sendRequestSync(arena, method, params);
+    const result = try adapter.server.sendRequestSync(arena, method, params);
+    return result;
+}
+
+pub fn drainCapturedMessages(adapter: *Adapter, allocator: std.mem.Allocator) error{OutOfMemory}![][]u8 {
+    adapter.server.wait_group.await(adapter.io) catch {};
+    adapter.server.wait_group = .init;
+    return try adapter.capture_transport.drain(allocator);
+}
+
+pub fn discardCapturedMessages(adapter: *Adapter) void {
+    adapter.capture_transport.discard();
 }
 
 fn initializeParams() types.InitializeParams {
@@ -204,6 +221,9 @@ fn initializeParams() types.InitializeParams {
                         .activeParameterSupport = true,
                     },
                     .contextSupport = true,
+                },
+                .publishDiagnostics = .{
+                    .tagSupport = .{ .valueSet = &diagnostic_tags },
                 },
                 .semanticTokens = .{
                     .requests = .{
@@ -237,6 +257,79 @@ fn freeStringSlices(allocator: std.mem.Allocator, slices: []const []const u8) vo
     allocator.free(slices);
 }
 
+fn freeCapturedMessages(allocator: std.mem.Allocator, messages: [][]u8) void {
+    for (messages) |message| allocator.free(message);
+    allocator.free(messages);
+}
+
+fn capturedMessagesContain(messages: []const []const u8, needle: []const u8) bool {
+    for (messages) |message| {
+        if (std.mem.indexOf(u8, message, needle) != null) return true;
+    }
+    return false;
+}
+
+const CaptureTransport = struct {
+    transport: lsp.Transport,
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    messages: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) CaptureTransport {
+        return .{
+            .transport = .{ .vtable = &.{
+                .readJsonMessage = CaptureTransport.readJsonMessage,
+                .writeJsonMessage = CaptureTransport.writeJsonMessage,
+            } },
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(capture: *CaptureTransport) void {
+        capture.discard();
+        capture.messages.deinit(capture.allocator);
+        capture.* = undefined;
+    }
+
+    fn drain(capture: *CaptureTransport, allocator: std.mem.Allocator) error{OutOfMemory}![][]u8 {
+        capture.mutex.lockUncancelable(std.Options.debug_io);
+        defer capture.mutex.unlock(std.Options.debug_io);
+
+        const messages = try capture.messages.toOwnedSlice(allocator);
+        capture.messages = .empty;
+        return messages;
+    }
+
+    fn discard(capture: *CaptureTransport) void {
+        capture.mutex.lockUncancelable(std.Options.debug_io);
+        defer capture.mutex.unlock(std.Options.debug_io);
+
+        for (capture.messages.items) |message| capture.allocator.free(message);
+        capture.messages.clearRetainingCapacity();
+    }
+
+    fn readJsonMessage(
+        _: *lsp.Transport,
+        _: std.Io,
+        _: std.mem.Allocator,
+    ) lsp.Transport.ReadError![]u8 {
+        return error.EndOfStream;
+    }
+
+    fn writeJsonMessage(
+        transport: *lsp.Transport,
+        _: std.Io,
+        json_message: []const u8,
+    ) lsp.Transport.WriteError!void {
+        const capture: *CaptureTransport = @fieldParentPtr("transport", transport);
+        const owned = capture.allocator.dupe(u8, json_message) catch @panic("out of memory capturing ZLS message");
+
+        capture.mutex.lockUncancelable(std.Options.debug_io);
+        defer capture.mutex.unlock(std.Options.debug_io);
+        capture.messages.append(capture.allocator, owned) catch @panic("out of memory capturing ZLS message");
+    }
+};
+
 test "adapter initializes, syncs, requests, and closes a document" {
     var env = std.process.Environ.Map.init(testing_allocator);
     try env.put("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
@@ -258,6 +351,9 @@ test "adapter initializes, syncs, requests, and closes a document" {
         \\}
         \\
     );
+    const open_messages = try adapter.drainCapturedMessages(testing_allocator);
+    defer freeCapturedMessages(testing_allocator, open_messages);
+    try std.testing.expect(capturedMessagesContain(open_messages, "textDocument/publishDiagnostics"));
 
     const hover = try adapter.request(arena, "textDocument/hover", .{
         .textDocument = .{ .uri = uri },
@@ -275,6 +371,9 @@ test "adapter initializes, syncs, requests, and closes a document" {
         \\}
         \\
     );
+    const change_messages = try adapter.drainCapturedMessages(testing_allocator);
+    defer freeCapturedMessages(testing_allocator, change_messages);
+    try std.testing.expect(capturedMessagesContain(change_messages, "textDocument/publishDiagnostics"));
     try adapter.closeDocument(arena, uri);
 }
 
@@ -286,6 +385,7 @@ const testing_allocator = std.testing.allocator;
 
 const position_encodings = [_]types.PositionEncodingKind{.@"utf-8"};
 const markup_formats = [_]types.MarkupKind{ .markdown, .plaintext };
+const diagnostic_tags = [_]types.DiagnosticTag{ .Unnecessary, .Deprecated };
 const semantic_token_formats = [_]types.TokenFormat{.relative};
 const semantic_token_types = [_][]const u8{
     "namespace",
