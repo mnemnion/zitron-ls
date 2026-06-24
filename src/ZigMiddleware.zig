@@ -391,14 +391,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -522,14 +519,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -599,14 +593,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -663,14 +654,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -727,14 +715,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -786,14 +771,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -903,15 +885,11 @@ const Middleware = struct {
             });
             return null;
         }
-
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = resolved_active_span_index,
         };
         defer translation_context.deinit();
@@ -946,14 +924,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = null,
         };
         defer translation_context.deinit();
@@ -1155,14 +1130,11 @@ const Middleware = struct {
             });
             return null;
         };
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = span_index,
         };
         defer translation_context.deinit();
@@ -1285,14 +1257,11 @@ const Middleware = struct {
         data: []u32,
         zy_filter: ?types.Range,
     ) Error![]const u32 {
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = &doc.code_map,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
-            .cache = &translation_cache,
             .active_span_index = null,
         };
         defer translation_context.deinit();
@@ -1501,8 +1470,6 @@ const Middleware = struct {
         errdefer edits.deinit(arena);
         var seen_starts: std.AutoHashMapUnmanaged(usize, void) = .empty;
         defer seen_starts.deinit(arena);
-        var translation_cache: SpanTranslatorCache = .{};
-        defer translation_cache.deinit(middleware.allocator);
 
         for (zy_ranges) |zy_range| {
             const span_index = doc.code_map.indexForZyRange(zy_range) orelse {
@@ -1512,9 +1479,8 @@ const Middleware = struct {
                 });
                 return null;
             };
-            const translator = try translation_cache.get(
+            const translator = try doc.code_map.spanTranslator(
                 middleware.allocator,
-                &doc.code_map,
                 doc.zy_text,
                 doc.zig_text,
                 span_index,
@@ -2238,15 +2204,11 @@ fn translateZlsDiagnostics(
         for (translated.items) |diagnostic| freeStoredDiagnostic(allocator, diagnostic);
         translated.deinit(allocator);
     }
-
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(allocator);
     var context = RequestTranslationContext{
         .allocator = allocator,
         .map = &doc.code_map,
         .zy_text = doc.zy_text,
         .zig_text = doc.zig_text,
-        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -2309,6 +2271,7 @@ pub const CodeMap = struct {
     /// Indexes into `gen_span` and `zy_range`, sorted by zy-line order for zy -> zig
     /// lookups. The buffer is retained across updates.
     zy_order: std.ArrayList(usize) = .empty,
+    translator_cache: SpanTranslatorCache = .{},
 
     /// Half-open byte range in either the zy or zig text.
     pub const ByteRange = struct {
@@ -2394,6 +2357,7 @@ pub const CodeMap = struct {
         zig_text: []u8,
         zy_path: []const u8,
     ) OOM!void {
+        map.translator_cache.reset(allocator);
         map.gen_span.clearRetainingCapacity();
         map.zy_range.clearRetainingCapacity();
         map.fast_column_mapping.clearRetainingCapacity();
@@ -2409,6 +2373,7 @@ pub const CodeMap = struct {
         map.zy_range.deinit(allocator);
         map.fast_column_mapping.deinit(allocator);
         map.zy_order.deinit(allocator);
+        map.translator_cache.deinit(allocator);
         map.* = .{};
     }
 
@@ -2534,6 +2499,30 @@ pub const CodeMap = struct {
             return null;
         }
         return index;
+    }
+
+    fn spanTranslator(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        zy_text: []const u8,
+        zig_text: []const u8,
+        span_index: usize,
+    ) OOM!*SpanTranslator {
+        return try map.translator_cache.get(allocator, map, zy_text, zig_text, span_index);
+    }
+
+    fn spanTranslatorEntryIndex(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        zy_text: []const u8,
+        zig_text: []const u8,
+        span_index: usize,
+    ) OOM!usize {
+        return try map.translator_cache.getEntryIndex(allocator, map, zy_text, zig_text, span_index);
+    }
+
+    fn translatorAt(map: *CodeMap, entry_index: usize) *SpanTranslator {
+        return map.translator_cache.at(entry_index);
     }
 
     /// Scans zig text for `#line` comments and coalesces consecutive mapped
@@ -3013,10 +3002,9 @@ const SpanTranslatorCache = struct {
 
 const RequestTranslationContext = struct {
     allocator: std.mem.Allocator,
-    map: *const CodeMap,
+    map: *CodeMap,
     zy_text: []const u8,
     zig_text: []const u8,
-    cache: *SpanTranslatorCache,
     active_span_index: ?usize,
 
     fn deinit(context: *RequestTranslationContext) void {
@@ -3089,9 +3077,8 @@ const RequestTranslationContext = struct {
     }
 
     fn translatorForSpanIndex(context: *RequestTranslationContext, span_index: usize) OOM!*SpanTranslator {
-        return try context.cache.get(
+        return try context.map.spanTranslator(
             context.allocator,
-            context.map,
             context.zy_text,
             context.zig_text,
             span_index,
@@ -3099,9 +3086,8 @@ const RequestTranslationContext = struct {
     }
 
     fn translatorEntryIndexForSpanIndex(context: *RequestTranslationContext, span_index: usize) OOM!usize {
-        return try context.cache.getEntryIndex(
+        return try context.map.spanTranslatorEntryIndex(
             context.allocator,
-            context.map,
             context.zy_text,
             context.zig_text,
             span_index,
@@ -3169,7 +3155,7 @@ const ZigPositionCursor = struct {
         if (cursor.span_index) |span_index| {
             const span = cursor.context.map.gen_span.items[span_index];
             if (spanContainsZigPosition(span, position)) {
-                return cursor.context.cache.at(cursor.cache_entry_index);
+                return cursor.context.map.translatorAt(cursor.cache_entry_index);
             }
 
             if (position.line >= span.zigEnd()) {
@@ -3179,7 +3165,7 @@ const ZigPositionCursor = struct {
                     if (position.line < next_span.zig_line) break;
                     if (spanContainsZigPosition(next_span, position)) {
                         try cursor.resetToSpan(next_index);
-                        return cursor.context.cache.at(cursor.cache_entry_index);
+                        return cursor.context.map.translatorAt(cursor.cache_entry_index);
                     }
                 }
             }
@@ -3189,12 +3175,12 @@ const ZigPositionCursor = struct {
         const span = cursor.context.map.gen_span.items[span_index];
         if (!spanContainsZigPosition(span, position)) return null;
         try cursor.resetToSpan(span_index);
-        return cursor.context.cache.at(cursor.cache_entry_index);
+        return cursor.context.map.translatorAt(cursor.cache_entry_index);
     }
 
     fn resetToSpan(cursor: *ZigPositionCursor, span_index: usize) OOM!void {
         const cache_entry_index = try cursor.context.translatorEntryIndexForSpanIndex(span_index);
-        const translator = cursor.context.cache.at(cache_entry_index);
+        const translator = cursor.context.map.translatorAt(cache_entry_index);
         cursor.span_index = span_index;
         cursor.cache_entry_index = cache_entry_index;
         cursor.zig_line = translator.gen_span.zig_line;
@@ -3525,19 +3511,16 @@ fn semanticDirtyLineDelta(dirty: SemanticDirtyRange) i64 {
 
 fn zyRangeToZigRange(
     allocator: std.mem.Allocator,
-    code_map: *const CodeMap,
+    code_map: *CodeMap,
     zy_text: []const u8,
     zig_text: []const u8,
     zy_range: types.Range,
 ) OOM!?types.Range {
-    var translation_cache: SpanTranslatorCache = .{};
-    defer translation_cache.deinit(allocator);
     var translation_context = RequestTranslationContext{
         .allocator = allocator,
         .map = code_map,
         .zy_text = zy_text,
         .zig_text = zig_text,
-        .cache = &translation_cache,
         .active_span_index = null,
     };
     defer translation_context.deinit();
@@ -5159,8 +5142,7 @@ fn makeTestDocumentState(
 }
 
 fn requestTranslationContextForTest(
-    cache: *SpanTranslatorCache,
-    map: *const CodeMap,
+    map: *CodeMap,
     zy_text: []const u8,
     zig_text: []const u8,
     position: types.Position,
@@ -5170,7 +5152,6 @@ fn requestTranslationContextForTest(
         .map = map,
         .zy_text = zy_text,
         .zig_text = zig_text,
-        .cache = cache,
         .active_span_index = map.zySpanIndexForPosition(position) orelse return error.UnexpectedCodeMap,
     };
 }
@@ -5462,15 +5443,11 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
             .end = lsp.offsets.indexToPosition(zy, zy_include_answer + "include_answer".len, .@"utf-8"),
         },
     )).?);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -5494,7 +5471,7 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
         0, 14, "code_answer".len,    8, 0,
         1, 17, "include_answer".len, 8, 0,
     }, translated);
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
 }
 
 test "code map reports optimized-away code blocks as unmapped" {
@@ -5995,13 +5972,9 @@ test "request span translator applies zy column offset" {
 
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "result").?, .@"utf-8");
-    const translator = try cache.get(
+    const translator = try map.spanTranslator(
         testing_allocator,
-        &map,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6024,13 +5997,9 @@ test "request span translator nulls mutated zig aliases" {
 
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "pik_elist_append").?, .@"utf-8");
-    const translator = try cache.get(
+    const translator = try map.spanTranslator(
         testing_allocator,
-        &map,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6068,9 +6037,6 @@ test "request span translator maps zig alias boundary points" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
 
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
-
     const zy_call = std.mem.indexOf(u8, zy, "pik_elist_append").?;
     const zy_alias = zy_call + std.mem.indexOf(u8, zy[zy_call..], "X").?;
     const zig_call = std.mem.indexOf(u8, zig, "pik_elist_append").?;
@@ -6078,9 +6044,8 @@ test "request span translator maps zig alias boundary points" {
     const zy_position = lsp.offsets.indexToPosition(zy, zy_alias, .@"utf-8");
     const zig_position = lsp.offsets.indexToPosition(zig, zig_alias, .@"utf-8");
 
-    const translator = try cache.get(
+    const translator = try map.spanTranslator(
         testing_allocator,
-        &map,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6105,7 +6070,6 @@ test "request span translator maps zig alias boundary points" {
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
     };
     defer context.deinit();
@@ -6246,13 +6210,9 @@ test "request span translator handles zig line directive after action" {
     defer map.deinit(testing_allocator);
     try expectEqual(@as(usize, 1), map.len());
     try expectEqual(std.mem.indexOf(u8, zig, "// #line 200").?, map.gen_span.items[0].zig_range.end);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "pik_elist_append").?, .@"utf-8");
-    const translator = try cache.get(
+    const translator = try map.spanTranslator(
         testing_allocator,
-        &map,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6284,16 +6244,12 @@ test "request translation context maps reference ranges in other spans" {
 
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const active_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "pik_render").?, .@"utf-8");
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = map.zySpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
     };
     defer context.deinit();
@@ -6338,16 +6294,12 @@ test "request translation context maps document highlight ranges" {
 
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const active_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "answer").?, .@"utf-8");
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = map.zySpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
     };
     defer context.deinit();
@@ -6391,9 +6343,6 @@ test "request translation context rejects zy positions before active zy range" {
 
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     const grammar_index = std.mem.indexOf(u8, zy, "item.") orelse return error.NeedleNotFound;
     const grammar_position = lsp.offsets.indexToPosition(zy, grammar_index, .@"utf-8");
     var context = RequestTranslationContext{
@@ -6401,7 +6350,6 @@ test "request translation context rejects zy positions before active zy range" {
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = map.zySpanIndexForPosition(grammar_position) orelse return error.UnexpectedCodeMap,
     };
     defer context.deinit();
@@ -6427,10 +6375,7 @@ test "request span translator handles one leading newline edit" {
         .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
     });
     try map.fast_column_mapping.append(testing_allocator, false);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
-    const translator = try cache.get(testing_allocator, &map, zy, zig, 0);
+    const translator = try map.spanTranslator(testing_allocator, zy, zig, 0);
 
     try expectEqual(types.Position{ .line = 0, .character = 6 }, sharedPosition(translator.zyPositionToZig(.{
         .line = 1,
@@ -6454,10 +6399,7 @@ test "translates hover and definition results back to zy ranges" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
-        &cache,
         &map,
         zy,
         zig,
@@ -6517,10 +6459,7 @@ test "translates completion edits back to zy ranges" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
-        &cache,
         &map,
         zy,
         zig,
@@ -6572,10 +6511,7 @@ test "translates inlay hints back to zy positions" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
-        &cache,
         &map,
         zy,
         zig,
@@ -6624,7 +6560,7 @@ test "translates inlay hints back to zy positions" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
     const translated = try translateInlayHints(
         arena_state.allocator(),
         &other_hints,
@@ -6633,7 +6569,7 @@ test "translates inlay hints back to zy positions" {
         "file:///zy.zy",
     );
 
-    try expectEqual(@as(usize, 1), cache.len());
+    try expectEqual(@as(usize, 1), map.translator_cache.len());
     try expectEqual(@as(usize, 2), translated.len);
     try expectEqual(@as(u32, 1), translated[0].position.line);
     try expectEqual(@as(u32, 12), translated[0].position.character);
@@ -6669,15 +6605,11 @@ test "translates inlay hints on first block line with zy column skew" {
     });
     try map.fast_column_mapping.append(testing_allocator, false);
     try map.rebuildZyOrder(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -6724,15 +6656,11 @@ test "zig position cursor translates zig ranges" {
     });
     try map.fast_column_mapping.append(testing_allocator, false);
     try map.rebuildZyOrder(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -6989,15 +6917,11 @@ test "translates semantic tokens and drops zig-only spans" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -7022,7 +6946,7 @@ test "translates semantic tokens and drops zig-only spans" {
         1, 6, 6, 8,  0,
         0, 9, 2, 19, 0,
     }, translated);
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
 }
 
 test "semantic token inline action spans use column-aware slow path" {
@@ -7064,15 +6988,11 @@ test "semantic token inline action spans use column-aware slow path" {
         .start = .{ .line = 0, .character = 0 },
         .end = .{ .line = 0, .character = zig_len },
     }, mapped_range);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -7093,7 +7013,7 @@ test "semantic token inline action spans use column-aware slow path" {
     );
 
     try expectEqualSlices(u32, &.{ 0, answer_zy_column, 6, 8, 0 }, translated);
-    try expectEqual(@as(usize, 1), cache.len());
+    try expectEqual(@as(usize, 1), map.translator_cache.len());
 }
 
 test "filtered semantic tokens skip unrequested slow spans before diffing" {
@@ -7140,15 +7060,11 @@ test "filtered semantic tokens skip unrequested slow spans before diffing" {
     });
     try map.fast_column_mapping.append(testing_allocator, false);
     try map.rebuildZyOrder(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -7173,7 +7089,7 @@ test "filtered semantic tokens skip unrequested slow spans before diffing" {
 
     const expected = [_]u32{ 1, second_zy_character, 6, 8, 0 };
     try expectEqualSlices(u32, &expected, filtered);
-    try expectEqual(@as(usize, 1), cache.len());
+    try expectEqual(@as(usize, 1), map.translator_cache.len());
 }
 
 test "translates semantic tokens in zy span order" {
@@ -7219,15 +7135,11 @@ test "translates semantic tokens in zy span order" {
     });
     try map.fast_column_mapping.append(testing_allocator, true);
     try map.rebuildZyOrder(testing_allocator);
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -7256,7 +7168,7 @@ test "translates semantic tokens in zy span order" {
         0, 6, 6, 8, 0,
         1, 6, 5, 8, 0,
     };
-    cache.reset(testing_allocator);
+    map.translator_cache.reset(testing_allocator);
     const filtered = try translateSemanticTokenData(
         arena_state.allocator(),
         &filtered_zig_tokens,
@@ -7269,7 +7181,7 @@ test "translates semantic tokens in zy span order" {
     try expectEqualSlices(u32, &.{
         2, 6, 6, 8, 0,
     }, filtered);
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
 }
 
 test "translates inlay hints with one cached diff per touched block" {
@@ -7290,15 +7202,11 @@ test "translates inlay hints with one cached diff per touched block" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
     try expectEqual(@as(usize, 2), map.len());
-
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
@@ -7319,7 +7227,7 @@ test "translates inlay hints with one cached diff per touched block" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
     const translated = try translateInlayHints(
         arena_state.allocator(),
         &hints,
@@ -7329,12 +7237,12 @@ test "translates inlay hints with one cached diff per touched block" {
     );
 
     try expectEqual(@as(usize, 2), translated.len);
-    try expectEqual(@as(usize, 2), cache.len());
+    try expectEqual(@as(usize, 2), map.translator_cache.len());
     try expectEqual(@as(u32, 1), translated[0].position.line);
     try expectEqual(@as(u32, 4), translated[1].position.line);
 }
 
-test "span translator cache is lazy and resets across regeneration" {
+test "code map reuses span translators and resets them across regeneration" {
     const zy =
         \\%code {
         \\const answer = 42;
@@ -7352,23 +7260,21 @@ test "span translator cache is lazy and resets across regeneration" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
 
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    const first = try map.spanTranslator(testing_allocator, zy, zig, 0);
+    const second = try map.spanTranslator(testing_allocator, zy, zig, 0);
+    try std.testing.expect(first == second);
+    try expectEqual(@as(usize, 1), map.translator_cache.len());
 
-    try expectEqual(@as(usize, 0), cache.len());
-    _ = try cache.get(testing_allocator, &map, zy, zig, 0);
-    try expectEqual(@as(usize, 1), cache.len());
-
-    cache.reset(testing_allocator);
     const updated_tree = try parseZitronTreeForTest(zy);
     defer updated_tree.destroy();
     const updated = try testing_allocator.dupe(u8, updated_zig);
     defer testing_allocator.free(updated);
     try map.update(testing_allocator, updated_tree.rootNode(), zy, updated, "zy.zy");
-    try expectEqual(@as(usize, 0), cache.len());
+    try expectEqual(@as(usize, 0), map.translator_cache.len());
 
-    _ = try cache.get(testing_allocator, &map, zy, updated_zig, 0);
-    try expectEqual(@as(usize, 1), cache.len());
+    _ = try map.spanTranslator(testing_allocator, zy, updated, 0);
+    try expectEqual(@as(usize, 1), map.translator_cache.len());
 }
 
 test "translates workspace edit changes back to zy ranges" {
@@ -7383,10 +7289,7 @@ test "translates workspace edit changes back to zy ranges" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = try requestTranslationContextForTest(
-        &cache,
         &map,
         zy,
         zig,
@@ -7484,14 +7387,11 @@ test "translates document symbols and drops zig yy symbols" {
     ;
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
-    var cache: SpanTranslatorCache = .{};
-    defer cache.deinit(testing_allocator);
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
         .zy_text = zy,
         .zig_text = zig,
-        .cache = &cache,
         .active_span_index = null,
     };
     defer context.deinit();
