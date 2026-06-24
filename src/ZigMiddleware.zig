@@ -394,6 +394,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -522,6 +523,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -596,6 +598,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -657,6 +660,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -718,6 +722,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -774,6 +779,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -888,6 +894,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = resolved_active_span_index,
@@ -927,6 +934,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = null,
@@ -1074,6 +1082,7 @@ const Middleware = struct {
         const resolved_range = (try zyRangeToZigRange(
             middleware.allocator,
             &doc.code_map,
+            doc.version,
             doc.zy_text,
             doc.zig_text,
             params.range,
@@ -1133,6 +1142,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = span_index,
@@ -1250,6 +1260,7 @@ const Middleware = struct {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = &doc.code_map,
+            .document_version = doc.version,
             .zy_text = doc.zy_text,
             .zig_text = doc.zig_text,
             .active_span_index = null,
@@ -1357,6 +1368,7 @@ const Middleware = struct {
         const zig_range = (try zyRangeToZigRange(
             middleware.allocator,
             &doc.code_map,
+            doc.version,
             doc.zy_text,
             doc.zig_text,
             current_zy_range,
@@ -1470,6 +1482,7 @@ const Middleware = struct {
             };
             const translator = try doc.code_map.spanTranslator(
                 middleware.allocator,
+                doc.version,
                 doc.zy_text,
                 doc.zig_text,
                 span_index,
@@ -1482,8 +1495,8 @@ const Middleware = struct {
                 doc.zy_text,
                 zy_range,
                 doc.zig_text,
-                doc.code_map.gen_span.items[span_index].zig_range,
-                translator.difference.edits.items,
+                doc.code_map.zig_span.items[span_index].zig_range,
+                translator.diffEdits(),
                 alias_name,
                 new_name,
                 offset_encoding,
@@ -2196,6 +2209,7 @@ fn translateZlsDiagnostics(
     var context = RequestTranslationContext{
         .allocator = allocator,
         .map = &doc.code_map,
+        .document_version = doc.version,
         .zy_text = doc.zy_text,
         .zig_text = doc.zig_text,
         .active_span_index = null,
@@ -2251,16 +2265,16 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
 pub const CodeMap = struct {
     /// Zig spans are stored in Zig-line order, which is the order encountered
     /// while scanning the translated Zig file.
-    gen_span: std.ArrayList(GenSpan) = .empty,
+    zig_span: std.ArrayList(ZigSpan) = .empty,
     /// Zy ranges for the zig spans.  Indexes are kept in lockstep with
-    /// `gen_span`, but the range retains exact tree-sitter byte and point data.
+    /// `zig_span`, but the range retains exact tree-sitter byte and point data.
     zy_range: std.ArrayList(ts.Range) = .empty,
     /// Whether a span came from a direct `%code`/`%include` shortcut.
     fast_column_mapping: std.ArrayList(bool) = .empty,
-    /// Indexes into `gen_span` and `zy_range`, sorted by zy-line order for zy -> zig
+    /// Indexes into `zig_span` and `zy_range`, sorted by zy-line order for zy -> zig
     /// lookups. The buffer is retained across updates.
     zy_order: std.ArrayList(usize) = .empty,
-    translator_cache: SpanTranslatorCache = .{},
+    translators: SpanTranslators = .{},
 
     /// Half-open byte range in either the zy or zig text.
     pub const ByteRange = struct {
@@ -2280,11 +2294,13 @@ pub const CodeMap = struct {
 
     /// One contiguous zig range. Zy-line offsets keep the legacy LSP
     /// position mapping; `zy_range` keeps the actual zy code-block extent.
-    const GenSpan = struct {
+    const ZigSpan = struct {
         /// First zero-based line in the original `.zy` document.
         zy_line: u32,
         /// First zero-based line in the translated Zig document.
         zig_line: u32,
+        /// First zero-based character in the translated Zig document.
+        zig_column: u32 = 0,
         /// Number of contiguous mapped lines shared by both coordinate systems.
         line_count: u32,
         /// Half-open byte range in the translated Zig document.
@@ -2292,37 +2308,37 @@ pub const CodeMap = struct {
 
         /// Exclusive zy-line end.  Keeping this as a helper avoids repeating
         /// the half-open interval convention at every lookup site.
-        fn zyEnd(span: GenSpan) u32 {
+        fn zyEnd(span: ZigSpan) u32 {
             return span.zy_line + span.line_count;
         }
 
         /// Exclusive zig-line end, matching `zyEnd` in length.
-        fn zigEnd(span: GenSpan) u32 {
+        fn zigEnd(span: ZigSpan) u32 {
             return span.zig_line + span.line_count;
         }
 
         /// Compares a zy line against this half-open span.
-        fn orderZy(span: GenSpan, line: u32) std.math.Order {
+        fn orderZy(span: ZigSpan, line: u32) std.math.Order {
             if (line < span.zy_line) return .lt;
             if (line < span.zyEnd()) return .eq;
             return .gt;
         }
 
         /// Compares a zig line against this half-open span.
-        fn orderZig(span: GenSpan, line: u32) std.math.Order {
+        fn orderZig(span: ZigSpan, line: u32) std.math.Order {
             if (line < span.zig_line) return .lt;
             if (line < span.zigEnd()) return .eq;
             return .gt;
         }
 
-        fn zyPositionToZig(span: GenSpan, position: types.Position) types.Position {
+        fn zyPositionToZig(span: ZigSpan, position: types.Position) types.Position {
             return .{
                 .line = span.zig_line + (position.line - span.zy_line),
                 .character = position.character,
             };
         }
 
-        fn zigPositionToZy(span: GenSpan, position: types.Position) types.Position {
+        fn zigPositionToZy(span: ZigSpan, position: types.Position) types.Position {
             return .{
                 .line = span.zy_line + (position.line - span.zig_line),
                 .character = position.character,
@@ -2331,7 +2347,7 @@ pub const CodeMap = struct {
     };
 
     const ActiveSpan = struct {
-        gen_span: GenSpan,
+        zig_span: ZigSpan,
         zy_range: ts.Range,
         fast_column_mapping: bool,
     };
@@ -2346,23 +2362,23 @@ pub const CodeMap = struct {
         zig_text: []u8,
         zy_path: []const u8,
     ) OOM!void {
-        map.translator_cache.reset(allocator);
-        map.gen_span.clearRetainingCapacity();
+        map.zig_span.clearRetainingCapacity();
         map.zy_range.clearRetainingCapacity();
         map.fast_column_mapping.clearRetainingCapacity();
         map.zy_order.clearRetainingCapacity();
 
         try map.collectSpans(allocator, zy_root, zy_text, zig_text, zy_path);
         try map.rebuildZyOrder(allocator);
+        try map.translators.resetForSpans(allocator, map);
     }
 
     /// Frees the reusable span and index buffers.
     pub fn deinit(map: *CodeMap, allocator: std.mem.Allocator) void {
-        map.gen_span.deinit(allocator);
+        map.zig_span.deinit(allocator);
         map.zy_range.deinit(allocator);
         map.fast_column_mapping.deinit(allocator);
         map.zy_order.deinit(allocator);
-        map.translator_cache.deinit(allocator);
+        map.translators.deinit(allocator);
         map.* = .{};
     }
 
@@ -2387,12 +2403,12 @@ pub const CodeMap = struct {
     }
 
     fn zyPositionToZigInSpan(map: *const CodeMap, span_index: usize, position: types.Position) types.Position {
-        const span = map.gen_span.items[span_index];
+        const span = map.zig_span.items[span_index];
         return span.zyPositionToZig(position);
     }
 
     fn zigPositionToZyInSpan(map: *const CodeMap, span_index: usize, position: types.Position) types.Position {
-        const span = map.gen_span.items[span_index];
+        const span = map.zig_span.items[span_index];
         return span.zigPositionToZy(position);
     }
 
@@ -2402,7 +2418,7 @@ pub const CodeMap = struct {
         zy_text: []const u8,
         position: types.Position,
     ) types.Position {
-        const span = map.gen_span.items[span_index];
+        const span = map.zig_span.items[span_index];
         var translated = span.zyPositionToZig(position);
         if (map.fast_column_mapping.items[span_index] and position.line == span.zy_line) {
             translated.character = translated.character -| map.fastFirstLineZyColumn(span_index, zy_text);
@@ -2416,7 +2432,7 @@ pub const CodeMap = struct {
         zy_text: []const u8,
         position: types.Position,
     ) types.Position {
-        const span = map.gen_span.items[span_index];
+        const span = map.zig_span.items[span_index];
         var translated = span.zigPositionToZy(position);
         if (map.fast_column_mapping.items[span_index] and position.line == span.zig_line) {
             translated.character += map.fastFirstLineZyColumn(span_index, zy_text);
@@ -2426,7 +2442,7 @@ pub const CodeMap = struct {
 
     fn fastFirstLineZyColumn(map: *const CodeMap, span_index: usize, zy_text: []const u8) u32 {
         const range = map.zy_range.items[span_index];
-        if (map.gen_span.items[span_index].zy_line != range.start_point.row) return 0;
+        if (map.zig_span.items[span_index].zy_line != range.start_point.row) return 0;
 
         var column = range.start_point.column;
         if (column == 0) return column;
@@ -2468,10 +2484,10 @@ pub const CodeMap = struct {
     /// Zig and cannot be reported as a zy range.
     pub fn zigRangeToZy(map: *const CodeMap, range: types.Range) OOM!?types.Range {
         var index = map.findZigIndex(range.start.line) orelse return null;
-        while (map.gen_span.items[index].orderZig(range.end.line) != .eq) {
+        while (map.zig_span.items[index].orderZig(range.end.line) != .eq) {
             const next_index = index + 1;
-            if (next_index >= map.gen_span.items.len) return null;
-            if (map.gen_span.items[next_index].zig_line != map.gen_span.items[index].zigEnd()) return null;
+            if (next_index >= map.zig_span.items.len) return null;
+            if (map.zig_span.items[next_index].zig_line != map.zig_span.items[index].zigEnd()) return null;
             index = next_index;
         }
 
@@ -2483,7 +2499,7 @@ pub const CodeMap = struct {
 
     fn zigSpanIndexForRange(map: *const CodeMap, range: types.Range) ?usize {
         const index = map.findZigIndex(range.start.line) orelse return null;
-        const span = map.gen_span.items[index];
+        const span = map.zig_span.items[index];
         if (span.orderZig(range.end.line) != .eq and !(range.end.line == span.zigEnd() and range.end.character == 0)) {
             return null;
         }
@@ -2493,25 +2509,16 @@ pub const CodeMap = struct {
     fn spanTranslator(
         map: *CodeMap,
         allocator: std.mem.Allocator,
+        document_version: i32,
         zy_text: []const u8,
         zig_text: []const u8,
         span_index: usize,
     ) OOM!*SpanTranslator {
-        return try map.translator_cache.get(allocator, map, zy_text, zig_text, span_index);
+        return try map.translators.get(allocator, map, document_version, zy_text, zig_text, span_index);
     }
 
-    fn spanTranslatorEntryIndex(
-        map: *CodeMap,
-        allocator: std.mem.Allocator,
-        zy_text: []const u8,
-        zig_text: []const u8,
-        span_index: usize,
-    ) OOM!usize {
-        return try map.translator_cache.getEntryIndex(allocator, map, zy_text, zig_text, span_index);
-    }
-
-    fn translatorAt(map: *CodeMap, entry_index: usize) *SpanTranslator {
-        return map.translator_cache.at(entry_index);
+    fn translatorAt(map: *CodeMap, span_index: usize) *SpanTranslator {
+        return map.translators.at(span_index);
     }
 
     /// Scans zig text for `#line` comments and coalesces consecutive mapped
@@ -2538,9 +2545,10 @@ pub const CodeMap = struct {
                 if (std.mem.eql(u8, directive.path, zy_path)) {
                     if (zigCodeSpanForLine(zy_text, zy_root, directive.line)) |zy_span| {
                         active_span = .{
-                            .gen_span = .{
+                            .zig_span = .{
                                 .zy_line = directive.line,
                                 .zig_line = zig_line + 1,
+                                .zig_column = columnAtOffset(zig_text, next_zig_offset),
                                 .line_count = 0,
                                 .zig_range = .{
                                     .start = next_zig_offset,
@@ -2560,6 +2568,12 @@ pub const CodeMap = struct {
         try map.processActiveSpan(allocator, &active_span, zig_line, zig_offset);
     }
 
+    fn columnAtOffset(text: []const u8, offset: usize) u32 {
+        var index = @min(offset, text.len);
+        while (index > 0 and text[index - 1] != '\n') index -= 1;
+        return @intCast(offset - index);
+    }
+
     fn processActiveSpan(
         map: *CodeMap,
         allocator: std.mem.Allocator,
@@ -2569,12 +2583,12 @@ pub const CodeMap = struct {
     ) OOM!void {
         var span = active_span.* orelse return;
         active_span.* = null;
-        const line_count = end_zig_line - span.gen_span.zig_line;
+        const line_count = end_zig_line - span.zig_span.zig_line;
         if (line_count == 0) return;
-        span.gen_span.line_count = line_count;
-        span.gen_span.zig_range.end = end_zig_offset;
-        try map.gen_span.append(allocator, span.gen_span);
-        errdefer _ = map.gen_span.pop();
+        span.zig_span.line_count = line_count;
+        span.zig_span.zig_range.end = end_zig_offset;
+        try map.zig_span.append(allocator, span.zig_span);
+        errdefer _ = map.zig_span.pop();
         try map.zy_range.append(allocator, span.zy_range);
         errdefer _ = map.zy_range.pop();
         try map.fast_column_mapping.append(allocator, span.fast_column_mapping);
@@ -2582,17 +2596,17 @@ pub const CodeMap = struct {
 
     /// Rebuilds the zy-order index over the current span buffer.
     fn rebuildZyOrder(map: *CodeMap, allocator: std.mem.Allocator) OOM!void {
-        try map.zy_order.ensureTotalCapacity(allocator, map.gen_span.items.len);
-        for (0..map.gen_span.items.len) |index| {
+        try map.zy_order.ensureTotalCapacity(allocator, map.zig_span.items.len);
+        for (0..map.zig_span.items.len) |index| {
             try map.zy_order.append(allocator, index);
         }
-        std.mem.sort(usize, map.zy_order.items, map.gen_span.items, zyIndexLessThan);
+        std.mem.sort(usize, map.zy_order.items, map.zig_span.items, zyIndexLessThan);
     }
 
     /// Returns the number of spans in the map.  Tests use this to assert
     /// that multi-line ranges stay coalesced instead of becoming per-line nodes.
     fn len(map: *const CodeMap) usize {
-        return map.gen_span.items.len;
+        return map.zig_span.items.len;
     }
 
     fn indexForZyRange(map: *const CodeMap, range: ts.Range) ?usize {
@@ -2605,18 +2619,18 @@ pub const CodeMap = struct {
     }
 
     /// Finds a zig-order span containing a zig line.
-    fn findZig(map: *const CodeMap, line: u32) ?GenSpan {
+    fn findZig(map: *const CodeMap, line: u32) ?ZigSpan {
         const index = map.findZigIndex(line) orelse return null;
-        return map.gen_span.items[index];
+        return map.zig_span.items[index];
     }
 
     /// Finds the index of a zig-order span containing a zig line.
     fn findZigIndex(map: *const CodeMap, line: u32) ?usize {
         var low: usize = 0;
-        var high: usize = map.gen_span.items.len;
+        var high: usize = map.zig_span.items.len;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            switch (map.gen_span.items[mid].orderZig(line)) {
+            switch (map.zig_span.items[mid].orderZig(line)) {
                 .lt => high = mid,
                 .eq => return mid,
                 .gt => low = mid + 1,
@@ -2627,13 +2641,13 @@ pub const CodeMap = struct {
     }
 
     /// Finds the earliest zig span containing a zy line.
-    fn findZy(map: *const CodeMap, line: u32) ?GenSpan {
+    fn findZy(map: *const CodeMap, line: u32) ?ZigSpan {
         const index = map.findZyIndex(line) orelse return null;
-        return map.gen_span.items[map.zy_order.items[index]];
+        return map.zig_span.items[map.zy_order.items[index]];
     }
 
-    fn spanInZyOrder(map: *const CodeMap, index: usize) GenSpan {
-        return map.gen_span.items[map.zy_order.items[index]];
+    fn spanInZyOrder(map: *const CodeMap, index: usize) ZigSpan {
+        return map.zig_span.items[map.zy_order.items[index]];
     }
 
     fn firstZyIndexPossiblyIntersecting(map: *const CodeMap, range: types.Range) usize {
@@ -2674,7 +2688,7 @@ pub const CodeMap = struct {
 
     /// Sorts zy indexes by zy start, then zig start.  The
     /// zig tie-breaker keeps defensive duplicate mappings deterministic.
-    fn zyIndexLessThan(spans: []const GenSpan, lhs_index: usize, rhs_index: usize) bool {
+    fn zyIndexLessThan(spans: []const ZigSpan, lhs_index: usize, rhs_index: usize) bool {
         const lhs = spans[lhs_index];
         const rhs = spans[rhs_index];
         if (lhs.zy_line != rhs.zy_line) return lhs.zy_line < rhs.zy_line;
@@ -2684,68 +2698,99 @@ pub const CodeMap = struct {
 };
 
 const SpanTranslator = struct {
-    gen_span: CodeMap.GenSpan,
+    zig_span: CodeMap.ZigSpan,
     zy_range: ts.Range,
-    zy_text: []const u8,
-    zig_text: []const u8,
-    difference: Diff,
+    document_version: i32 = std.math.minInt(i32),
+    zy_text: []u8 = &.{},
+    zig_text: []u8 = &.{},
+    difference: ?Diff = null,
 
     const OffsetTranslation = union(enum) {
         shared: usize,
         mutant: CodeMap.Mutation,
     };
 
-    fn init(
-        allocator: std.mem.Allocator,
-        gen_span: CodeMap.GenSpan,
-        zy_range: ts.Range,
-        zy_text: []const u8,
-        zig_text: []const u8,
-    ) OOM!SpanTranslator {
-        const zy_slice = zy_text[zy_range.start_byte..zy_range.end_byte];
-        const zig_slice = zig_text[gen_span.zig_range.start..gen_span.zig_range.end];
-
-        var difference = Diff.init(.default);
-        errdefer difference.deinit(allocator);
-        _ = try difference.diff(allocator, zy_slice, zig_slice);
-
+    fn init(zig_span: CodeMap.ZigSpan, zy_range: ts.Range) SpanTranslator {
         return .{
-            .gen_span = gen_span,
+            .zig_span = zig_span,
             .zy_range = zy_range,
-            .zy_text = zy_text,
-            .zig_text = zig_text,
-            .difference = difference,
         };
     }
 
+    fn updateSpan(translator: *SpanTranslator, zig_span: CodeMap.ZigSpan, zy_range: ts.Range) void {
+        translator.zig_span = zig_span;
+        translator.zy_range = zy_range;
+    }
+
     fn deinit(translator: *SpanTranslator, allocator: std.mem.Allocator) void {
-        translator.difference.deinit(allocator);
+        if (translator.difference) |*difference| difference.deinit(allocator);
+        allocator.free(translator.zy_text);
+        allocator.free(translator.zig_text);
         translator.* = undefined;
     }
 
+    fn ensureFresh(
+        translator: *SpanTranslator,
+        allocator: std.mem.Allocator,
+        current_version: i32,
+        zy_doc: []const u8,
+        zig_doc: []const u8,
+    ) OOM!void {
+        if (translator.document_version == current_version) return;
+
+        const current_zig = translator.currentZigSlice(zig_doc);
+        if (translator.difference != null and std.mem.eql(u8, translator.zig_text, current_zig)) {
+            translator.document_version = current_version;
+            return;
+        }
+
+        if (translator.difference) |*difference| {
+            difference.deinit(allocator);
+            translator.difference = null;
+        }
+
+        try translator.replaceText(allocator, &translator.zy_text, translator.currentZySlice(zy_doc));
+        try translator.replaceText(allocator, &translator.zig_text, current_zig);
+
+        var difference = Diff.init(.default);
+        errdefer difference.deinit(allocator);
+        _ = try difference.diff(allocator, translator.zy_text, translator.zig_text);
+        translator.difference = difference;
+        translator.document_version = current_version;
+    }
+
+    fn replaceText(
+        translator: *SpanTranslator,
+        allocator: std.mem.Allocator,
+        target: *[]u8,
+        source: []const u8,
+    ) OOM!void {
+        _ = translator;
+        const resized = try allocator.realloc(target.*, source.len);
+        if (source.len != 0) @memcpy(resized, source);
+        target.* = resized;
+    }
+
+    fn currentZySlice(translator: *const SpanTranslator, zy_doc: []const u8) []const u8 {
+        return zy_doc[translator.zy_range.start_byte..translator.zy_range.end_byte];
+    }
+
+    fn currentZigSlice(translator: *const SpanTranslator, zig_doc: []const u8) []const u8 {
+        return zig_doc[translator.zig_span.zig_range.start..translator.zig_span.zig_range.end];
+    }
+
     fn zyPositionToZig(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
-        const zy_index = lsp.offsets.positionToIndex(translator.zy_text, position, .@"utf-8");
-        const zy_start: usize = translator.zy_range.start_byte;
-        const rel = zy_index - zy_start;
+        const rel = translator.zyIndexForPosition(position);
         return switch (translator.zyOffsetToZig(rel)) {
-            .shared => |zig_rel| .{ .shared = lsp.offsets.indexToPosition(
-                translator.zig_text,
-                translator.gen_span.zig_range.start + zig_rel,
-                .@"utf-8",
-            ) },
+            .shared => |zig_rel| .{ .shared = translator.zigPositionForRel(zig_rel) },
             .mutant => |mutation| .{ .mutant = mutation },
         };
     }
 
     fn zigPositionToZy(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
-        const zig_index = lsp.offsets.positionToIndex(translator.zig_text, position, .@"utf-8");
-        const rel = zig_index - translator.gen_span.zig_range.start;
+        const rel = translator.zigIndexForPosition(position);
         return switch (translator.zigOffsetToZy(rel)) {
-            .shared => |zy_rel| .{ .shared = lsp.offsets.indexToPosition(
-                translator.zy_text,
-                @as(usize, translator.zy_range.start_byte) + zy_rel,
-                .@"utf-8",
-            ) },
+            .shared => |zy_rel| .{ .shared = translator.zyPositionForRel(zy_rel) },
             .mutant => |mutation| .{ .mutant = mutation },
         };
     }
@@ -2757,10 +2802,8 @@ const SpanTranslator = struct {
             return null;
         }
 
-        const zig_start = lsp.offsets.positionToIndex(translator.zig_text, range.start, .@"utf-8");
-        const zig_end = lsp.offsets.positionToIndex(translator.zig_text, range.end, .@"utf-8");
-        const rel_start = zig_start - translator.gen_span.zig_range.start;
-        const rel_end = zig_end - translator.gen_span.zig_range.start;
+        const rel_start = translator.zigIndexForPosition(range.start);
+        const rel_end = translator.zigIndexForPosition(range.end);
         if (!translator.zigIntervalShared(rel_start, rel_end)) return null;
 
         return .{
@@ -2775,25 +2818,30 @@ const SpanTranslator = struct {
     }
 
     fn containsZigPosition(translator: *const SpanTranslator, position: types.Position, allow_end: bool) bool {
-        if (position.line < translator.gen_span.zig_line) return false;
-        if (position.line > translator.gen_span.zigEnd()) return false;
-        if (position.line == translator.gen_span.zigEnd()) {
+        if (position.line < translator.zig_span.zig_line) return false;
+        if (position.line > translator.zig_span.zigEnd()) return false;
+        if (position.line == translator.zig_span.zig_line and position.character < translator.zig_span.zig_column) return false;
+        if (position.line == translator.zig_span.zigEnd()) {
             return allow_end and position.character == 0;
         }
         return true;
     }
 
     fn zyOffsetToZig(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
-        return zyOffsetThroughDiff(translator, rel, translator.difference.edits.items);
+        return zyOffsetThroughDiff(translator, rel, translator.diffEdits());
     }
 
     fn zigOffsetToZy(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
-        return zigOffsetThroughDiff(translator, rel, translator.difference.edits.items);
+        return zigOffsetThroughDiff(translator, rel, translator.diffEdits());
     }
 
     fn zigIntervalShared(translator: *const SpanTranslator, start: usize, end: usize) bool {
         if (start == end) return translator.zigOffsetToZy(start) == .shared;
-        return zigDiffIntervalShared(start, end, translator.difference.edits.items);
+        return zigDiffIntervalShared(start, end, translator.diffEdits());
+    }
+
+    fn diffEdits(translator: *const SpanTranslator) []const Edit {
+        return translator.difference.?.edits.items;
     }
 
     fn zyOffsetThroughDiff(translator: *const SpanTranslator, rel: usize, edits: []const Edit) OffsetTranslation {
@@ -2898,100 +2946,153 @@ const SpanTranslator = struct {
         zig_end: usize,
     ) CodeMap.Mutation {
         return .{
-            .zy = rangeFromByteRange(
-                translator.zy_text,
-                @as(usize, translator.zy_range.start_byte) + zy_start,
-                @as(usize, translator.zy_range.start_byte) + zy_end,
-            ),
-            .zig = rangeFromByteRange(
-                translator.zig_text,
-                translator.gen_span.zig_range.start + zig_start,
-                translator.gen_span.zig_range.start + zig_end,
-            ),
+            .zy = translator.zyRangeFromRel(zy_start, zy_end),
+            .zig = translator.zigRangeFromRel(zig_start, zig_end),
         };
     }
 
     fn zyLength(translator: *const SpanTranslator) usize {
-        return translator.zy_range.end_byte - translator.zy_range.start_byte;
+        return translator.zy_text.len;
     }
 
     fn zigLength(translator: *const SpanTranslator) usize {
-        return translator.gen_span.zig_range.end - translator.gen_span.zig_range.start;
+        return translator.zig_text.len;
+    }
+
+    fn zyIndexForPosition(translator: *const SpanTranslator, position: types.Position) usize {
+        return lsp.offsets.positionToIndex(translator.zy_text, translator.relativeZyPosition(position), .@"utf-8");
+    }
+
+    fn zigIndexForPosition(translator: *const SpanTranslator, position: types.Position) usize {
+        return lsp.offsets.positionToIndex(translator.zig_text, translator.relativeZigPosition(position), .@"utf-8");
+    }
+
+    fn relativeZyPosition(translator: *const SpanTranslator, position: types.Position) types.Position {
+        const line = position.line - translator.zy_range.start_point.row;
+        return .{
+            .line = line,
+            .character = if (line == 0) position.character - translator.zy_range.start_point.column else position.character,
+        };
+    }
+
+    fn relativeZigPosition(translator: *const SpanTranslator, position: types.Position) types.Position {
+        const line = position.line - translator.zig_span.zig_line;
+        return .{
+            .line = line,
+            .character = if (line == 0) position.character - translator.zig_span.zig_column else position.character,
+        };
+    }
+
+    fn zyPositionForRel(translator: *const SpanTranslator, rel: usize) types.Position {
+        const relative = lsp.offsets.indexToPosition(translator.zy_text, rel, .@"utf-8");
+        return .{
+            .line = translator.zy_range.start_point.row + relative.line,
+            .character = if (relative.line == 0) translator.zy_range.start_point.column + relative.character else relative.character,
+        };
+    }
+
+    fn zigPositionForRel(translator: *const SpanTranslator, rel: usize) types.Position {
+        const relative = lsp.offsets.indexToPosition(translator.zig_text, rel, .@"utf-8");
+        return .{
+            .line = translator.zig_span.zig_line + relative.line,
+            .character = if (relative.line == 0) translator.zig_span.zig_column + relative.character else relative.character,
+        };
+    }
+
+    fn zyRangeFromRel(translator: *const SpanTranslator, start: usize, end: usize) types.Range {
+        return .{
+            .start = translator.zyPositionForRel(start),
+            .end = translator.zyPositionForRel(end),
+        };
+    }
+
+    fn zigRangeFromRel(translator: *const SpanTranslator, start: usize, end: usize) types.Range {
+        return .{
+            .start = translator.zigPositionForRel(start),
+            .end = translator.zigPositionForRel(end),
+        };
     }
 };
 
-const SpanTranslatorCache = struct {
-    entries: std.ArrayList(Entry) = .empty,
-
-    const Entry = struct {
-        span_index: usize,
-        translator: SpanTranslator,
-    };
+const SpanTranslators = struct {
+    slots: std.ArrayList(SpanTranslator) = .empty,
 
     fn get(
-        cache: *SpanTranslatorCache,
+        cache: *SpanTranslators,
         allocator: std.mem.Allocator,
         map: *const CodeMap,
+        document_version: i32,
         zy_text: []const u8,
         zig_text: []const u8,
         span_index: usize,
     ) OOM!*SpanTranslator {
-        const entry_index = try cache.getEntryIndex(allocator, map, zy_text, zig_text, span_index);
-        return &cache.entries.items[entry_index].translator;
+        try cache.ensureSlots(allocator, map, span_index + 1);
+        const translator = &cache.slots.items[span_index];
+        try translator.ensureFresh(allocator, document_version, zy_text, zig_text);
+        return translator;
     }
 
-    fn getEntryIndex(
-        cache: *SpanTranslatorCache,
+    fn at(cache: *SpanTranslators, span_index: usize) *SpanTranslator {
+        return &cache.slots.items[span_index];
+    }
+
+    fn resetForSpans(cache: *SpanTranslators, allocator: std.mem.Allocator, map: *const CodeMap) OOM!void {
+        while (cache.slots.items.len > map.zig_span.items.len) {
+            var translator = cache.slots.pop().?;
+            translator.deinit(allocator);
+        }
+        for (cache.slots.items, 0..) |*translator, index| {
+            translator.updateSpan(map.zig_span.items[index], map.zy_range.items[index]);
+        }
+        try cache.ensureSlots(allocator, map, map.zig_span.items.len);
+    }
+
+    fn ensureSlots(
+        cache: *SpanTranslators,
         allocator: std.mem.Allocator,
         map: *const CodeMap,
-        zy_text: []const u8,
-        zig_text: []const u8,
-        span_index: usize,
-    ) OOM!usize {
-        for (cache.entries.items, 0..) |*entry, entry_index| {
-            if (entry.span_index == span_index) return entry_index;
+        count: usize,
+    ) OOM!void {
+        try cache.slots.ensureTotalCapacity(allocator, count);
+        while (cache.slots.items.len < count) {
+            const span_index = cache.slots.items.len;
+            cache.slots.appendAssumeCapacity(SpanTranslator.init(
+                map.zig_span.items[span_index],
+                map.zy_range.items[span_index],
+            ));
         }
-
-        var translator = try SpanTranslator.init(
-            allocator,
-            map.gen_span.items[span_index],
-            map.zy_range.items[span_index],
-            zy_text,
-            zig_text,
-        );
-        errdefer translator.deinit(allocator);
-        try cache.entries.append(allocator, .{
-            .span_index = span_index,
-            .translator = translator,
-        });
-        return cache.entries.items.len - 1;
     }
 
-    fn at(cache: *SpanTranslatorCache, entry_index: usize) *SpanTranslator {
-        return &cache.entries.items[entry_index].translator;
-    }
-
-    fn reset(cache: *SpanTranslatorCache, allocator: std.mem.Allocator) void {
-        for (cache.entries.items) |*entry| {
-            entry.translator.deinit(allocator);
+    fn reset(cache: *SpanTranslators, allocator: std.mem.Allocator) void {
+        for (cache.slots.items) |*translator| {
+            translator.deinit(allocator);
         }
-        cache.entries.clearRetainingCapacity();
+        cache.slots.clearRetainingCapacity();
     }
 
-    fn deinit(cache: *SpanTranslatorCache, allocator: std.mem.Allocator) void {
+    fn deinit(cache: *SpanTranslators, allocator: std.mem.Allocator) void {
         cache.reset(allocator);
-        cache.entries.deinit(allocator);
+        cache.slots.deinit(allocator);
         cache.* = .{};
     }
 
-    fn len(cache: *const SpanTranslatorCache) usize {
-        return cache.entries.items.len;
+    fn len(cache: *const SpanTranslators) usize {
+        return cache.slots.items.len;
+    }
+
+    fn freshLen(cache: *const SpanTranslators, document_version: i32) usize {
+        var count: usize = 0;
+        for (cache.slots.items) |translator| {
+            if (translator.document_version == document_version) count += 1;
+        }
+        return count;
     }
 };
 
 const RequestTranslationContext = struct {
     allocator: std.mem.Allocator,
     map: *CodeMap,
+    document_version: i32 = 0,
     zy_text: []const u8,
     zig_text: []const u8,
     active_span_index: ?usize,
@@ -3038,7 +3139,7 @@ const RequestTranslationContext = struct {
 
     fn zigPositionToZy(context: *RequestTranslationContext, position: types.Position) OOM!?types.Position {
         const span_index = context.map.findZigIndex(position.line) orelse return null;
-        const span = context.map.gen_span.items[span_index];
+        const span = context.map.zig_span.items[span_index];
         if (position.line == span.zigEnd() and position.character != 0) return null;
         if (context.map.fast_column_mapping.items[span_index]) {
             return context.map.zigPositionToZyInSpanFromText(span_index, context.zy_text, position);
@@ -3050,7 +3151,7 @@ const RequestTranslationContext = struct {
 
     fn translatorForZigRange(context: *RequestTranslationContext, range: types.Range) OOM!?*SpanTranslator {
         const span_index = context.map.findZigIndex(range.start.line) orelse return null;
-        const span = context.map.gen_span.items[span_index];
+        const span = context.map.zig_span.items[span_index];
         if (span.orderZig(range.end.line) != .eq and !(range.end.line == span.zigEnd() and range.end.character == 0)) {
             return null;
         }
@@ -3060,7 +3161,7 @@ const RequestTranslationContext = struct {
 
     fn translatorForZigPosition(context: *RequestTranslationContext, position: types.Position) OOM!?*SpanTranslator {
         const span_index = context.map.findZigIndex(position.line) orelse return null;
-        const span = context.map.gen_span.items[span_index];
+        const span = context.map.zig_span.items[span_index];
         if (position.line == span.zigEnd() and position.character != 0) return null;
         return try context.translatorForSpanIndex(span_index);
     }
@@ -3068,15 +3169,7 @@ const RequestTranslationContext = struct {
     fn translatorForSpanIndex(context: *RequestTranslationContext, span_index: usize) OOM!*SpanTranslator {
         return try context.map.spanTranslator(
             context.allocator,
-            context.zy_text,
-            context.zig_text,
-            span_index,
-        );
-    }
-
-    fn translatorEntryIndexForSpanIndex(context: *RequestTranslationContext, span_index: usize) OOM!usize {
-        return try context.map.spanTranslatorEntryIndex(
-            context.allocator,
+            context.document_version,
             context.zy_text,
             context.zig_text,
             span_index,
@@ -3087,7 +3180,6 @@ const RequestTranslationContext = struct {
 const ZigPositionCursor = struct {
     context: *RequestTranslationContext,
     span_index: ?usize = null,
-    cache_entry_index: usize = 0,
     zig_line: u32 = 0,
     zig_line_start: usize = 0,
     zy_line: u32 = 0,
@@ -3102,8 +3194,7 @@ const ZigPositionCursor = struct {
 
     fn zigPositionToZy(cursor: *ZigPositionCursor, position: types.Position) OOM!?types.Position {
         const translator = try cursor.translatorForPosition(position) orelse return null;
-        const zig_index = cursor.zigIndexForPosition(translator, position) orelse return null;
-        const rel = zig_index - translator.gen_span.zig_range.start;
+        const rel = cursor.zigIndexForPosition(translator, position) orelse return null;
         const translated = cursor.zigOffsetToZy(translator, rel);
         const zy_rel = switch (translated) {
             .shared => |zy_rel| zy_rel,
@@ -3120,10 +3211,8 @@ const ZigPositionCursor = struct {
             return null;
         }
 
-        const zig_start = cursor.zigIndexForPosition(translator, range.start) orelse return null;
-        const zig_end = cursor.zigIndexForPosition(translator, range.end) orelse return null;
-        const rel_start = zig_start - translator.gen_span.zig_range.start;
-        const rel_end = zig_end - translator.gen_span.zig_range.start;
+        const rel_start = cursor.zigIndexForPosition(translator, range.start) orelse return null;
+        const rel_end = cursor.zigIndexForPosition(translator, range.end) orelse return null;
         if (rel_end < rel_start or !translator.zigIntervalShared(rel_start, rel_end)) return null;
 
         const start_rel = switch (cursor.zigOffsetToZy(translator, rel_start)) {
@@ -3142,40 +3231,38 @@ const ZigPositionCursor = struct {
 
     fn translatorForPosition(cursor: *ZigPositionCursor, position: types.Position) OOM!?*SpanTranslator {
         if (cursor.span_index) |span_index| {
-            const span = cursor.context.map.gen_span.items[span_index];
+            const span = cursor.context.map.zig_span.items[span_index];
             if (spanContainsZigPosition(span, position)) {
-                return cursor.context.map.translatorAt(cursor.cache_entry_index);
+                return cursor.context.map.translatorAt(span_index);
             }
 
             if (position.line >= span.zigEnd()) {
                 var next_index = span_index + 1;
-                while (next_index < cursor.context.map.gen_span.items.len) : (next_index += 1) {
-                    const next_span = cursor.context.map.gen_span.items[next_index];
+                while (next_index < cursor.context.map.zig_span.items.len) : (next_index += 1) {
+                    const next_span = cursor.context.map.zig_span.items[next_index];
                     if (position.line < next_span.zig_line) break;
                     if (spanContainsZigPosition(next_span, position)) {
                         try cursor.resetToSpan(next_index);
-                        return cursor.context.map.translatorAt(cursor.cache_entry_index);
+                        return cursor.context.map.translatorAt(next_index);
                     }
                 }
             }
         }
 
         const span_index = cursor.context.map.findZigIndex(position.line) orelse return null;
-        const span = cursor.context.map.gen_span.items[span_index];
+        const span = cursor.context.map.zig_span.items[span_index];
         if (!spanContainsZigPosition(span, position)) return null;
         try cursor.resetToSpan(span_index);
-        return cursor.context.map.translatorAt(cursor.cache_entry_index);
+        return cursor.context.map.translatorAt(span_index);
     }
 
     fn resetToSpan(cursor: *ZigPositionCursor, span_index: usize) OOM!void {
-        const cache_entry_index = try cursor.context.translatorEntryIndexForSpanIndex(span_index);
-        const translator = cursor.context.map.translatorAt(cache_entry_index);
+        const translator = try cursor.context.translatorForSpanIndex(span_index);
         cursor.span_index = span_index;
-        cursor.cache_entry_index = cache_entry_index;
-        cursor.zig_line = translator.gen_span.zig_line;
-        cursor.zig_line_start = translator.gen_span.zig_range.start;
+        cursor.zig_line = translator.zig_span.zig_line;
+        cursor.zig_line_start = 0;
         cursor.zy_line = translator.zy_range.start_point.row;
-        cursor.zy_line_start = zyLineStart(translator);
+        cursor.zy_line_start = 0;
         cursor.diff = .{};
     }
 
@@ -3184,17 +3271,10 @@ const ZigPositionCursor = struct {
         translator: *const SpanTranslator,
         position: types.Position,
     ) ?usize {
-        if (position.line < cursor.zig_line) {
-            cursor.zig_line = translator.gen_span.zig_line;
-            cursor.zig_line_start = translator.gen_span.zig_range.start;
-        }
-        while (cursor.zig_line < position.line) : (cursor.zig_line += 1) {
-            const line_tail = translator.zig_text[cursor.zig_line_start..translator.gen_span.zig_range.end];
-            const newline = std.mem.indexOfScalar(u8, line_tail, '\n') orelse return null;
-            cursor.zig_line_start += newline + 1;
-        }
-        const index = cursor.zig_line_start + position.character;
-        return if (index <= translator.gen_span.zig_range.end) index else null;
+        _ = cursor;
+        if (!translator.containsZigPosition(position, true)) return null;
+        const index = translator.zigIndexForPosition(position);
+        return if (index <= translator.zigLength()) index else null;
     }
 
     fn zyPositionForRel(
@@ -3202,23 +3282,8 @@ const ZigPositionCursor = struct {
         translator: *const SpanTranslator,
         zy_rel: usize,
     ) types.Position {
-        const zy_index = @as(usize, translator.zy_range.start_byte) + zy_rel;
-        if (zy_index < cursor.zy_line_start) {
-            cursor.zy_line = translator.zy_range.start_point.row;
-            cursor.zy_line_start = zyLineStart(translator);
-        }
-        while (cursor.zy_line_start < zy_index) {
-            const line_tail = translator.zy_text[cursor.zy_line_start..@as(usize, translator.zy_range.end_byte)];
-            const newline = std.mem.indexOfScalar(u8, line_tail, '\n') orelse break;
-            const next_line_start = cursor.zy_line_start + newline + 1;
-            if (next_line_start > zy_index) break;
-            cursor.zy_line_start = next_line_start;
-            cursor.zy_line += 1;
-        }
-        return .{
-            .line = cursor.zy_line,
-            .character = @intCast(zy_index - cursor.zy_line_start),
-        };
+        _ = cursor;
+        return translator.zyPositionForRel(zy_rel);
     }
 
     fn zigOffsetToZy(cursor: *ZigPositionCursor, translator: *const SpanTranslator, rel: usize) SpanTranslator.OffsetTranslation {
@@ -3226,7 +3291,7 @@ const ZigPositionCursor = struct {
             cursor.diff = .{};
         }
 
-        const edits = translator.difference.edits.items;
+        const edits = translator.diffEdits();
         var zy_cursor = cursor.diff.zy_cursor;
         var zig_cursor = cursor.diff.zig_cursor;
         var index = cursor.diff.edit_index;
@@ -3289,15 +3354,12 @@ const ZigPositionCursor = struct {
         return .{ .mutant = translator.zyMutation(0, translator.zyLength(), 0, translator.zigLength()) };
     }
 
-    fn spanContainsZigPosition(span: CodeMap.GenSpan, position: types.Position) bool {
+    fn spanContainsZigPosition(span: CodeMap.ZigSpan, position: types.Position) bool {
         if (position.line < span.zig_line) return false;
         if (position.line > span.zigEnd()) return false;
+        if (position.line == span.zig_line and position.character < span.zig_column) return false;
         if (position.line == span.zigEnd()) return position.character == 0;
         return true;
-    }
-
-    fn zyLineStart(translator: *const SpanTranslator) usize {
-        return translator.zy_range.start_byte - @as(usize, translator.zy_range.start_point.column);
     }
 };
 
@@ -3501,6 +3563,7 @@ fn semanticDirtyLineDelta(dirty: SemanticDirtyRange) i64 {
 fn zyRangeToZigRange(
     allocator: std.mem.Allocator,
     code_map: *CodeMap,
+    document_version: i32,
     zy_text: []const u8,
     zig_text: []const u8,
     zy_range: types.Range,
@@ -3508,6 +3571,7 @@ fn zyRangeToZigRange(
     var translation_context = RequestTranslationContext{
         .allocator = allocator,
         .map = code_map,
+        .document_version = document_version,
         .zy_text = zy_text,
         .zig_text = zig_text,
         .active_span_index = null,
@@ -4040,7 +4104,7 @@ fn translateSemanticTokenData(
     data: []u32,
     map: *RequestTranslationContext,
 ) Error![]const u32 {
-    const token_ranges = try arena.alloc(SemanticTokenRange, map.map.gen_span.items.len);
+    const token_ranges = try arena.alloc(SemanticTokenRange, map.map.zig_span.items.len);
     @memset(token_ranges, .{});
     const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
 
@@ -4101,8 +4165,8 @@ fn semanticSpanMappings(
     code_map: *const CodeMap,
     zig_text: []const u8,
 ) OOM![]const SemanticSpanMapping {
-    const mappings = try arena.alloc(SemanticSpanMapping, code_map.gen_span.items.len);
-    for (mappings, code_map.gen_span.items, code_map.fast_column_mapping.items) |*mapping, span, fast| {
+    const mappings = try arena.alloc(SemanticSpanMapping, code_map.zig_span.items.len);
+    for (mappings, code_map.zig_span.items, code_map.fast_column_mapping.items) |*mapping, span, fast| {
         mapping.* = semanticSpanMappingForSpan(zig_text, span, fast);
     }
     return mappings;
@@ -4110,7 +4174,7 @@ fn semanticSpanMappings(
 
 fn semanticSpanMappingForSpan(
     zig_text: []const u8,
-    span: CodeMap.GenSpan,
+    span: CodeMap.ZigSpan,
     fast_column_mapping: bool,
 ) SemanticSpanMapping {
     return .{
@@ -5192,7 +5256,7 @@ test "code map stores one span for a multi-line mapped range" {
     defer map.deinit(testing_allocator);
 
     try expectEqual(@as(usize, 1), map.len());
-    try expectEqual(@as(u32, 3), map.gen_span.items[0].line_count);
+    try expectEqual(@as(u32, 3), map.zig_span.items[0].line_count);
     try expectEqual(types.Position{ .line = 21, .character = 9 }, map.zigPositionToZy(.{
         .line = 3,
         .character = 9,
@@ -5240,19 +5304,19 @@ test "code map stores zy and zig byte ranges" {
 
     try expectEqual(@as(usize, 2), map.len());
 
-    const code_gen_span = map.gen_span.items[0];
+    const code_zig_span = map.zig_span.items[0];
     const code_zy_range = map.zy_range.items[0];
     try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, zy, "{\n").? + 1)), code_zy_range.start_byte);
     try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, zy, "}\n").?)), code_zy_range.end_byte);
-    try expectEqual(std.mem.indexOf(u8, zig, "\n\n").? + 1, code_gen_span.zig_range.start);
-    try expectEqual(std.mem.indexOf(u8, zig, "// #line 4").?, code_gen_span.zig_range.end);
+    try expectEqual(std.mem.indexOf(u8, zig, "\n\n").? + 1, code_zig_span.zig_range.start);
+    try expectEqual(std.mem.indexOf(u8, zig, "// #line 4").?, code_zig_span.zig_range.end);
 
-    const action_gen_span = map.gen_span.items[1];
+    const action_zig_span = map.zig_span.items[1];
     const action_zy_range = map.zy_range.items[1];
     try expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, zy, "{ result").? + 1)), action_zy_range.start_byte);
     try expectEqual(@as(u32, @intCast(std.mem.lastIndexOfScalar(u8, zy, '}').?)), action_zy_range.end_byte);
-    try expectEqual(std.mem.indexOf(u8, zig, " result").?, action_gen_span.zig_range.start);
-    try expectEqual(zig.len, action_gen_span.zig_range.end);
+    try expectEqual(std.mem.indexOf(u8, zig, " result").?, action_zig_span.zig_range.start);
+    try expectEqual(zig.len, action_zig_span.zig_range.end);
 }
 
 test "code map marks directive shortcuts as fast column mappings" {
@@ -5313,6 +5377,7 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
     }, (try zyRangeToZigRange(
         testing_allocator,
         &map,
+        0,
         zy,
         zig,
         .{
@@ -5327,6 +5392,7 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
     }, (try zyRangeToZigRange(
         testing_allocator,
         &map,
+        0,
         zy,
         zig,
         .{
@@ -5361,7 +5427,8 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
         0, 14, "code_answer".len,    8, 0,
         1, 17, "include_answer".len, 8, 0,
     }, translated);
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(0));
 }
 
 test "code map reports optimized-away code blocks as unmapped" {
@@ -5865,6 +5932,7 @@ test "request span translator applies zy column offset" {
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "result").?, .@"utf-8");
     const translator = try map.spanTranslator(
         testing_allocator,
+        0,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -5890,6 +5958,7 @@ test "request span translator nulls mutated zig aliases" {
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "pik_elist_append").?, .@"utf-8");
     const translator = try map.spanTranslator(
         testing_allocator,
+        0,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -5936,6 +6005,7 @@ test "request span translator maps zig alias boundary points" {
 
     const translator = try map.spanTranslator(
         testing_allocator,
+        0,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6001,7 +6071,7 @@ test "alias code block rename edits come from zy-side deletes" {
     const arena = arena_state.allocator();
 
     const zy_range = map.zy_range.items[0];
-    const zig_range = map.gen_span.items[0].zig_range;
+    const zig_range = map.zig_span.items[0].zig_range;
     var difference = Diff.init(.default);
     defer difference.deinit(testing_allocator);
     _ = try difference.diff(
@@ -6049,7 +6119,7 @@ test "alias code block rename catches lhs aliases matched inside zig types" {
     const arena = arena_state.allocator();
 
     const zy_range = map.zy_range.items[0];
-    const zig_range = map.gen_span.items[0].zig_range;
+    const zig_range = map.zig_span.items[0].zig_range;
     var difference = Diff.init(.default);
     defer difference.deinit(testing_allocator);
     _ = try difference.diff(
@@ -6099,10 +6169,11 @@ test "request span translator handles zig line directive after action" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
     try expectEqual(@as(usize, 1), map.len());
-    try expectEqual(std.mem.indexOf(u8, zig, "// #line 200").?, map.gen_span.items[0].zig_range.end);
+    try expectEqual(std.mem.indexOf(u8, zig, "// #line 200").?, map.zig_span.items[0].zig_range.end);
     const zy_position = lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "pik_elist_append").?, .@"utf-8");
     const translator = try map.spanTranslator(
         testing_allocator,
+        0,
         zy,
         zig,
         map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6252,7 +6323,7 @@ test "request span translator handles one leading newline edit" {
     const zig = "const answer = 42;";
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
         .line_count = 1,
@@ -6265,7 +6336,7 @@ test "request span translator handles one leading newline edit" {
         .end_point = .{ .row = 1, .column = @intCast("const answer = 42;".len) },
     });
     try map.fast_column_mapping.append(testing_allocator, false);
-    const translator = try map.spanTranslator(testing_allocator, zy, zig, 0);
+    const translator = try map.spanTranslator(testing_allocator, 0, zy, zig, 0);
 
     try expectEqual(types.Position{ .line = 0, .character = 6 }, sharedPosition(translator.zyPositionToZig(.{
         .line = 1,
@@ -6450,7 +6521,8 @@ test "translates inlay hints back to zy positions" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(0));
     const translated = try translateInlayHints(
         arena_state.allocator(),
         &other_hints,
@@ -6459,7 +6531,8 @@ test "translates inlay hints back to zy positions" {
         "file:///zy.zy",
     );
 
-    try expectEqual(@as(usize, 1), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 1), map.translators.freshLen(0));
     try expectEqual(@as(usize, 2), translated.len);
     try expectEqual(@as(u32, 1), translated[0].position.line);
     try expectEqual(@as(u32, 12), translated[0].position.character);
@@ -6481,7 +6554,7 @@ test "translates inlay hints on first block line with zy column skew" {
 
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
         .line_count = 1,
@@ -6532,7 +6605,7 @@ test "zig position cursor translates zig ranges" {
 
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
         .line_count = 1,
@@ -6835,7 +6908,8 @@ test "translates semantic tokens and drops zig-only spans" {
         1, 6, 6, 8,  0,
         0, 9, 2, 19, 0,
     }, translated);
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(0));
 }
 
 test "semantic token inline action spans use column-aware slow path" {
@@ -6848,7 +6922,7 @@ test "semantic token inline action spans use column-aware slow path" {
 
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
         .line_count = 1,
@@ -6866,6 +6940,7 @@ test "semantic token inline action spans use column-aware slow path" {
     const mapped_range = (try zyRangeToZigRange(
         testing_allocator,
         &map,
+        0,
         zy,
         zig,
         .{
@@ -6898,7 +6973,7 @@ test "semantic token inline action spans use column-aware slow path" {
     );
 
     try expectEqualSlices(u32, &.{ 0, answer_zy_column, 6, 8, 0 }, translated);
-    try expectEqual(@as(usize, 1), map.translator_cache.len());
+    try expectEqual(@as(usize, 1), map.translators.freshLen(0));
 }
 
 test "translates semantic tokens in zy span order" {
@@ -6917,7 +6992,7 @@ test "translates semantic tokens in zy span order" {
 
     var map: CodeMap = .{};
     defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 2,
         .zig_line = 0,
         .line_count = 1,
@@ -6930,7 +7005,7 @@ test "translates semantic tokens in zy span order" {
         .end_point = .{ .row = 2, .column = @intCast(zy.len - zy_second_start) },
     });
     try map.fast_column_mapping.append(testing_allocator, true);
-    try map.gen_span.append(testing_allocator, .{
+    try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 1,
         .line_count = 1,
@@ -7016,7 +7091,8 @@ test "translates inlay hints with one cached diff per touched block" {
     var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena_state.deinit();
 
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(0));
     const translated = try translateInlayHints(
         arena_state.allocator(),
         &hints,
@@ -7026,12 +7102,109 @@ test "translates inlay hints with one cached diff per touched block" {
     );
 
     try expectEqual(@as(usize, 2), translated.len);
-    try expectEqual(@as(usize, 2), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 2), map.translators.freshLen(0));
     try expectEqual(@as(u32, 1), translated[0].position.line);
     try expectEqual(@as(u32, 4), translated[1].position.line);
 }
 
-test "code map reuses span translators and resets them across regeneration" {
+test "span translator marks identical stale zig slice fresh without rebuilding diff" {
+    const zy = "rule(A) ::= token(T). { A = T; }";
+    const zig =
+        \\// #line 1 zy.zy
+        \\ yygotominor.yy0 = yymsp[0].minor.yy42;
+    ;
+
+    var map = try parseCodeMapForTest(zy, zig, "zy.zy");
+    defer map.deinit(testing_allocator);
+
+    const first = try map.spanTranslator(testing_allocator, 1, zy, zig, 0);
+    const first_edits = first.diffEdits().ptr;
+    try expectEqual(@as(i32, 1), first.document_version);
+    try expectEqual(@as(usize, 1), map.translators.freshLen(1));
+
+    const tree = try parseZitronTreeForTest(zy);
+    defer tree.destroy();
+    const updated = try testing_allocator.dupe(u8, zig);
+    defer testing_allocator.free(updated);
+    try map.update(testing_allocator, tree.rootNode(), zy, updated, "zy.zy");
+    try expectEqual(@as(usize, 0), map.translators.freshLen(2));
+
+    const second = try map.spanTranslator(testing_allocator, 2, zy, zig, 0);
+    try std.testing.expect(first == second);
+    try expectEqual(@as(i32, 2), second.document_version);
+    try std.testing.expect(first_edits == second.diffEdits().ptr);
+}
+
+test "span translator refreshes owned text and diff when stale zig slice changes" {
+    const zy = "rule(A) ::= token(T). { A = T; }";
+    const zig =
+        \\// #line 1 zy.zy
+        \\ yygotominor.yy0 = yymsp[0].minor.yy42;
+    ;
+    const updated_zig =
+        \\// #line 1 zy.zy
+        \\ yygotominor.yy0 = yymsp[1].minor.yy42;
+    ;
+
+    var map = try parseCodeMapForTest(zy, zig, "zy.zy");
+    defer map.deinit(testing_allocator);
+
+    const first = try map.spanTranslator(testing_allocator, 1, zy, zig, 0);
+    const first_zig_text = try testing_allocator.dupe(u8, first.zig_text);
+    defer testing_allocator.free(first_zig_text);
+    try expectEqual(@as(i32, 1), first.document_version);
+
+    const tree = try parseZitronTreeForTest(zy);
+    defer tree.destroy();
+    const updated = try testing_allocator.dupe(u8, updated_zig);
+    defer testing_allocator.free(updated);
+    try map.update(testing_allocator, tree.rootNode(), zy, updated, "zy.zy");
+
+    const refreshed = try map.spanTranslator(testing_allocator, 2, zy, updated_zig, 0);
+    try std.testing.expect(first == refreshed);
+    try expectEqual(@as(i32, 2), refreshed.document_version);
+    try expectEqualStrings(updated_zig[map.zig_span.items[0].zig_range.start..map.zig_span.items[0].zig_range.end], refreshed.zig_text);
+    try std.testing.expect(!std.mem.eql(u8, first_zig_text, refreshed.zig_text));
+    const zig_answer = lsp.offsets.indexToPosition(updated_zig, std.mem.indexOf(u8, updated_zig, "yygotominor").?, .@"utf-8");
+    try expectEqual(
+        lsp.offsets.indexToPosition(zy, std.mem.indexOf(u8, zy, "A =").?, .@"utf-8"),
+        sharedPosition(refreshed.zigPositionToZy(zig_answer)) orelse return error.UnexpectedCodeMap,
+    );
+}
+
+test "span translators refresh only touched stale spans" {
+    const zy =
+        \\first(A) ::= token(T). { A = first(T); }
+        \\second(B) ::= token(T). { B = second(T); }
+    ;
+    const zig =
+        \\// #line 1 zy.zy
+        \\ yygotominor.yy0 = first(yymsp[0].minor.yy42);
+        \\// #line 2 zy.zy
+        \\ yygotominor.yy0 = second(yymsp[0].minor.yy42);
+    ;
+
+    var map = try parseCodeMapForTest(zy, zig, "zy.zy");
+    defer map.deinit(testing_allocator);
+    try expectEqual(@as(usize, 2), map.translators.len());
+
+    _ = try map.spanTranslator(testing_allocator, 1, zy, zig, 0);
+    try expectEqual(@as(usize, 1), map.translators.freshLen(1));
+
+    const tree = try parseZitronTreeForTest(zy);
+    defer tree.destroy();
+    const updated = try testing_allocator.dupe(u8, zig);
+    defer testing_allocator.free(updated);
+    try map.update(testing_allocator, tree.rootNode(), zy, updated, "zy.zy");
+    try expectEqual(@as(usize, 0), map.translators.freshLen(2));
+
+    _ = try map.spanTranslator(testing_allocator, 2, zy, zig, 1);
+    try expectEqual(@as(usize, 1), map.translators.freshLen(1));
+    try expectEqual(@as(usize, 1), map.translators.freshLen(2));
+}
+
+test "code map preserves span translators and refreshes them across regeneration" {
     const zy =
         \\%code {
         \\const answer = 42;
@@ -7049,21 +7222,25 @@ test "code map reuses span translators and resets them across regeneration" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     defer map.deinit(testing_allocator);
 
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
-    const first = try map.spanTranslator(testing_allocator, zy, zig, 0);
-    const second = try map.spanTranslator(testing_allocator, zy, zig, 0);
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(0));
+    const first = try map.spanTranslator(testing_allocator, 0, zy, zig, 0);
+    const second = try map.spanTranslator(testing_allocator, 0, zy, zig, 0);
     try std.testing.expect(first == second);
-    try expectEqual(@as(usize, 1), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 1), map.translators.freshLen(0));
 
     const updated_tree = try parseZitronTreeForTest(zy);
     defer updated_tree.destroy();
     const updated = try testing_allocator.dupe(u8, updated_zig);
     defer testing_allocator.free(updated);
     try map.update(testing_allocator, updated_tree.rootNode(), zy, updated, "zy.zy");
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 0), map.translators.freshLen(1));
 
-    _ = try map.spanTranslator(testing_allocator, zy, updated, 0);
-    try expectEqual(@as(usize, 1), map.translator_cache.len());
+    _ = try map.spanTranslator(testing_allocator, 1, zy, updated, 0);
+    try expectEqual(map.len(), map.translators.len());
+    try expectEqual(@as(usize, 1), map.translators.freshLen(1));
 }
 
 test "translates workspace edit changes back to zy ranges" {
