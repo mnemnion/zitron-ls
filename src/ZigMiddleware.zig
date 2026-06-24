@@ -1247,16 +1247,6 @@ const Middleware = struct {
         doc: *ZigDocument,
         data: []u32,
     ) Error![]const u32 {
-        return try middleware.translateSemanticTokensForDocumentRange(arena, doc, data, null);
-    }
-
-    fn translateSemanticTokensForDocumentRange(
-        middleware: *Middleware,
-        arena: std.mem.Allocator,
-        doc: *ZigDocument,
-        data: []u32,
-        zy_filter: ?types.Range,
-    ) Error![]const u32 {
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
             .map = &doc.code_map,
@@ -1265,7 +1255,7 @@ const Middleware = struct {
             .active_span_index = null,
         };
         defer translation_context.deinit();
-        return try translateSemanticTokenData(arena, data, &translation_context, zy_filter);
+        return try translateSemanticTokenData(arena, data, &translation_context);
     }
 
     fn semanticTokensFullAsDelta(
@@ -1389,11 +1379,10 @@ const Middleware = struct {
         };
         const zls_ns = elapsedNs(middleware.io, zls_start);
         const translate_start = logStart(middleware.io);
-        const current_range_data = try middleware.translateSemanticTokensForDocumentRange(
+        const current_range_data = try middleware.translateSemanticTokensForDocument(
             arena,
             doc,
             @constCast(range_result.data),
-            current_zy_range,
         );
         const translate_ns = elapsedNs(middleware.io, translate_start);
         const splice_start = logStart(middleware.io);
@@ -4050,12 +4039,7 @@ fn translateSemanticTokenData(
     arena: std.mem.Allocator,
     data: []u32,
     map: *RequestTranslationContext,
-    zy_filter: ?types.Range,
 ) Error![]const u32 {
-    if (zy_filter) |filter| {
-        return try translateSemanticTokenDataFiltered(arena, data, map, filter);
-    }
-
     const token_ranges = try arena.alloc(SemanticTokenRange, map.map.gen_span.items.len);
     @memset(token_ranges, .{});
     const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
@@ -4112,70 +4096,6 @@ fn translateSemanticTokenData(
     return encodeSemanticTokenDataInPlace(translated);
 }
 
-fn translateSemanticTokenDataFiltered(
-    arena: std.mem.Allocator,
-    data: []u32,
-    map: *RequestTranslationContext,
-    zy_filter: types.Range,
-) Error![]const u32 {
-    const token_ranges = try arena.alloc(SemanticTokenRange, map.map.gen_span.items.len);
-    @memset(token_ranges, .{});
-
-    var line: u32 = 0;
-    var character: u32 = 0;
-    var write_index: usize = 0;
-
-    var index: usize = 0;
-    while (index + 4 < data.len) : (index += 5) {
-        line += data[index];
-        character = if (data[index] == 0) character + data[index + 1] else data[index + 1];
-        const length = data[index + 2];
-        const token_type = data[index + 3];
-        const token_modifiers = data[index + 4];
-
-        const zig_range: types.Range = .{
-            .start = .{ .line = line, .character = character },
-            .end = .{ .line = line, .character = character + length },
-        };
-        const span_index = map.map.zigSpanIndexForRange(zig_range) orelse continue;
-        if (!semanticTokenMightIntersectZyFilter(map.map, span_index, zig_range, zy_filter)) continue;
-
-        const zy_range = (try translateSemanticTokenRangeFromMapping(
-            map,
-            semanticSpanMapping(map.map, map.zig_text, span_index),
-            span_index,
-            zig_range,
-        )) orelse continue;
-        if (zy_range.start.line != zy_range.end.line) continue;
-        if (zy_range.end.character < zy_range.start.character) continue;
-        if (rangeIntersection(zy_range, zy_filter) == null) continue;
-
-        var range = &token_ranges[span_index];
-        if (!range.seen) {
-            range.* = .{
-                .start = write_index,
-                .end = write_index,
-                .seen = true,
-            };
-        } else if (range.end != write_index) {
-            return error.UnexpectedResponse;
-        }
-
-        const out = data[write_index..][0..5];
-        out[0] = zy_range.start.line;
-        out[1] = zy_range.start.character;
-        out[2] = zy_range.end.character - zy_range.start.character;
-        out[3] = token_type;
-        out[4] = token_modifiers;
-        write_index += 5;
-        range.end = write_index;
-    }
-
-    const translated = data[0..write_index];
-    try reorderSemanticTokenRanges(translated, token_ranges, map.map.zy_order.items);
-    return encodeSemanticTokenDataInPlace(translated);
-}
-
 fn semanticSpanMappings(
     arena: std.mem.Allocator,
     code_map: *const CodeMap,
@@ -4186,18 +4106,6 @@ fn semanticSpanMappings(
         mapping.* = semanticSpanMappingForSpan(zig_text, span, fast);
     }
     return mappings;
-}
-
-fn semanticSpanMapping(
-    code_map: *const CodeMap,
-    zig_text: []const u8,
-    span_index: usize,
-) SemanticSpanMapping {
-    return semanticSpanMappingForSpan(
-        zig_text,
-        code_map.gen_span.items[span_index],
-        code_map.fast_column_mapping.items[span_index],
-    );
 }
 
 fn semanticSpanMappingForSpan(
@@ -4251,23 +4159,6 @@ const SemanticSpanMapping = struct {
 
 fn rangeContainsRange(outer: types.Range, inner: types.Range) bool {
     return !positionLessThan(inner.start, outer.start) and !positionLessThan(outer.end, inner.end);
-}
-
-fn semanticTokenMightIntersectZyFilter(
-    code_map: *const CodeMap,
-    span_index: usize,
-    zig_range: types.Range,
-    zy_filter: types.Range,
-) bool {
-    const span = code_map.gen_span.items[span_index];
-    if (zig_range.start.line < span.zig_line or zig_range.end.line < span.zig_line) return false;
-
-    const zy_start_line = span.zy_line + (zig_range.start.line - span.zig_line);
-    const zy_end_line = span.zy_line + (zig_range.end.line - span.zig_line);
-    return rangeIntersection(.{
-        .start = .{ .line = zy_start_line, .character = 0 },
-        .end = .{ .line = zy_end_line + 1, .character = 0 },
-    }, zy_filter) != null;
 }
 
 const SemanticTokenRange = struct {
@@ -5464,7 +5355,6 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
         arena_state.allocator(),
         &zig_tokens,
         &context,
-        null,
     );
 
     try expectEqualSlices(u32, &.{
@@ -6939,7 +6829,6 @@ test "translates semantic tokens and drops zig-only spans" {
         arena_state.allocator(),
         &zig_tokens,
         &context,
-        null,
     );
 
     try expectEqualSlices(u32, &.{
@@ -7006,89 +6895,9 @@ test "semantic token inline action spans use column-aware slow path" {
         arena_state.allocator(),
         &zig_tokens,
         &context,
-        .{
-            .start = .{ .line = 0, .character = 0 },
-            .end = .{ .line = 1, .character = 0 },
-        },
     );
 
     try expectEqualSlices(u32, &.{ 0, answer_zy_column, 6, 8, 0 }, translated);
-    try expectEqual(@as(usize, 1), map.translator_cache.len());
-}
-
-test "filtered semantic tokens skip unrequested slow spans before diffing" {
-    const zy =
-        "rule1 ::= A. { const first = A; }\n" ++
-        "rule2 ::= B. { const second = B; }";
-    const zig =
-        "const first = yy;\n" ++
-        "const second = yy;";
-    const first_zy_start = std.mem.indexOf(u8, zy, "const first").?;
-    const first_zy_len = "const first = A;".len;
-    const second_zy_start = std.mem.indexOf(u8, zy, "const second").?;
-    const second_zy_len = "const second = B;".len;
-    const second_line_start = std.mem.indexOf(u8, zy, "rule2").?;
-    const zig_first_end = std.mem.indexOfScalar(u8, zig, '\n').?;
-    const second_zy_character: u32 = @intCast(second_zy_start - second_line_start + 6);
-
-    var map: CodeMap = .{};
-    defer map.deinit(testing_allocator);
-    try map.gen_span.append(testing_allocator, .{
-        .zy_line = 0,
-        .zig_line = 0,
-        .line_count = 1,
-        .zig_range = .{ .start = 0, .end = zig_first_end },
-    });
-    try map.zy_range.append(testing_allocator, .{
-        .start_byte = @intCast(first_zy_start),
-        .end_byte = @intCast(first_zy_start + first_zy_len),
-        .start_point = .{ .row = 0, .column = @intCast(first_zy_start) },
-        .end_point = .{ .row = 0, .column = @intCast(first_zy_start + first_zy_len) },
-    });
-    try map.fast_column_mapping.append(testing_allocator, false);
-    try map.gen_span.append(testing_allocator, .{
-        .zy_line = 1,
-        .zig_line = 1,
-        .line_count = 1,
-        .zig_range = .{ .start = zig_first_end + 1, .end = zig.len },
-    });
-    try map.zy_range.append(testing_allocator, .{
-        .start_byte = @intCast(second_zy_start),
-        .end_byte = @intCast(second_zy_start + second_zy_len),
-        .start_point = .{ .row = 1, .column = @intCast(second_zy_start - second_line_start) },
-        .end_point = .{ .row = 1, .column = @intCast(second_zy_start - second_line_start + second_zy_len) },
-    });
-    try map.fast_column_mapping.append(testing_allocator, false);
-    try map.rebuildZyOrder(testing_allocator);
-    var context = RequestTranslationContext{
-        .allocator = testing_allocator,
-        .map = &map,
-        .zy_text = zy,
-        .zig_text = zig,
-        .active_span_index = null,
-    };
-    defer context.deinit();
-
-    var zig_tokens = [_]u32{
-        0, 6, 5, 8, 0,
-        1, 6, 6, 8, 0,
-    };
-
-    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena_state.deinit();
-
-    const filtered = try translateSemanticTokenData(
-        arena_state.allocator(),
-        &zig_tokens,
-        &context,
-        .{
-            .start = .{ .line = 1, .character = 0 },
-            .end = .{ .line = 2, .character = 0 },
-        },
-    );
-
-    const expected = [_]u32{ 1, second_zy_character, 6, 8, 0 };
-    try expectEqualSlices(u32, &expected, filtered);
     try expectEqual(@as(usize, 1), map.translator_cache.len());
 }
 
@@ -7156,32 +6965,12 @@ test "translates semantic tokens in zy span order" {
         arena_state.allocator(),
         &zig_tokens,
         &context,
-        null,
     );
 
     try expectEqualSlices(u32, &.{
         0, 6, 5, 8, 0,
         2, 6, 6, 8, 0,
     }, translated);
-
-    var filtered_zig_tokens = [_]u32{
-        0, 6, 6, 8, 0,
-        1, 6, 5, 8, 0,
-    };
-    map.translator_cache.reset(testing_allocator);
-    const filtered = try translateSemanticTokenData(
-        arena_state.allocator(),
-        &filtered_zig_tokens,
-        &context,
-        .{
-            .start = .{ .line = 2, .character = 0 },
-            .end = .{ .line = 3, .character = 0 },
-        },
-    );
-    try expectEqualSlices(u32, &.{
-        2, 6, 6, 8, 0,
-    }, filtered);
-    try expectEqual(@as(usize, 0), map.translator_cache.len());
 }
 
 test "translates inlay hints with one cached diff per touched block" {
