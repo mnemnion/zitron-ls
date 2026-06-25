@@ -372,6 +372,8 @@ const Middleware = struct {
             notify_ns,
             elapsedNs(middleware.io, start),
         });
+
+        try middleware.refreshSemanticTokensCurrentIfInitialized(uri);
     }
 
     fn forwardHover(
@@ -959,34 +961,21 @@ const Middleware = struct {
     ) Error!lsp.ResultType("textDocument/semanticTokens/full") {
         const start = logStart(middleware.io);
         log.debug("Zig forward semanticTokens/full <- uri={s}", .{zy_uri});
-        const doc = try middleware.documentReady(zy_uri);
-        var mapped = params;
-        mapped.textDocument = .{ .uri = doc.zig_uri };
+        const current = (try middleware.ensureSemanticTokensCurrent(arena, zy_uri, .{
+            .textDocument = params.textDocument,
+            .workDoneToken = params.workDoneToken,
+            .partialResultToken = params.partialResultToken,
+        })) orelse return null;
+        const zy_result_id = try middleware.storeSemanticTokensSnapshotFromCurrent(zy_uri, current);
 
-        const result = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
-            log.debug("Zig forward semanticTokens/full -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-                zy_uri,
-                elapsedNs(middleware.io, start),
-            });
-            return null;
-        };
-        const translated_data = try middleware.translateSemanticTokenRangeForDocument(arena, doc, @constCast(result.data));
-        const zy_result_id = try middleware.storeSemanticTokensSnapshot(
+        log.debug("Zig forward semanticTokens/full -> uri={s} route=current token_count={} elapsed_ns={}", .{
             zy_uri,
-            doc.zy_text,
-            doc.zig_text,
-            translated_data,
-        );
-
-        log.debug("Zig forward semanticTokens/full -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
-            zy_uri,
-            result.data.len / 5,
-            translated_data.len / 5,
+            current.zy_data.len / 5,
             elapsedNs(middleware.io, start),
         });
         return .{
             .resultId = zy_result_id,
-            .data = translated_data,
+            .data = current.zy_data,
         };
     }
 
@@ -998,29 +987,35 @@ const Middleware = struct {
     ) Error!lsp.ResultType("textDocument/semanticTokens/full/delta") {
         const start = logStart(middleware.io);
         log.debug("Zig forward semanticTokens/full/delta <- uri={s} previous={s}", .{ zy_uri, params.previousResultId });
-        const doc = try middleware.documentReady(zy_uri);
-        const snapshot = middleware.semanticTokensSnapshot(zy_uri, params.previousResultId) orelse {
-            const full = (try middleware.forwardSemanticTokensFull(arena, zy_uri, .{
-                .textDocument = params.textDocument,
-                .workDoneToken = params.workDoneToken,
-                .partialResultToken = params.partialResultToken,
-            })) orelse return null;
-            return .{ .semantic_tokens = full };
-        };
-
-        if (std.mem.eql(u8, doc.zig_text, snapshot.zig_text)) {
-            return try middleware.semanticTokensEmptyDelta(zy_uri, doc, snapshot, start);
-        }
-
-        const dirty = doc.semantic_dirty_range orelse
-            (try semanticDirtyRangeFromDiff(arena, snapshot.zy_text, doc.zy_text)) orelse
-            fullSemanticDirtyRange(snapshot.zy_text, doc.zy_text);
-
-        return try middleware.semanticTokensRangeAsDelta(arena, zy_uri, doc, snapshot, .{
+        const current = (try middleware.ensureSemanticTokensCurrent(arena, zy_uri, .{
             .textDocument = params.textDocument,
             .workDoneToken = params.workDoneToken,
             .partialResultToken = params.partialResultToken,
-        }, dirty, start);
+        })) orelse return null;
+        const snapshot = middleware.semanticTokensSnapshot(zy_uri, params.previousResultId) orelse {
+            const zy_result_id = try middleware.storeSemanticTokensSnapshotFromCurrent(zy_uri, current);
+            log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=current_full reason=unknown_previous token_count={} elapsed_ns={}", .{
+                zy_uri,
+                current.zy_data.len / 5,
+                elapsedNs(middleware.io, start),
+            });
+            return .{ .semantic_tokens = .{
+                .resultId = zy_result_id,
+                .data = current.zy_data,
+            } };
+        };
+
+        const zy_edits = try semanticTokenDeltaEdits(arena, snapshot.zy_data, current.zy_data);
+        const zy_result_id = try middleware.storeSemanticTokensSnapshotFromCurrent(zy_uri, current);
+        log.debug("Zig forward semanticTokens/full/delta -> uri={s} route=current_delta zy_edits={} elapsed_ns={}", .{
+            zy_uri,
+            zy_edits.len,
+            elapsedNs(middleware.io, start),
+        });
+        return .{ .semantic_tokens_delta = .{
+            .resultId = zy_result_id,
+            .edits = zy_edits,
+        } };
     }
 
     fn forwardSemanticTokensRange(
@@ -1031,43 +1026,21 @@ const Middleware = struct {
     ) Error!lsp.ResultType("textDocument/semanticTokens/range") {
         const start = logStart(middleware.io);
         log.debug("Zig forward semanticTokens/range <- uri={s} zy_range={any}", .{ zy_uri, params.range });
-        const doc = try middleware.documentReady(zy_uri);
-        const resolved_range = (try zyRangeToZigRange(
-            middleware.allocator,
-            &doc.code_map,
-            doc.version,
-            doc.zy_text,
-            doc.zig_text,
-            params.range,
-        )) orelse {
-            log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=unmapped_range elapsed_ns={}", .{
-                zy_uri,
-                elapsedNs(middleware.io, start),
-            });
-            return null;
-        };
+        const current = (try middleware.ensureSemanticTokensCurrent(arena, zy_uri, .{
+            .textDocument = params.textDocument,
+            .workDoneToken = params.workDoneToken,
+            .partialResultToken = params.partialResultToken,
+        })) orelse return null;
+        const range_data = try semanticTokenDataForRange(arena, current.zy_index, params.range);
 
-        var mapped = params;
-        mapped.textDocument = .{ .uri = doc.zig_uri };
-        mapped.range = resolved_range;
-        const result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
-            log.debug("Zig forward semanticTokens/range -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
-                zy_uri,
-                elapsedNs(middleware.io, start),
-            });
-            return null;
-        };
-        const translated_data = try middleware.translateSemanticTokensForDocument(arena, doc, @constCast(result.data));
-
-        log.debug("Zig forward semanticTokens/range -> uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+        log.debug("Zig forward semanticTokens/range -> uri={s} route=current token_count={} elapsed_ns={}", .{
             zy_uri,
-            result.data.len / 5,
-            translated_data.len / 5,
+            range_data.len / 5,
             elapsedNs(middleware.io, start),
         });
         return .{
             .resultId = null,
-            .data = translated_data,
+            .data = range_data,
         };
     }
 
@@ -1238,6 +1211,206 @@ const Middleware = struct {
         };
         defer translation_context.deinit();
         return try translateSemanticTokenRangeData(arena, data, &translation_context);
+    }
+
+    fn ensureSemanticTokensCurrent(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        zy_uri: []const u8,
+        params: types.SemanticTokensParams,
+    ) Error!?*const SemanticTokenCollection {
+        const doc = try middleware.documentReady(zy_uri);
+        const state = middleware.documents.getPtr(zy_uri) orelse return error.MissingZigDocument;
+        if (state.semantic_tokens_current) |*current| {
+            if (current.version == doc.version) return current;
+            try middleware.updateSemanticTokensCurrent(arena, zy_uri, doc, current, null);
+            return &(middleware.documents.getPtr(zy_uri).?.semantic_tokens_current.?);
+        }
+        return try middleware.initSemanticTokensCurrent(arena, zy_uri, doc, params);
+    }
+
+    fn initSemanticTokensCurrent(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        zy_uri: []const u8,
+        doc: *ZigDocument,
+        params: types.SemanticTokensParams,
+    ) Error!?*const SemanticTokenCollection {
+        const start = logStart(middleware.io);
+        var mapped = params;
+        mapped.textDocument = .{ .uri = doc.zig_uri };
+        const result = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
+            log.debug("Zig semantic current init_full uri={s} result=null reason=zls_null elapsed_ns={}", .{
+                zy_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return null;
+        };
+        const translated_data = try middleware.translateSemanticTokenRangeForDocument(arena, doc, @constCast(result.data));
+        const owned_zy_data = try middleware.allocator.dupe(u32, translated_data);
+        errdefer middleware.allocator.free(owned_zy_data);
+        const current = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, owned_zy_data);
+        log.debug("Zig semantic current init_full uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            zy_uri,
+            result.data.len / 5,
+            translated_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+        return current;
+    }
+
+    fn refreshSemanticTokensCurrentIfInitialized(
+        middleware: *Middleware,
+        zy_uri: []const u8,
+    ) Error!void {
+        const state = middleware.documents.getPtr(zy_uri) orelse return;
+        const doc = state.currentGeneration() orelse return;
+        if (doc.generation_error != null) return;
+        const current = &(state.semantic_tokens_current orelse return);
+        if (current.version == doc.version) return;
+
+        var arena_state = std.heap.ArenaAllocator.init(middleware.allocator);
+        defer arena_state.deinit();
+        try middleware.updateSemanticTokensCurrent(arena_state.allocator(), zy_uri, doc, current, null);
+    }
+
+    fn updateSemanticTokensCurrent(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        zy_uri: []const u8,
+        doc: *ZigDocument,
+        current: *const SemanticTokenCollection,
+        maybe_dirty: ?SemanticDirtyRange,
+    ) Error!void {
+        if (std.mem.eql(u8, doc.zig_text, current.zig_text)) {
+            try middleware.updateSemanticTokensCurrentWithoutZigChange(zy_uri, doc, current, maybe_dirty);
+            return;
+        }
+
+        const start = logStart(middleware.io);
+        const dirty = maybe_dirty orelse
+            doc.semantic_dirty_range orelse
+            (try semanticDirtyRangeFromDiff(arena, current.zy_text, doc.zy_text)) orelse
+            fullSemanticDirtyRange(current.zy_text, doc.zy_text);
+        const current_zy_range = expandSemanticDirtyRange(dirty.current);
+        var route: enum { update_range, update_whole_range } = .update_range;
+        const zig_range = (try zyRangeToZigRange(
+            middleware.allocator,
+            &doc.code_map,
+            doc.version,
+            doc.zy_text,
+            doc.zig_text,
+            current_zy_range,
+        )) orelse blk: {
+            route = .update_whole_range;
+            break :blk fullDocumentRange(doc.zig_text);
+        };
+
+        const mapped: types.SemanticTokensRangeParams = .{
+            .textDocument = .{ .uri = doc.zig_uri },
+            .range = zig_range,
+            .workDoneToken = null,
+            .partialResultToken = null,
+        };
+        const range_result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
+            log.debug("Zig semantic current {t} uri={s} result=null reason=zls_range_null elapsed_ns={}", .{
+                route,
+                zy_uri,
+                elapsedNs(middleware.io, start),
+            });
+            return error.RequestFailed;
+        };
+        const current_range_data = middleware.translateSemanticTokenRangeForDocument(
+            arena,
+            doc,
+            @constCast(range_result.data),
+        ) catch |err| switch (err) {
+            error.UnexpectedResponse => {
+                log.debug("Zig semantic current {t} uri={s} result=null reason=range_translate_unexpected elapsed_ns={}", .{
+                    route,
+                    zy_uri,
+                    elapsedNs(middleware.io, start),
+                });
+                return error.RequestFailed;
+            },
+            else => return err,
+        };
+        const current_zy_data = try rebuildSemanticTokenDataFromRange(
+            middleware.allocator,
+            current.zy_index,
+            dirty,
+            current_range_data,
+        );
+        errdefer middleware.allocator.free(current_zy_data);
+        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, current_zy_data);
+        log.debug("Zig semantic current {t} uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
+            route,
+            zy_uri,
+            range_result.data.len / 5,
+            current_range_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn updateSemanticTokensCurrentWithoutZigChange(
+        middleware: *Middleware,
+        zy_uri: []const u8,
+        doc: *ZigDocument,
+        current: *const SemanticTokenCollection,
+        maybe_dirty: ?SemanticDirtyRange,
+    ) Error!void {
+        const start = logStart(middleware.io);
+        const dirty = maybe_dirty orelse
+            doc.semantic_dirty_range orelse
+            (try semanticDirtyRangeFromDiff(middleware.allocator, current.zy_text, doc.zy_text));
+        const current_zy_data = if (dirty) |range|
+            try rebuildSemanticTokenDataWithoutZigChange(middleware.allocator, current.zy_index, range)
+        else
+            try middleware.allocator.dupe(u32, current.zy_data);
+        errdefer middleware.allocator.free(current_zy_data);
+        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, current_zy_data);
+        log.debug("Zig semantic current update_no_zig_change uri={s} token_count={} elapsed_ns={}", .{
+            zy_uri,
+            current_zy_data.len / 5,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn replaceSemanticTokensCurrentOwned(
+        middleware: *Middleware,
+        zy_uri: []const u8,
+        doc: *ZigDocument,
+        owned_zy_data: []u32,
+    ) OOM!*const SemanticTokenCollection {
+        const state = middleware.documents.getPtr(zy_uri) orelse unreachable;
+        var replacement = try SemanticTokenCollection.initOwned(
+            middleware.allocator,
+            doc.version,
+            doc.zy_text,
+            doc.zig_text,
+            owned_zy_data,
+        );
+        errdefer replacement.deinit(middleware.allocator);
+        if (state.semantic_tokens_current) |*old| old.deinit(middleware.allocator);
+        state.semantic_tokens_current = replacement;
+        return &(state.semantic_tokens_current.?);
+    }
+
+    fn storeSemanticTokensSnapshotFromCurrent(
+        middleware: *Middleware,
+        zy_uri: []const u8,
+        current: *const SemanticTokenCollection,
+    ) OOM![]const u8 {
+        var owned_by_store = false;
+        const owned_zy_data = try middleware.allocator.dupe(u32, current.zy_data);
+        errdefer if (!owned_by_store) middleware.allocator.free(owned_zy_data);
+        owned_by_store = true;
+        return try middleware.storeSemanticTokensSnapshotOwned(
+            zy_uri,
+            current.zy_text,
+            current.zig_text,
+            owned_zy_data,
+        );
     }
 
     fn semanticTokensEmptyDelta(
@@ -1645,6 +1818,7 @@ const DocumentState = struct {
     opened: bool,
     zls_sync_count: usize,
     zls_synced_generation_id: ?usize,
+    semantic_tokens_current: ?SemanticTokenCollection = null,
     semantic_tokens: std.ArrayListUnmanaged(SemanticTokensSnapshot) = .empty,
     next_semantic_tokens_result_id: usize = 1,
 
@@ -1681,8 +1855,47 @@ const DocumentState = struct {
 
     fn deinit(state: *DocumentState, allocator: std.mem.Allocator) void {
         if (state.current) |*current| current.deinit(allocator);
+        if (state.semantic_tokens_current) |*semantic_tokens_current| semantic_tokens_current.deinit(allocator);
         for (state.semantic_tokens.items) |*semantic_tokens| semantic_tokens.deinit(allocator);
         state.semantic_tokens.deinit(allocator);
+    }
+};
+
+const SemanticTokenCollection = struct {
+    version: i32,
+    zy_text: []u8,
+    zig_text: []u8,
+    zy_data: []u32,
+    zy_index: []AbsoluteSemanticToken,
+
+    fn initOwned(
+        allocator: std.mem.Allocator,
+        version: i32,
+        zy_text: []const u8,
+        zig_text: []const u8,
+        owned_zy_data: []u32,
+    ) OOM!SemanticTokenCollection {
+        errdefer allocator.free(owned_zy_data);
+        const owned_zy_text = try allocator.dupe(u8, zy_text);
+        errdefer allocator.free(owned_zy_text);
+        const owned_zig_text = try allocator.dupe(u8, zig_text);
+        errdefer allocator.free(owned_zig_text);
+        const owned_zy_index = try semanticTokenIndexFromData(allocator, owned_zy_data);
+        errdefer allocator.free(owned_zy_index);
+        return .{
+            .version = version,
+            .zy_text = owned_zy_text,
+            .zig_text = owned_zig_text,
+            .zy_data = owned_zy_data,
+            .zy_index = owned_zy_index,
+        };
+    }
+
+    fn deinit(collection: *SemanticTokenCollection, allocator: std.mem.Allocator) void {
+        allocator.free(collection.zy_text);
+        allocator.free(collection.zig_text);
+        allocator.free(collection.zy_data);
+        allocator.free(collection.zy_index);
     }
 };
 
@@ -4417,11 +4630,7 @@ fn rebuildSemanticTokenDataFromRange(
 ) Error![]u32 {
     const current_range_index = try semanticTokenIndexFromData(allocator, current_range_data);
     defer allocator.free(current_range_index);
-
-    var replacement_range: ?types.Range = dirty.current;
-    for (current_range_index) |token| {
-        replacement_range = rangeUnion(replacement_range, semanticTokenRange(token));
-    }
+    std.mem.sort(AbsoluteSemanticToken, current_range_index, {}, absoluteSemanticTokenLessThan);
 
     var rebuilt: std.ArrayList(AbsoluteSemanticToken) = .empty;
     defer rebuilt.deinit(allocator);
@@ -4435,15 +4644,36 @@ fn rebuildSemanticTokenDataFromRange(
         else
             previous_token;
 
-        if (replacement_range) |range| {
-            if (semanticTokenIntersectsRange(semanticTokenRange(current_token), range)) continue;
-        }
+        if (semanticTokenIntersectsAny(current_token, current_range_index)) continue;
         try rebuilt.append(allocator, current_token);
     }
 
     try rebuilt.appendSlice(allocator, current_range_index);
     std.mem.sort(AbsoluteSemanticToken, rebuilt.items, {}, absoluteSemanticTokenLessThan);
 
+    return try semanticTokenDataFromIndex(allocator, rebuilt.items);
+}
+
+fn rebuildSemanticTokenDataWithoutZigChange(
+    allocator: std.mem.Allocator,
+    previous_index: []const AbsoluteSemanticToken,
+    dirty: SemanticDirtyRange,
+) Error![]u32 {
+    var rebuilt: std.ArrayList(AbsoluteSemanticToken) = .empty;
+    defer rebuilt.deinit(allocator);
+
+    for (previous_index) |previous_token| {
+        const previous_range = semanticTokenRange(previous_token);
+        if (semanticTokenAffectedByDirty(previous_range, dirty.previous)) continue;
+
+        const current_token = if (!positionLessThan(previous_token.startPosition(), dirty.previous.end))
+            try transformSemanticTokenAfterDirty(previous_token, dirty)
+        else
+            previous_token;
+        try rebuilt.append(allocator, current_token);
+    }
+
+    std.mem.sort(AbsoluteSemanticToken, rebuilt.items, {}, absoluteSemanticTokenLessThan);
     return try semanticTokenDataFromIndex(allocator, rebuilt.items);
 }
 
@@ -4465,6 +4695,59 @@ fn semanticTokenDataFromIndex(
 
     _ = try encodeSemanticTokenDataInPlace(data);
     return data;
+}
+
+fn semanticTokenDataForRange(
+    allocator: std.mem.Allocator,
+    tokens: []const AbsoluteSemanticToken,
+    range: types.Range,
+) Error![]u32 {
+    if (rangeIsEmpty(range)) return try allocator.alloc(u32, 0);
+
+    const first = firstSemanticTokenIntersectingOrAfter(tokens, range.start);
+    var end = first;
+    while (end < tokens.len and positionLessThan(tokens[end].startPosition(), range.end)) {
+        end += 1;
+    }
+
+    var kept: std.ArrayList(AbsoluteSemanticToken) = .empty;
+    defer kept.deinit(allocator);
+    for (tokens[first..end]) |token| {
+        if (rangeIntersection(semanticTokenRange(token), range) != null) {
+            try kept.append(allocator, token);
+        }
+    }
+    return try semanticTokenDataFromIndex(allocator, kept.items);
+}
+
+fn firstSemanticTokenIntersectingOrAfter(
+    tokens: []const AbsoluteSemanticToken,
+    start: types.Position,
+) usize {
+    var low: usize = 0;
+    var high: usize = tokens.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (positionLessThan(start, tokens[mid].endPosition())) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
+fn semanticTokenIntersectsAny(
+    token: AbsoluteSemanticToken,
+    sorted_tokens: []const AbsoluteSemanticToken,
+) bool {
+    const range = semanticTokenRange(token);
+    const first = firstSemanticTokenIntersectingOrAfter(sorted_tokens, range.start);
+    var index = first;
+    while (index < sorted_tokens.len and positionLessThan(sorted_tokens[index].startPosition(), range.end)) : (index += 1) {
+        if (rangeIntersection(range, semanticTokenRange(sorted_tokens[index])) != null) return true;
+    }
+    return false;
 }
 
 fn semanticTokenRange(token: AbsoluteSemanticToken) types.Range {
@@ -5130,6 +5413,25 @@ fn makeTestDocumentState(
         .zls_sync_count = 0,
         .zls_synced_generation_id = null,
     };
+}
+
+fn setTestSemanticTokensCurrent(
+    state: *DocumentState,
+    allocator: std.mem.Allocator,
+    version: i32,
+    zy_text: []const u8,
+    zig_text: []const u8,
+    data: []const u32,
+) !void {
+    const owned_data = try allocator.dupe(u32, data);
+    errdefer allocator.free(owned_data);
+    state.semantic_tokens_current = try SemanticTokenCollection.initOwned(
+        allocator,
+        version,
+        zy_text,
+        zig_text,
+        owned_data,
+    );
 }
 
 fn requestTranslationContextForTest(
@@ -6811,7 +7113,7 @@ test "semantic token range rebuild shifts suffix after line delete" {
     }, updated);
 }
 
-test "semantic token range rebuild treats returned token extent as authoritative" {
+test "semantic token range rebuild preserves sparse gaps between returned tokens" {
     const previous = [_]u32{
         0, 0, 5, 1, 0,
         1, 0, 3, 2, 0,
@@ -6840,8 +7142,41 @@ test "semantic token range rebuild treats returned token extent as authoritative
     try expectEqualSlices(u32, &.{
         0, 0, 5, 1, 0,
         1, 0, 3, 2, 0,
-        2, 0, 4, 5, 0,
+        1, 0, 4, 3, 0,
+        1, 0, 4, 5, 0,
         1, 0, 6, 4, 0,
+    }, updated);
+}
+
+test "semantic token range rebuild treats returned token overlap as authoritative" {
+    const previous = [_]u32{
+        0, 0, 5, 1, 0,
+        1, 0, 3, 2, 0,
+        1, 0, 4, 3, 0,
+        2, 0, 6, 4, 0,
+    };
+    const current_range = [_]u32{
+        2, 0, 4, 5, 0,
+    };
+    const previous_index = try semanticTokenIndexFromData(testing_allocator, &previous);
+    defer testing_allocator.free(previous_index);
+
+    const updated = try rebuildSemanticTokenDataFromRange(testing_allocator, previous_index, .{
+        .previous = .{
+            .start = .{ .line = 1, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+        .current = .{
+            .start = .{ .line = 1, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+    }, &current_range);
+    defer testing_allocator.free(updated);
+
+    try expectEqualSlices(u32, &.{
+        0, 0, 5, 1, 0,
+        2, 0, 4, 5, 0,
+        2, 0, 6, 4, 0,
     }, updated);
 }
 
@@ -7049,7 +7384,7 @@ test "semantic token full delta returns empty edit when zig is unchanged" {
         .zy_data = zy_data,
         .zy_index = zy_index,
     };
-    var state = middleware.documents.getPtr(uri).?;
+    const state = middleware.documents.getPtr(uri).?;
     try state.semantic_tokens.append(testing_allocator, snapshot);
     snapshot_owned = true;
 
@@ -7069,6 +7404,146 @@ test "semantic token full delta returns empty edit when zig is unchanged" {
     try expectEqual(@as(usize, 2), state.semantic_tokens.items.len);
     try expectEqualStrings(current_zy, state.semantic_tokens.items[1].zy_text);
     try expectEqualStrings(zig, state.semantic_tokens.items[1].zig_text);
+}
+
+test "semantic token requests serve fresh current collection without zls" {
+    const uri = "file:///zy.zy";
+    const zy =
+        \\first
+        \\second
+        \\third
+    ;
+    const zig = "zig\n";
+    const current_data = [_]u32{
+        1, 0, 5, 1, 0,
+        1, 2, 3, 2, 0,
+    };
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+    };
+    defer middleware.documents.deinit(testing_allocator);
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, try makeTestDocumentState(testing_allocator, uri, 3, zy, zig));
+    defer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var state = removed.value;
+        state.deinit(testing_allocator);
+    }
+    const state = middleware.documents.getPtr(uri).?;
+    try setTestSemanticTokensCurrent(state, testing_allocator, 3, zy, zig, &current_data);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const full = (try middleware.forwardSemanticTokensFull(arena, uri, .{
+        .textDocument = .{ .uri = uri },
+    })) orelse return error.UnexpectedResponse;
+    try expectEqualStrings("lsp-zitron-semantic-1", full.resultId.?);
+    try expectEqualSlices(u32, &current_data, full.data);
+
+    const range = (try middleware.forwardSemanticTokensRange(arena, uri, .{
+        .textDocument = .{ .uri = uri },
+        .range = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 2, .character = 10 },
+        },
+    })) orelse return error.UnexpectedResponse;
+    try expectEqual(@as(?[]const u8, null), range.resultId);
+    try expectEqualSlices(u32, &.{ 2, 2, 3, 2, 0 }, range.data);
+
+    const delta = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
+        .textDocument = .{ .uri = uri },
+        .previousResultId = full.resultId.?,
+    })) orelse return error.UnexpectedResponse;
+    const delta_result = switch (delta) {
+        .semantic_tokens_delta => |value| value,
+        .semantic_tokens => return error.UnexpectedResponse,
+    };
+    try expectEqualStrings("lsp-zitron-semantic-2", delta_result.resultId.?);
+    try expectEqual(@as(usize, 0), delta_result.edits.len);
+
+    const unknown = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
+        .textDocument = .{ .uri = uri },
+        .previousResultId = "missing",
+    })) orelse return error.UnexpectedResponse;
+    const unknown_full = switch (unknown) {
+        .semantic_tokens => |value| value,
+        .semantic_tokens_delta => return error.UnexpectedResponse,
+    };
+    try expectEqualStrings("lsp-zitron-semantic-3", unknown_full.resultId.?);
+    try expectEqualSlices(u32, &current_data, unknown_full.data);
+}
+
+test "stale semantic token current updates without zls when zig is unchanged" {
+    const uri = "file:///zy.zy";
+    const previous_zy =
+        \\a
+        \\b
+    ;
+    const current_zy =
+        \\x
+        \\a
+        \\b
+    ;
+    const zig = "zig\n";
+    const previous_data = [_]u32{
+        1, 0, 1, 1, 0,
+    };
+
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+    };
+    defer middleware.documents.deinit(testing_allocator);
+    const key = try testing_allocator.dupe(u8, uri);
+    errdefer testing_allocator.free(key);
+    try middleware.documents.put(testing_allocator, key, try makeTestDocumentState(testing_allocator, uri, 2, current_zy, zig));
+    defer {
+        const removed = middleware.documents.fetchRemove(uri).?;
+        testing_allocator.free(removed.key);
+        var state = removed.value;
+        state.deinit(testing_allocator);
+    }
+    var state = middleware.documents.getPtr(uri).?;
+    state.current.?.semantic_dirty_range = .{
+        .previous = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 0 },
+        },
+        .current = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 1, .character = 0 },
+        },
+    };
+    try setTestSemanticTokensCurrent(state, testing_allocator, 1, previous_zy, zig, &previous_data);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const current = (try middleware.ensureSemanticTokensCurrent(arena_state.allocator(), uri, .{
+        .textDocument = .{ .uri = uri },
+    })) orelse return error.UnexpectedResponse;
+
+    try expectEqual(@as(i32, 2), current.version);
+    try expectEqualStrings(current_zy, current.zy_text);
+    try expectEqualStrings(zig, current.zig_text);
+    try expectEqualSlices(u32, &.{ 2, 0, 1, 1, 0 }, current.zy_data);
 }
 
 test "translates semantic tokens and drops zig-only spans" {
