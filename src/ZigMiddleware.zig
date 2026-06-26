@@ -16,6 +16,8 @@ pub const SemanticDirtyRange = struct {
     current: types.Range,
 };
 
+const max_semantic_token_snapshots = 8;
+
 const Middleware = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1116,8 +1118,14 @@ const Middleware = struct {
         zy_result_id: []const u8,
     ) ?*SemanticTokensSnapshot {
         const state = middleware.documents.getPtr(zy_uri) orelse return null;
-        for (state.semantic_tokens.items) |*snapshot| {
-            if (std.mem.eql(u8, snapshot.zy_result_id, zy_result_id)) return snapshot;
+        for (state.semantic_tokens.items, 0..) |*snapshot, index| {
+            if (std.mem.eql(u8, snapshot.zy_result_id, zy_result_id)) {
+                if (index != state.semantic_tokens.items.len - 1) {
+                    const touched = state.semantic_tokens.orderedRemove(index);
+                    state.semantic_tokens.appendAssumeCapacity(touched);
+                }
+                return &state.semantic_tokens.items[state.semantic_tokens.items.len - 1];
+            }
         }
         return null;
     }
@@ -1169,8 +1177,7 @@ const Middleware = struct {
             .zy_index = owned_zy_index,
         };
         try state.semantic_tokens.append(middleware.allocator, snapshot);
-        const max_snapshots = 8;
-        while (state.semantic_tokens.items.len > max_snapshots) {
+        while (state.semantic_tokens.items.len > max_semantic_token_snapshots) {
             var old = state.semantic_tokens.orderedRemove(0);
             old.deinit(middleware.allocator);
         }
@@ -7451,6 +7458,8 @@ test "semantic token requests serve fresh current collection without zls" {
     })) orelse return error.UnexpectedResponse;
     try expectEqualStrings("lsp-zitron-semantic-1", full.resultId.?);
     try expectEqualSlices(u32, &current_data, full.data);
+    const baseline_result_id = try testing_allocator.dupe(u8, full.resultId.?);
+    defer testing_allocator.free(baseline_result_id);
 
     const range = (try middleware.forwardSemanticTokensRange(arena, uri, .{
         .textDocument = .{ .uri = uri },
@@ -7473,6 +7482,18 @@ test "semantic token requests serve fresh current collection without zls" {
     try expectEqualStrings("lsp-zitron-semantic-2", delta_result.resultId.?);
     try expectEqual(@as(usize, 0), delta_result.edits.len);
 
+    for (0..max_semantic_token_snapshots + 2) |_| {
+        const touched = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
+            .textDocument = .{ .uri = uri },
+            .previousResultId = baseline_result_id,
+        })) orelse return error.UnexpectedResponse;
+        const touched_delta = switch (touched) {
+            .semantic_tokens_delta => |value| value,
+            .semantic_tokens => return error.UnexpectedResponse,
+        };
+        try expectEqual(@as(usize, 0), touched_delta.edits.len);
+    }
+
     const unknown = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
         .textDocument = .{ .uri = uri },
         .previousResultId = "missing",
@@ -7481,7 +7502,7 @@ test "semantic token requests serve fresh current collection without zls" {
         .semantic_tokens => |value| value,
         .semantic_tokens_delta => return error.UnexpectedResponse,
     };
-    try expectEqualStrings("lsp-zitron-semantic-3", unknown_full.resultId.?);
+    try expectEqualStrings("lsp-zitron-semantic-13", unknown_full.resultId.?);
     try expectEqualSlices(u32, &current_data, unknown_full.data);
 }
 
