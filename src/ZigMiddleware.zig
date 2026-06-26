@@ -3574,29 +3574,29 @@ fn workspaceEditCount(edit: types.WorkspaceEdit) usize {
 }
 
 fn zigDiffIntervalShared(start: usize, end: usize, edits: []const Edit) bool {
-    var index: usize = 0;
+    if (end < start) return false;
+
     var zig_cursor: usize = 0;
-    while (index < edits.len) {
-        switch (edits[index].operation) {
+    for (edits) |edit| {
+        switch (edit.operation) {
             .equal => {
-                zig_cursor += edits[index].text.len;
-                index += 1;
-            },
-            .delete, .insert => {
-                const mutation_start = zig_cursor;
-                while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
-                    if (edits[index].operation == .insert) zig_cursor += edits[index].text.len;
+                const equal_start = zig_cursor;
+                const equal_end = equal_start + edit.text.len;
+                if (start == end and equal_start <= start and start <= equal_end) return true;
+                if (equal_start <= start and start < equal_end and end <= equal_end) {
+                    if (start == equal_start and end == equal_end) return false;
+                    return true;
                 }
-                if (rangesOverlap(start, end, mutation_start, zig_cursor)) return false;
-                if (mutation_start == zig_cursor and start < mutation_start and mutation_start < end) return false;
+                zig_cursor = equal_end;
             },
+            .insert => {
+                zig_cursor += edit.text.len;
+            },
+            .delete => {},
         }
     }
-    return true;
-}
 
-fn rangesOverlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
-    return a_start < b_end and b_start < a_end;
+    return false;
 }
 
 fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
@@ -7731,6 +7731,67 @@ test "semantic token inline action spans use column-aware slow path" {
 
     try expectEqualSlices(u32, &.{ 0, answer_zy_column, 6, 8, 0 }, translated);
     try expectEqual(@as(usize, 1), map.translators.freshLen(0));
+}
+
+test "semantic token slow path drops partial source-token matches and reencodes following tokens" {
+    const zy = "A = pik_position_between(X, P1, P2);\n";
+    const zig = "A = pik_position_between(X, stack[1], P2);\n";
+    const function_zy_column: u32 = @intCast(std.mem.indexOf(u8, zy, "pik_position_between").?);
+    const function_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "pik_position_between").?);
+    const one_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "[1]").? + 1);
+    const p2_zy_column: u32 = @intCast(std.mem.indexOf(u8, zy, "P2").?);
+    const p2_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "P2").?);
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.zig_span.append(testing_allocator, .{
+        .zy_line = 0,
+        .zig_line = 0,
+        .line_count = 1,
+        .zig_range = .{ .start = 0, .end = zig.len },
+    });
+    try map.zy_range.append(testing_allocator, .{
+        .start_byte = 0,
+        .end_byte = zy.len,
+        .start_point = .{ .row = 0, .column = 0 },
+        .end_point = .{ .row = 1, .column = 0 },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.rebuildZyOrder(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .zy_text = zy,
+        .zig_text = zig,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var position_cursor = ZigPositionCursor{ .context = &context };
+    try std.testing.expect(try position_cursor.zigRangeToZy(.{
+        .start = .{ .line = 0, .character = one_zig_column },
+        .end = .{ .line = 0, .character = one_zig_column + 1 },
+    }) == null);
+
+    var zig_tokens = [_]u32{
+        0, function_zig_column,                  20, 12, 0,
+        0, one_zig_column - function_zig_column, 1,  20, 0,
+        0, p2_zig_column - one_zig_column,       2,  8,  0,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = try translateSemanticTokenData(
+        arena_state.allocator(),
+        &zig_tokens,
+        &context,
+    );
+
+    try expectEqualSlices(u32, &.{
+        0, function_zy_column,                20, 12, 0,
+        0, p2_zy_column - function_zy_column, 2,  8,  0,
+    }, translated);
 }
 
 test "translates semantic tokens in zy span order" {
