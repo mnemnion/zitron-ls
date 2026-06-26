@@ -1346,6 +1346,7 @@ const Middleware = struct {
             middleware.allocator,
             current.zy_index,
             dirty,
+            current_zy_range,
             current_range_data,
         );
         errdefer middleware.allocator.free(current_zy_data);
@@ -1515,6 +1516,7 @@ const Middleware = struct {
             middleware.allocator,
             snapshot.zy_index,
             dirty,
+            current_zy_range,
             current_range_data,
         );
         const splice_ns = elapsedNs(middleware.io, splice_start);
@@ -4633,6 +4635,7 @@ fn rebuildSemanticTokenDataFromRange(
     allocator: std.mem.Allocator,
     previous_index: []const AbsoluteSemanticToken,
     dirty: SemanticDirtyRange,
+    replacement_range: types.Range,
     current_range_data: []const u32,
 ) Error![]u32 {
     const current_range_index = try semanticTokenIndexFromData(allocator, current_range_data);
@@ -4651,6 +4654,7 @@ fn rebuildSemanticTokenDataFromRange(
         else
             previous_token;
 
+        if (semanticTokenIntersectsRange(semanticTokenRange(current_token), replacement_range)) continue;
         if (semanticTokenIntersectsAny(current_token, current_range_index)) continue;
         try rebuilt.append(allocator, current_token);
     }
@@ -7077,6 +7081,9 @@ test "semantic token range rebuild preserves suffix token" {
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7109,6 +7116,9 @@ test "semantic token range rebuild shifts suffix after line delete" {
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7143,6 +7153,9 @@ test "semantic token range rebuild preserves sparse gaps between returned tokens
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7177,6 +7190,9 @@ test "semantic token range rebuild treats returned token overlap as authoritativ
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7209,6 +7225,9 @@ test "semantic token range rebuild preserves adjacent sparse omissions" {
             .start = .{ .line = 2, .character = 0 },
             .end = .{ .line = 3, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 2, .character = 0 },
+        .end = .{ .line = 3, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7217,6 +7236,37 @@ test "semantic token range rebuild preserves adjacent sparse omissions" {
         1, 0, 3, 2, 0,
         1, 0, 4, 5, 0,
         1, 0, 6, 4, 0,
+    }, updated);
+}
+
+test "semantic token range rebuild deletes stale tokens omitted by refreshed range" {
+    const previous = [_]u32{
+        0, 0, 5, 1, 0,
+        1, 0, 3, 2, 0,
+        2, 0, 6, 3, 0,
+    };
+    const current_range = [_]u32{};
+    const previous_index = try semanticTokenIndexFromData(testing_allocator, &previous);
+    defer testing_allocator.free(previous_index);
+
+    const updated = try rebuildSemanticTokenDataFromRange(testing_allocator, previous_index, .{
+        .previous = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+        .current = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 3, .character = 0 },
+    }, &current_range);
+    defer testing_allocator.free(updated);
+
+    try expectEqualSlices(u32, &.{
+        0, 0, 5, 1, 0,
+        3, 0, 6, 3, 0,
     }, updated);
 }
 
@@ -7238,6 +7288,9 @@ test "semantic token range rebuild shifts same-line suffix columns" {
             .start = .{ .line = 0, .character = 5 },
             .end = .{ .line = 0, .character = 8 },
         },
+    }, .{
+        .start = .{ .line = 0, .character = 5 },
+        .end = .{ .line = 0, .character = 8 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7267,6 +7320,9 @@ test "semantic token range rebuild invalidates insertion inside token" {
             .start = .{ .line = 0, .character = 2 },
             .end = .{ .line = 0, .character = 3 },
         },
+    }, .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 8 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
