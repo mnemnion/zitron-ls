@@ -155,19 +155,39 @@ pub fn updateIncremental(
 }
 
 fn changeRangeFromInputEdits(input_edits: []const ts.InputEdit) ?ChangeRange {
-    if (input_edits.len != 1) return null;
+    if (input_edits.len == 0) return null;
 
-    const edit = input_edits[0];
+    var previous_start = positionFromTsPoint(input_edits[0].start_point);
+    var previous_end = positionFromTsPoint(input_edits[0].old_end_point);
+    var current_start = positionFromTsPoint(input_edits[0].start_point);
+    var current_end = positionFromTsPoint(input_edits[0].new_end_point);
+
+    for (input_edits[1..]) |edit| {
+        const start = positionFromTsPoint(edit.start_point);
+        previous_start = positionMin(previous_start, start);
+        previous_end = positionMax(previous_end, positionFromTsPoint(edit.old_end_point));
+        current_start = positionMin(current_start, start);
+        current_end = positionMax(current_end, positionFromTsPoint(edit.new_end_point));
+    }
+
     return .{
         .previous = .{
-            .start = positionFromTsPoint(edit.start_point),
-            .end = positionFromTsPoint(edit.old_end_point),
+            .start = previous_start,
+            .end = previous_end,
         },
         .current = .{
-            .start = positionFromTsPoint(edit.start_point),
-            .end = positionFromTsPoint(edit.new_end_point),
+            .start = current_start,
+            .end = current_end,
         },
     };
+}
+
+fn positionMin(lhs: types.Position, rhs: types.Position) types.Position {
+    return if (positionLessThan(lhs, rhs)) lhs else rhs;
+}
+
+fn positionMax(lhs: types.Position, rhs: types.Position) types.Position {
+    return if (positionLessThan(lhs, rhs)) rhs else lhs;
 }
 
 fn positionFromTsPoint(point: ts.Point) types.Position {
@@ -1920,6 +1940,47 @@ test "updateIncremental accepts same-line insert after nonzero column" {
     try expectEqualStrings("rule ::= TOKEN.", document.source);
     try expectEqualStrings("source_file", document.parsed.root_kind);
     try expect(!document.parsed.has_error);
+}
+
+test "updateIncremental reports a conservative range for multiple edits" {
+    var document = try Document.init(testing_allocator, 1, "rule ::= TOKEN.");
+    defer document.deinit(testing_allocator);
+
+    const first_position = lsp.offsets.indexToPosition(document.source, 4, .@"utf-8");
+    const second_position: types.Position = .{ .line = 0, .character = 8 };
+    const change = (try document.updateIncremental(
+        testing_allocator,
+        2,
+        &.{
+            .{ .text_document_content_change_partial = .{
+                .range = .{
+                    .start = first_position,
+                    .end = first_position,
+                },
+                .rangeLength = 0,
+                .text = "_a",
+            } },
+            .{ .text_document_content_change_partial = .{
+                .range = .{
+                    .start = second_position,
+                    .end = second_position,
+                },
+                .rangeLength = 0,
+                .text = "_b",
+            } },
+        },
+        .@"utf-8",
+    )) orelse return error.UnexpectedResponse;
+
+    try expectEqual(@as(u32, 0), change.previous.start.line);
+    try expectEqual(@as(u32, 4), change.previous.start.character);
+    try expectEqual(@as(u32, 0), change.previous.end.line);
+    try expectEqual(@as(u32, 8), change.previous.end.character);
+    try expectEqual(@as(u32, 0), change.current.start.line);
+    try expectEqual(@as(u32, 4), change.current.start.character);
+    try expectEqual(@as(u32, 0), change.current.end.line);
+    try expectEqual(@as(u32, 10), change.current.end.character);
+    try expectEqualStrings("rule_a :_b:= TOKEN.", document.source);
 }
 
 test "document keeps one parser across reparses" {

@@ -1249,6 +1249,25 @@ test "server capabilities match the implemented handlers" {
     try expectEqualStrings(",", signature_help.triggerCharacters.?[2]);
     try expectEqualStrings(";", signature_help.retriggerCharacters.?[0]);
     try expectEqualStrings(",", signature_help.retriggerCharacters.?[1]);
+
+    const semantic_tokens = switch (capabilities.semanticTokensProvider.?) {
+        .semantic_tokens_options => |options| options,
+        else => return error.UnexpectedServerCapabilities,
+    };
+    const semantic_range = semantic_tokens.range orelse return error.UnexpectedServerCapabilities;
+    switch (semantic_range) {
+        .bool => |supported| try expect(supported),
+        else => return error.UnexpectedServerCapabilities,
+    }
+
+    const json = try std.json.Stringify.valueAlloc(
+        testing_allocator,
+        capabilities,
+        .{ .emit_null_optional_fields = false },
+    );
+    defer testing_allocator.free(json);
+    try expect(std.mem.indexOf(u8, json, "\"semanticTokensProvider\"") != null);
+    try expect(std.mem.indexOf(u8, json, "\"range\":true") != null);
 }
 
 test "server capabilities merge zls completion triggers" {
