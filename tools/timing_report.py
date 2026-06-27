@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--include-replay-sessions", action="store_true")
     parser.add_argument("--format", choices=("tsv", "json"), default="tsv")
     parser.add_argument("--raw", action="store_true")
+    parser.add_argument("--no-split-first", action="store_true")
     args = parser.parse_args()
 
     lines = args.log.read_text(errors="replace").splitlines()
@@ -33,7 +34,7 @@ def main() -> int:
     if args.raw:
         emit_raw(rows, args.format)
     else:
-        emit_summary(rows, args.format)
+        emit_summary(rows, args.format, split_first=not args.no_split_first)
     return 0
 
 
@@ -61,13 +62,18 @@ def session_ranges(lines: list[str]) -> list[tuple[int, int]]:
 
 def timing_rows(lines: list[str]) -> list[dict]:
     rows = []
+    occurrences: dict[str, int] = defaultdict(int)
     for line in lines:
         match = re.search(r"elapsed_ns=(\d+)", line)
         if not match:
             continue
+        metric = normalize_metric(line)
+        occurrences[metric] += 1
         rows.append(
             {
-                "metric": normalize_metric(line),
+                "metric": metric,
+                "occurrence": occurrences[metric],
+                "phase": "first" if occurrences[metric] == 1 else "repeat",
                 "elapsed_ns": int(match.group(1)),
                 "elapsed_ms": int(match.group(1)) / 1_000_000,
             }
@@ -101,22 +107,27 @@ def emit_raw(rows: list[dict], fmt: str) -> None:
         json.dump(rows, sys.stdout, indent=2)
         print()
         return
-    print("metric\telapsed_ms\telapsed_ns")
+    print("metric\tphase\toccurrence\telapsed_ms\telapsed_ns")
     for row in rows:
-        print(f"{row['metric']}\t{row['elapsed_ms']:.6f}\t{row['elapsed_ns']}")
+        print(
+            f"{row['metric']}\t{row['phase']}\t{row['occurrence']}\t"
+            f"{row['elapsed_ms']:.6f}\t{row['elapsed_ns']}"
+        )
 
 
-def emit_summary(rows: list[dict], fmt: str) -> None:
-    grouped: dict[str, list[float]] = defaultdict(list)
+def emit_summary(rows: list[dict], fmt: str, split_first: bool) -> None:
+    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
     for row in rows:
-        grouped[row["metric"]].append(row["elapsed_ms"])
+        phase = row["phase"] if split_first else "all"
+        grouped[(row["metric"], phase)].append(row["elapsed_ms"])
 
     summaries = []
-    for metric, values in sorted(grouped.items()):
+    for (metric, phase), values in sorted(grouped.items()):
         values.sort()
         summaries.append(
             {
                 "metric": metric,
+                "phase": phase,
                 "count": len(values),
                 "min_ms": values[0],
                 "p50_ms": percentile(values, 50),
@@ -132,10 +143,10 @@ def emit_summary(rows: list[dict], fmt: str) -> None:
         print()
         return
 
-    print("metric\tcount\tmin_ms\tp50_ms\tp90_ms\tp95_ms\tmax_ms\tmean_ms")
+    print("metric\tphase\tcount\tmin_ms\tp50_ms\tp90_ms\tp95_ms\tmax_ms\tmean_ms")
     for row in summaries:
         print(
-            f"{row['metric']}\t{row['count']}\t"
+            f"{row['metric']}\t{row['phase']}\t{row['count']}\t"
             f"{row['min_ms']:.6f}\t{row['p50_ms']:.6f}\t"
             f"{row['p90_ms']:.6f}\t{row['p95_ms']:.6f}\t"
             f"{row['max_ms']:.6f}\t{row['mean_ms']:.6f}"

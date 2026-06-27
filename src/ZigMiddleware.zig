@@ -4199,8 +4199,9 @@ fn translateDocumentHighlights(
     map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentHighlight {
     var translated: std.ArrayList(types.DocumentHighlight) = .empty;
+    var position_cursor = ZigPositionCursor{ .context = map };
     for (highlights) |highlight| {
-        if (try translateDocumentHighlight(highlight, map)) |mapped| {
+        if (try translateDocumentHighlight(highlight, &position_cursor)) |mapped| {
             try translated.append(arena, mapped);
         }
     }
@@ -4210,10 +4211,10 @@ fn translateDocumentHighlights(
 
 fn translateDocumentHighlight(
     highlight: types.DocumentHighlight,
-    map: *RequestTranslationContext,
+    position_cursor: *ZigPositionCursor,
 ) OOM!?types.DocumentHighlight {
     return .{
-        .range = (try map.zigRangeToZy(highlight.range)) orelse return null,
+        .range = (try position_cursor.zigRangeToZy(highlight.range)) orelse return null,
         .kind = highlight.kind,
     };
 }
