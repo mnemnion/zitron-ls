@@ -62,7 +62,7 @@ const Middleware = struct {
             if (!gop.found_existing) {
                 errdefer _ = middleware.documents.remove(uri);
                 gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
-                errdefer middleware.allocator.free(gop.key_ptr.*);
+                errdefer comptime unreachable;
                 gop.value_ptr.* = .{
                     .current = null,
                     .latest_requested_version = version,
@@ -1391,14 +1391,14 @@ const Middleware = struct {
         owned_zy_data: []u32,
     ) OOM!*const SemanticTokenCollection {
         const state = middleware.documents.getPtr(zy_uri) orelse unreachable;
-        var replacement = try SemanticTokenCollection.initOwned(
+        const replacement = try SemanticTokenCollection.initOwned(
             middleware.allocator,
             doc.version,
             doc.zy_text,
             doc.zig_text,
             owned_zy_data,
         );
-        errdefer replacement.deinit(middleware.allocator);
+        errdefer comptime unreachable;
         if (state.semantic_tokens_current) |*old| old.deinit(middleware.allocator);
         state.semantic_tokens_current = replacement;
         return &(state.semantic_tokens_current.?);
@@ -1890,7 +1890,7 @@ const SemanticTokenCollection = struct {
         const owned_zig_text = try allocator.dupe(u8, zig_text);
         errdefer allocator.free(owned_zig_text);
         const owned_zy_index = try semanticTokenIndexFromData(allocator, owned_zy_data);
-        errdefer allocator.free(owned_zy_index);
+        errdefer comptime unreachable;
         return .{
             .version = version,
             .zy_text = owned_zy_text,
@@ -1954,7 +1954,7 @@ fn initImpl(
     errdefer freeStringSlices(allocator, zls_completion_triggers);
 
     const mware = try allocator.create(Middleware);
-    errdefer allocator.destroy(mware);
+    errdefer comptime unreachable;
     mware.* = .{
         .allocator = allocator,
         .io = io,
@@ -4609,7 +4609,7 @@ fn semanticTokenIndexFromData(
 ) OOM![]AbsoluteSemanticToken {
     const token_count = data.len / 5;
     const index = try allocator.alloc(AbsoluteSemanticToken, token_count);
-    errdefer allocator.free(index);
+    errdefer comptime unreachable;
 
     var line: u32 = 0;
     var character: u32 = 0;

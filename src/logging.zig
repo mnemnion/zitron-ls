@@ -205,7 +205,7 @@ fn createLogFile(
             return null;
         },
     };
-    errdefer file.close(io);
+    errdefer comptime unreachable;
 
     return .{ .file = file, .path = path };
 }

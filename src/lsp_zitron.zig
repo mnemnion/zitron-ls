@@ -123,7 +123,7 @@ pub const Server = struct {
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
         errdefer tags_query.destroy();
         const rename_query = try ts.Query.create(zitronLanguage(), rename_query_source, &query_error_offset);
-        errdefer rename_query.destroy();
+        errdefer comptime unreachable;
 
         return .{
             .allocator = allocator,
