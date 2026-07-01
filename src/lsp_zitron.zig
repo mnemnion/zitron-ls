@@ -1118,7 +1118,7 @@ pub const Server = struct {
             struct {
                 token: types.ProgressToken,
                 value: struct {
-                    kind: []const u8 = "begin",
+                    kind: []const u8,
                     title: []const u8,
                     message: []const u8,
                 },
@@ -1126,6 +1126,7 @@ pub const Server = struct {
             .{
                 .token = token,
                 .value = .{
+                    .kind = "begin",
                     .title = title,
                     .message = message,
                 },
@@ -1150,13 +1151,13 @@ pub const Server = struct {
             struct {
                 token: types.ProgressToken,
                 value: struct {
-                    kind: []const u8 = "end",
+                    kind: []const u8,
                     message: []const u8,
                 },
             },
             .{
                 .token = token,
-                .value = .{ .message = message },
+                .value = .{ .kind = "end", .message = message },
             },
             .{ .emit_null_optional_fields = false },
         );

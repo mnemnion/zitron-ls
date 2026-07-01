@@ -25,9 +25,9 @@ const Middleware = struct {
     diagnostics_publisher: ?DiagnosticsPublisher,
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
-    zls_mutex: std.Io.Mutex = .init,
-    pending_zls_updates: std.Deque(ZlsUpdateFuture) = .empty,
-    zls_library: ZlsAdapter = undefined,
+    zls_mutex: std.Io.Mutex,
+    pending_zls_updates: std.Deque(ZlsUpdateFuture),
+    zls_library: ZlsAdapter,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
 
@@ -76,6 +76,9 @@ const Middleware = struct {
                     .opened = false,
                     .zls_sync_count = 0,
                     .zls_synced_generation_id = null,
+                    .semantic_tokens_current = null,
+                    .semantic_tokens = .empty,
+                    .next_semantic_tokens_result_id = 1,
                 };
                 log.debug("Zig sync doc-created uri={s}", .{uri});
             } else {
@@ -114,7 +117,7 @@ const Middleware = struct {
                 .zy_text = owned_zy_text,
                 .zig_uri = zig_uri,
                 .zig_text = empty_zig,
-                .code_map = .{},
+                .code_map = .empty,
                 .generation_error = generation_error,
                 .grammar_diagnostics = &.{},
                 .zls_diagnostics = &.{},
@@ -154,7 +157,7 @@ const Middleware = struct {
         var zig_text: []u8 = undefined;
         var zig_text_needs_free = false;
         errdefer if (zig_text_needs_free) middleware.allocator.free(zig_text);
-        var code_map: CodeMap = .{};
+        var code_map: CodeMap = .empty;
         var code_map_needs_deinit = true;
         errdefer if (code_map_needs_deinit) code_map.deinit(middleware.allocator);
 
@@ -1913,7 +1916,7 @@ pub const Error =
 const ZlsUpdateFuture = std.Io.Future(Error!void);
 
 const ZigDocument = struct {
-    generation_id: usize = 0,
+    generation_id: usize,
     zy_uri: []u8,
     zy_path: []u8,
     zy_text: []const u8,
@@ -1948,9 +1951,9 @@ const DocumentState = struct {
     opened: bool,
     zls_sync_count: usize,
     zls_synced_generation_id: ?usize,
-    semantic_tokens_current: ?SemanticTokenCollection = null,
-    semantic_tokens: std.ArrayListUnmanaged(SemanticTokensSnapshot) = .empty,
-    next_semantic_tokens_result_id: usize = 1,
+    semantic_tokens_current: ?SemanticTokenCollection,
+    semantic_tokens: std.ArrayListUnmanaged(SemanticTokensSnapshot),
+    next_semantic_tokens_result_id: usize,
 
     fn currentGeneration(state: *DocumentState) ?*ZigDocument {
         return &(state.current orelse return null);
@@ -2083,6 +2086,8 @@ fn initImpl(
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
         .zls_library = zls_library,
         .zls_completion_triggers = zls_completion_triggers,
         .next_generation_id = 1,
@@ -2533,18 +2538,26 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
 
 /// Mapping between original Zitron code blocks and translated Zig code.
 pub const CodeMap = struct {
+    pub const empty: CodeMap = .{
+        .zig_span = .empty,
+        .zy_range = .empty,
+        .fast_column_mapping = .empty,
+        .zy_order = .empty,
+        .translators = .empty,
+    };
+
     /// Zig spans are stored in Zig-line order, which is the order encountered
     /// while scanning the translated Zig file.
-    zig_span: std.ArrayList(ZigSpan) = .empty,
+    zig_span: std.ArrayList(ZigSpan),
     /// Zy ranges for the zig spans.  Indexes are kept in lockstep with
     /// `zig_span`, but the range retains exact tree-sitter byte and point data.
-    zy_range: std.ArrayList(ts.Range) = .empty,
+    zy_range: std.ArrayList(ts.Range),
     /// Whether a span came from a direct `%code`/`%include` shortcut.
-    fast_column_mapping: std.ArrayList(bool) = .empty,
+    fast_column_mapping: std.ArrayList(bool),
     /// Indexes into `zig_span` and `zy_range`, sorted by zy-line order for zy -> zig
     /// lookups. The buffer is retained across updates.
-    zy_order: std.ArrayList(usize) = .empty,
-    translators: SpanTranslators = .{},
+    zy_order: std.ArrayList(usize),
+    translators: SpanTranslators,
 
     /// Half-open byte range in either the zy or zig text.
     pub const ByteRange = struct {
@@ -2570,7 +2583,7 @@ pub const CodeMap = struct {
         /// First zero-based line in the translated Zig document.
         zig_line: u32,
         /// First zero-based character in the translated Zig document.
-        zig_column: u32 = 0,
+        zig_column: u32,
         /// Number of contiguous mapped lines shared by both coordinate systems.
         line_count: u32,
         /// Half-open byte range in the translated Zig document.
@@ -2649,7 +2662,7 @@ pub const CodeMap = struct {
         map.fast_column_mapping.deinit(allocator);
         map.zy_order.deinit(allocator);
         map.translators.deinit(allocator);
-        map.* = .{};
+        map.* = .empty;
     }
 
     /// Translates a zy position to zig coordinates by finding the
@@ -3399,7 +3412,9 @@ const SpanTranslator = struct {
 };
 
 const SpanTranslators = struct {
-    slots: std.ArrayList(SpanTranslator) = .empty,
+    const empty: SpanTranslators = .{ .slots = .empty };
+
+    slots: std.ArrayList(SpanTranslator),
 
     fn get(
         cache: *SpanTranslators,
@@ -3457,7 +3472,7 @@ const SpanTranslators = struct {
     fn deinit(cache: *SpanTranslators, allocator: std.mem.Allocator) void {
         cache.reset(allocator);
         cache.slots.deinit(allocator);
-        cache.* = .{};
+        cache.* = .empty;
     }
 
     fn len(cache: *const SpanTranslators) usize {
@@ -3476,7 +3491,7 @@ const SpanTranslators = struct {
 const RequestTranslationContext = struct {
     allocator: std.mem.Allocator,
     map: *CodeMap,
-    document_version: i32 = 0,
+    document_version: i32,
     zy_text: []const u8,
     zig_text: []const u8,
     active_span_index: ?usize,
@@ -3563,7 +3578,7 @@ const RequestTranslationContext = struct {
 
 const ZigPositionCursor = struct {
     context: *RequestTranslationContext,
-    span_index: ?usize = null,
+    span_index: ?usize,
 
     fn zigPositionToZy(cursor: *ZigPositionCursor, position: types.Position) OOM!?types.Position {
         const translator = try cursor.translatorForPosition(position) orelse return null;
@@ -4396,7 +4411,7 @@ fn translateDocumentHighlights(
     map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentHighlight {
     var translated: std.ArrayList(types.DocumentHighlight) = .empty;
-    var position_cursor = ZigPositionCursor{ .context = map };
+    var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
     for (highlights) |highlight| {
         if (try translateDocumentHighlight(highlight, &position_cursor)) |mapped| {
             try translated.append(arena, mapped);
@@ -4447,7 +4462,7 @@ pub fn translateInlayHints(
     zy_uri: []const u8,
 ) OOM![]const types.InlayHint {
     var translated: std.ArrayList(types.InlayHint) = .empty;
-    var position_cursor = ZigPositionCursor{ .context = map };
+    var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
     for (hints) |hint| {
         if (try translateInlayHint(arena, hint, map, &position_cursor, zig_uri, zy_uri)) |mapped| {
             try translated.append(arena, mapped);
@@ -4462,13 +4477,13 @@ fn translateSemanticTokenData(
     map: *RequestTranslationContext,
 ) Error![]const u32 {
     const token_ranges = try arena.alloc(SemanticTokenRange, map.map.zig_span.items.len);
-    @memset(token_ranges, .{});
+    @memset(token_ranges, .empty);
     const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
 
     var line: u32 = 0;
     var character: u32 = 0;
     var write_index: usize = 0;
-    var position_cursor = ZigPositionCursor{ .context = map };
+    var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
 
     var index: usize = 0;
     while (index + 4 < data.len) : (index += 5) {
@@ -4526,7 +4541,7 @@ fn translateSemanticTokenRangeData(
 ) Error![]const u32 {
     const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
     defer arena.free(span_mappings);
-    var position_cursor = ZigPositionCursor{ .context = map };
+    var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
     var translated: std.ArrayList(AbsoluteSemanticToken) = .empty;
     defer translated.deinit(arena);
 
@@ -4601,7 +4616,7 @@ fn translateSemanticTokenRangeDataFiltered(
 
     const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
     defer arena.free(span_mappings);
-    var position_cursor = ZigPositionCursor{ .context = map };
+    var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
     var translated: std.ArrayList(AbsoluteSemanticToken) = .empty;
     defer translated.deinit(arena);
 
@@ -4744,9 +4759,15 @@ fn rangeContainsRange(outer: types.Range, inner: types.Range) bool {
 }
 
 const SemanticTokenRange = struct {
-    start: usize = 0,
-    end: usize = 0,
-    seen: bool = false,
+    start: usize,
+    end: usize,
+    seen: bool,
+
+    const empty: SemanticTokenRange = .{
+        .start = 0,
+        .end = 0,
+        .seen = false,
+    };
 
     fn len(range: SemanticTokenRange) usize {
         return range.end - range.start;
@@ -5179,7 +5200,7 @@ pub fn translateDocumentSymbols(
 ) OOM!?[]const types.DocumentSymbol {
     return switch (result) {
         .document_symbols => |symbols| {
-            var position_cursor = ZigPositionCursor{ .context = map };
+            var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
             return translateDocumentSymbolSlice(arena, symbols, &position_cursor);
         },
         .symbol_informations => null,
@@ -5670,7 +5691,7 @@ fn parseCodeMapForTest(zy_text: []const u8, zig_text: []const u8, zy_path: []con
     const zig = try testing_allocator.dupe(u8, zig_text);
     defer testing_allocator.free(zig);
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     errdefer map.deinit(testing_allocator);
     try map.update(testing_allocator, tree.rootNode(), effective_zy, zig, zy_path);
     return map;
@@ -5718,6 +5739,9 @@ fn makeTestDocumentState(
         .opened = false,
         .zls_sync_count = 0,
         .zls_synced_generation_id = null,
+        .semantic_tokens_current = null,
+        .semantic_tokens = .empty,
+        .next_semantic_tokens_result_id = 1,
     };
 }
 
@@ -5836,7 +5860,7 @@ test "code map extraction preserves line directive text" {
     defer testing_allocator.free(extracted);
     const tree = try parseZitronTreeForTest(zy);
     defer tree.destroy();
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
 
     try map.update(testing_allocator, tree.rootNode(), zy, extracted, "zy.zy");
@@ -6038,6 +6062,7 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -6074,11 +6099,12 @@ test "directive shortcut fast mapping clamps ranges before line directive span" 
     ;
     const zig = "const answer = 42;";
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 1,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig.len },
     });
@@ -6165,6 +6191,9 @@ test "alias code block rename refuses unmapped zy blocks" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -6172,6 +6201,7 @@ test "alias code block rename refuses unmapped zy blocks" {
     errdefer testing_allocator.free(key);
     try middleware.documents.put(testing_allocator, key, .{
         .current = .{
+            .generation_id = 1,
             .zy_uri = try testing_allocator.dupe(u8, uri),
             .zy_path = try testing_allocator.dupe(u8, "zy.zy"),
             .zy_text = try testing_allocator.dupe(u8, zy),
@@ -6191,6 +6221,9 @@ test "alias code block rename refuses unmapped zy blocks" {
         .opened = false,
         .zls_sync_count = 0,
         .zls_synced_generation_id = null,
+        .semantic_tokens_current = null,
+        .semantic_tokens = .empty,
+        .next_semantic_tokens_result_id = 1,
     });
     errdefer {
         const removed = middleware.documents.fetchRemove(uri).?;
@@ -6243,6 +6276,9 @@ test "forward requests return null while generation has errors" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -6255,12 +6291,13 @@ test "forward requests return null while generation has errors" {
             errdefer testing_allocator.free(key);
             try mware.documents.put(testing_allocator, key, .{
                 .current = .{
+                    .generation_id = 1,
                     .zy_uri = try testing_allocator.dupe(u8, uri),
                     .zy_path = try testing_allocator.dupe(u8, "zy.zy"),
                     .zy_text = try testing_allocator.dupe(u8, zy),
                     .zig_uri = try zigUriForZyUri(testing_allocator, uri),
                     .zig_text = try testing_allocator.dupe(u8, ""),
-                    .code_map = .{},
+                    .code_map = .empty,
                     .generation_error = try testing_allocator.dupe(u8, "generation failed"),
                     .grammar_diagnostics = &.{},
                     .zls_diagnostics = &.{},
@@ -6274,6 +6311,9 @@ test "forward requests return null while generation has errors" {
                 .opened = false,
                 .zls_sync_count = 0,
                 .zls_synced_generation_id = null,
+                .semantic_tokens_current = null,
+                .semantic_tokens = .empty,
+                .next_semantic_tokens_result_id = 1,
             });
         },
     }
@@ -6394,6 +6434,7 @@ test "ZLS diagnostics translate to zy ranges and default zy" {
     var map = try parseCodeMapForTest(zy, zig, "zy.zy");
     errdefer map.deinit(testing_allocator);
     var doc: ZigDocument = .{
+        .generation_id = 1,
         .zy_uri = try testing_allocator.dupe(u8, "file:///zy.zy"),
         .zy_path = try testing_allocator.dupe(u8, "zy.zy"),
         .zy_text = try testing_allocator.dupe(u8, zy),
@@ -6473,6 +6514,9 @@ test "document state does not publish stale generation" {
         .opened = false,
         .zls_sync_count = 0,
         .zls_synced_generation_id = null,
+        .semantic_tokens_current = null,
+        .semantic_tokens = .empty,
+        .next_semantic_tokens_result_id = 1,
     };
     defer state.deinit(testing_allocator);
 
@@ -6492,6 +6536,9 @@ test "ZLS diagnostics for stale generation do not replace current diagnostics" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -6549,6 +6596,9 @@ test "ZLS diagnostics with null version publish after repeated current syncs" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -6708,6 +6758,7 @@ test "request span translator maps zig alias boundary points" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = map.zySpanIndexForPosition(zy_position) orelse return error.UnexpectedCodeMap,
@@ -6889,6 +6940,7 @@ test "request translation context maps reference ranges in other spans" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = map.zySpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
@@ -6939,6 +6991,7 @@ test "request translation context maps document highlight ranges" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = map.zySpanIndexForPosition(active_position) orelse return error.UnexpectedCodeMap,
@@ -6989,6 +7042,7 @@ test "request translation context rejects zy positions before active zy range" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = map.zySpanIndexForPosition(grammar_position) orelse return error.UnexpectedCodeMap,
@@ -7001,11 +7055,12 @@ test "request translation context rejects zy positions before active zy range" {
 test "request span translator handles one leading newline edit" {
     const zy = "\nconst answer = 42;";
     const zig = "const answer = 42;";
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig.len },
     });
@@ -7232,11 +7287,12 @@ test "translates inlay hints on first block line with zy column skew" {
     const zy = prefix ++ "const answer = 42;";
     const zig = "const answer = 42;";
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig.len },
     });
@@ -7251,6 +7307,7 @@ test "translates inlay hints on first block line with zy column skew" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -7283,11 +7340,12 @@ test "zig position cursor translates zig ranges" {
     const zy = prefix ++ "const answer = 42;";
     const zig = "const answer = 42;";
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig.len },
     });
@@ -7302,13 +7360,14 @@ test "zig position cursor translates zig ranges" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
     };
     defer context.deinit();
 
-    var cursor = ZigPositionCursor{ .context = &context };
+    var cursor = ZigPositionCursor{ .context = &context, .span_index = null };
     try expectEqual(types.Range{
         .start = .{ .line = 0, .character = 13 },
         .end = .{ .line = 0, .character = 19 },
@@ -7333,17 +7392,19 @@ test "span translators keep independent diff cursors" {
     const zy = zy_line0 ++ "\n" ++ zy_line1;
     const zig = zig_line0 ++ "\n" ++ zig_line1;
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig_line0.len },
     });
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 1,
         .zig_line = 1,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = zig_line0.len + 1, .end = zig.len },
     });
@@ -7366,13 +7427,14 @@ test "span translators keep independent diff cursors" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
     };
     defer context.deinit();
 
-    var cursor = ZigPositionCursor{ .context = &context };
+    var cursor = ZigPositionCursor{ .context = &context, .span_index = null };
     try expectEqual(types.Range{
         .start = .{ .line = 0, .character = 4 },
         .end = .{ .line = 0, .character = 7 },
@@ -7773,12 +7835,13 @@ fn semanticFilterLineTextForTest(allocator: std.mem.Allocator, line_count: usize
 }
 
 fn identitySemanticFilterMapForTest(allocator: std.mem.Allocator, text: []const u8, line_count: usize) !CodeMap {
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     errdefer map.deinit(allocator);
 
     try map.zig_span.append(allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = @intCast(line_count),
         .zig_range = .{ .start = 0, .end = text.len },
     });
@@ -8008,6 +8071,9 @@ test "semantic token full delta returns empty edit when zig is unchanged" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -8076,6 +8142,9 @@ test "semantic token requests serve fresh current collection without zls" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -8172,6 +8241,9 @@ test "stale semantic token current updates without zls when zig is unchanged" {
         .diagnostics_publisher = null,
         .documents_mutex = .init,
         .documents = .empty,
+        .zls_mutex = .init,
+        .pending_zls_updates = .empty,
+        .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
     };
@@ -8227,6 +8299,7 @@ test "translates semantic tokens and drops zig-only spans" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -8264,11 +8337,12 @@ test "semantic token inline action spans use column-aware slow path" {
     const zy_len: u32 = @intCast(zy.len);
     const answer_zy_column: u32 = @intCast(prefix.len + 6);
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig_len },
     });
@@ -8299,6 +8373,7 @@ test "semantic token inline action spans use column-aware slow path" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -8329,11 +8404,12 @@ test "semantic token slow path drops partial source-token matches and reencodes 
     const p2_zy_column: u32 = @intCast(std.mem.indexOf(u8, zy, "P2").?);
     const p2_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "P2").?);
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig.len },
     });
@@ -8348,13 +8424,14 @@ test "semantic token slow path drops partial source-token matches and reencodes 
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
     };
     defer context.deinit();
 
-    var position_cursor = ZigPositionCursor{ .context = &context };
+    var position_cursor = ZigPositionCursor{ .context = &context, .span_index = null };
     try std.testing.expect(try position_cursor.zigRangeToZy(.{
         .start = .{ .line = 0, .character = one_zig_column },
         .end = .{ .line = 0, .character = one_zig_column + 1 },
@@ -8395,11 +8472,12 @@ test "translates semantic tokens in zy span order" {
     const zy_second_start = std.mem.indexOf(u8, zy, "const second").?;
     const zig_first_line_end = std.mem.indexOfScalar(u8, zig, '\n').?;
 
-    var map: CodeMap = .{};
+    var map: CodeMap = .empty;
     defer map.deinit(testing_allocator);
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 2,
         .zig_line = 0,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = 0, .end = zig_first_line_end },
     });
@@ -8413,6 +8491,7 @@ test "translates semantic tokens in zy span order" {
     try map.zig_span.append(testing_allocator, .{
         .zy_line = 0,
         .zig_line = 1,
+        .zig_column = 0,
         .line_count = 1,
         .zig_range = .{ .start = zig_first_line_end + 1, .end = zig.len },
     });
@@ -8427,6 +8506,7 @@ test "translates semantic tokens in zy span order" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -8474,6 +8554,7 @@ test "translates inlay hints with one cached diff per touched block" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,
@@ -8761,6 +8842,7 @@ test "translates document symbols and drops zig yy symbols" {
     var context = RequestTranslationContext{
         .allocator = testing_allocator,
         .map = &map,
+        .document_version = 0,
         .zy_text = zy,
         .zig_text = zig,
         .active_span_index = null,

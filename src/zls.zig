@@ -272,8 +272,8 @@ fn capturedMessagesContain(messages: []const []const u8, needle: []const u8) boo
 const CaptureTransport = struct {
     transport: lsp.Transport,
     allocator: std.mem.Allocator,
-    mutex: std.Io.Mutex = .init,
-    messages: std.ArrayListUnmanaged([]u8) = .empty,
+    mutex: std.Io.Mutex,
+    messages: std.ArrayListUnmanaged([]u8),
 
     fn init(allocator: std.mem.Allocator) CaptureTransport {
         return .{
@@ -282,6 +282,8 @@ const CaptureTransport = struct {
                 .writeJsonMessage = CaptureTransport.writeJsonMessage,
             } },
             .allocator = allocator,
+            .mutex = .init,
+            .messages = .empty,
         };
     }
 
