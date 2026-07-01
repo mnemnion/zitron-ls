@@ -2969,26 +2969,47 @@ pub const CodeMap = struct {
 const SpanTranslator = struct {
     zig_span: CodeMap.ZigSpan,
     zy_range: ts.Range,
-    document_version: i32 = std.math.minInt(i32),
-    zy_text: []u8 = &.{},
-    zig_text: []u8 = &.{},
-    difference: ?Diff = null,
+    document_version: i32,
+    zy_text: []u8,
+    zig_text: []u8,
+    difference: ?Diff,
+    zy_to_zig_cursor: DiffCursor,
+    zig_to_zy_cursor: DiffCursor,
 
     const OffsetTranslation = union(enum) {
         shared: usize,
         mutant: CodeMap.Mutation,
     };
 
+    const DiffCursor = struct {
+        const init: DiffCursor = .{
+            .edit_index = 0,
+            .zy_cursor = 0,
+            .zig_cursor = 0,
+        };
+
+        edit_index: usize,
+        zy_cursor: usize,
+        zig_cursor: usize,
+    };
+
     fn init(zig_span: CodeMap.ZigSpan, zy_range: ts.Range) SpanTranslator {
         return .{
             .zig_span = zig_span,
             .zy_range = zy_range,
+            .document_version = std.math.minInt(i32),
+            .zy_text = &.{},
+            .zig_text = &.{},
+            .difference = null,
+            .zy_to_zig_cursor = .init,
+            .zig_to_zy_cursor = .init,
         };
     }
 
     fn updateSpan(translator: *SpanTranslator, zig_span: CodeMap.ZigSpan, zy_range: ts.Range) void {
         translator.zig_span = zig_span;
         translator.zy_range = zy_range;
+        translator.resetCursors();
     }
 
     fn deinit(translator: *SpanTranslator, allocator: std.mem.Allocator) void {
@@ -3026,6 +3047,12 @@ const SpanTranslator = struct {
         _ = try difference.diff(allocator, translator.zy_text, translator.zig_text);
         translator.difference = difference;
         translator.document_version = current_version;
+        translator.resetCursors();
+    }
+
+    fn resetCursors(translator: *SpanTranslator) void {
+        translator.zy_to_zig_cursor = .init;
+        translator.zig_to_zy_cursor = .init;
     }
 
     fn replaceText(
@@ -3048,7 +3075,7 @@ const SpanTranslator = struct {
         return zig_doc[translator.zig_span.zig_range.start..translator.zig_span.zig_range.end];
     }
 
-    fn zyPositionToZig(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
+    fn zyPositionToZig(translator: *SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
         const rel = translator.zyIndexForPosition(position);
         return switch (translator.zyOffsetToZig(rel)) {
             .shared => |zig_rel| .{ .shared = translator.zigPositionForRel(zig_rel) },
@@ -3056,7 +3083,7 @@ const SpanTranslator = struct {
         };
     }
 
-    fn zigPositionToZy(translator: *const SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
+    fn zigPositionToZy(translator: *SpanTranslator, position: types.Position) CodeMap.TranslatedPosition {
         const rel = translator.zigIndexForPosition(position);
         return switch (translator.zigOffsetToZy(rel)) {
             .shared => |zy_rel| .{ .shared = translator.zyPositionForRel(zy_rel) },
@@ -3064,7 +3091,7 @@ const SpanTranslator = struct {
         };
     }
 
-    fn zigRangeToZy(translator: *const SpanTranslator, range: types.Range) ?types.Range {
+    fn zigRangeToZy(translator: *SpanTranslator, range: types.Range) ?types.Range {
         if (!translator.containsZigPosition(range.start, false) or
             !translator.containsZigPosition(range.end, true))
         {
@@ -3096,32 +3123,25 @@ const SpanTranslator = struct {
         return true;
     }
 
-    fn zyOffsetToZig(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
-        return zyOffsetThroughDiff(translator, rel, translator.diffEdits());
-    }
+    fn zyOffsetToZig(translator: *SpanTranslator, rel: usize) OffsetTranslation {
+        if (rel < translator.zy_to_zig_cursor.zy_cursor) {
+            translator.zy_to_zig_cursor = .init;
+        }
 
-    fn zigOffsetToZy(translator: *const SpanTranslator, rel: usize) OffsetTranslation {
-        return zigOffsetThroughDiff(translator, rel, translator.diffEdits());
-    }
-
-    fn zigIntervalShared(translator: *const SpanTranslator, start: usize, end: usize) bool {
-        if (start == end) return translator.zigOffsetToZy(start) == .shared;
-        return zigDiffIntervalShared(start, end, translator.diffEdits());
-    }
-
-    fn diffEdits(translator: *const SpanTranslator) []const Edit {
-        return translator.difference.?.edits.items;
-    }
-
-    fn zyOffsetThroughDiff(translator: *const SpanTranslator, rel: usize, edits: []const Edit) OffsetTranslation {
-        var zy_cursor: usize = 0;
-        var zig_cursor: usize = 0;
-        var index: usize = 0;
+        const edits = translator.diffEdits();
+        var zy_cursor = translator.zy_to_zig_cursor.zy_cursor;
+        var zig_cursor = translator.zy_to_zig_cursor.zig_cursor;
+        var index = translator.zy_to_zig_cursor.edit_index;
         while (index < edits.len) {
             const edit = edits[index];
             switch (edit.operation) {
                 .equal => {
                     const zy_end = zy_cursor + edit.text.len;
+                    translator.zy_to_zig_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
                     if (rel < zy_end or (rel == zy_end and zy_end == translator.zyLength())) {
                         return .{ .shared = zig_cursor + (rel - zy_cursor) };
                     }
@@ -3132,6 +3152,7 @@ const SpanTranslator = struct {
                 .delete, .insert => {
                     const mutation_start_zy = zy_cursor;
                     const mutation_start_zig = zig_cursor;
+                    const mutation_start_index = index;
                     while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
                         switch (edits[index].operation) {
                             .delete => zy_cursor += edits[index].text.len,
@@ -3139,6 +3160,11 @@ const SpanTranslator = struct {
                             .equal => unreachable,
                         }
                     }
+                    translator.zy_to_zig_cursor = .{
+                        .edit_index = mutation_start_index,
+                        .zy_cursor = mutation_start_zy,
+                        .zig_cursor = mutation_start_zig,
+                    };
                     if (rel == mutation_start_zy) {
                         return .{ .shared = if (zy_cursor == mutation_start_zy)
                             zig_cursor
@@ -3153,6 +3179,11 @@ const SpanTranslator = struct {
                             zig_cursor,
                         ) };
                     }
+                    translator.zy_to_zig_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
                 },
             }
         }
@@ -3160,15 +3191,25 @@ const SpanTranslator = struct {
         return .{ .mutant = translator.zyMutation(0, translator.zyLength(), 0, translator.zigLength()) };
     }
 
-    fn zigOffsetThroughDiff(translator: *const SpanTranslator, rel: usize, edits: []const Edit) OffsetTranslation {
-        var zy_cursor: usize = 0;
-        var zig_cursor: usize = 0;
-        var index: usize = 0;
+    fn zigOffsetToZy(translator: *SpanTranslator, rel: usize) OffsetTranslation {
+        if (rel < translator.zig_to_zy_cursor.zig_cursor) {
+            translator.zig_to_zy_cursor = .init;
+        }
+
+        const edits = translator.diffEdits();
+        var zy_cursor = translator.zig_to_zy_cursor.zy_cursor;
+        var zig_cursor = translator.zig_to_zy_cursor.zig_cursor;
+        var index = translator.zig_to_zy_cursor.edit_index;
         while (index < edits.len) {
             const edit = edits[index];
             switch (edit.operation) {
                 .equal => {
                     const zig_end = zig_cursor + edit.text.len;
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
                     if (rel < zig_end or (rel == zig_end and zig_end == translator.zigLength())) {
                         return .{ .shared = zy_cursor + (rel - zig_cursor) };
                     }
@@ -3179,6 +3220,7 @@ const SpanTranslator = struct {
                 .delete, .insert => {
                     const mutation_start_zy = zy_cursor;
                     const mutation_start_zig = zig_cursor;
+                    const mutation_start_index = index;
                     while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
                         switch (edits[index].operation) {
                             .delete => zy_cursor += edits[index].text.len,
@@ -3186,6 +3228,11 @@ const SpanTranslator = struct {
                             .equal => unreachable,
                         }
                     }
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = mutation_start_index,
+                        .zy_cursor = mutation_start_zy,
+                        .zig_cursor = mutation_start_zig,
+                    };
                     if (rel == mutation_start_zig) {
                         return .{ .shared = if (zig_cursor == mutation_start_zig)
                             zy_cursor
@@ -3200,11 +3247,79 @@ const SpanTranslator = struct {
                             zig_cursor,
                         ) };
                     }
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
                 },
             }
         }
         if (rel == zig_cursor) return .{ .shared = zy_cursor };
         return .{ .mutant = translator.zyMutation(0, translator.zyLength(), 0, translator.zigLength()) };
+    }
+
+    fn zigIntervalShared(translator: *SpanTranslator, start: usize, end: usize) bool {
+        if (start == end) return translator.zigOffsetToZy(start) == .shared;
+        if (end < start) return false;
+        if (start < translator.zig_to_zy_cursor.zig_cursor) {
+            translator.zig_to_zy_cursor = .init;
+        }
+
+        const edits = translator.diffEdits();
+        var zy_cursor = translator.zig_to_zy_cursor.zy_cursor;
+        var zig_cursor = translator.zig_to_zy_cursor.zig_cursor;
+        var index = translator.zig_to_zy_cursor.edit_index;
+        while (index < edits.len) {
+            const edit = edits[index];
+            switch (edit.operation) {
+                .equal => {
+                    const equal_start = zig_cursor;
+                    const equal_end = equal_start + edit.text.len;
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
+                    if (equal_start <= start and start < equal_end and end <= equal_end) {
+                        if (start == equal_start and end == equal_end) return false;
+                        return true;
+                    }
+                    zy_cursor += edit.text.len;
+                    zig_cursor = equal_end;
+                    index += 1;
+                },
+                .delete, .insert => {
+                    const mutation_start_zy = zy_cursor;
+                    const mutation_start_zig = zig_cursor;
+                    const mutation_start_index = index;
+                    while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
+                        switch (edits[index].operation) {
+                            .delete => zy_cursor += edits[index].text.len,
+                            .insert => zig_cursor += edits[index].text.len,
+                            .equal => unreachable,
+                        }
+                    }
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = mutation_start_index,
+                        .zy_cursor = mutation_start_zy,
+                        .zig_cursor = mutation_start_zig,
+                    };
+                    if (start < zig_cursor and end > mutation_start_zig) return false;
+                    translator.zig_to_zy_cursor = .{
+                        .edit_index = index,
+                        .zy_cursor = zy_cursor,
+                        .zig_cursor = zig_cursor,
+                    };
+                },
+            }
+        }
+
+        return false;
+    }
+
+    fn diffEdits(translator: *const SpanTranslator) []const Edit {
+        return translator.difference.?.edits.items;
     }
 
     fn zyMutation(
@@ -3449,22 +3564,11 @@ const RequestTranslationContext = struct {
 const ZigPositionCursor = struct {
     context: *RequestTranslationContext,
     span_index: ?usize = null,
-    zig_line: u32 = 0,
-    zig_line_start: usize = 0,
-    zy_line: u32 = 0,
-    zy_line_start: usize = 0,
-    diff: DiffCursor = .{},
-
-    const DiffCursor = struct {
-        edit_index: usize = 0,
-        zy_cursor: usize = 0,
-        zig_cursor: usize = 0,
-    };
 
     fn zigPositionToZy(cursor: *ZigPositionCursor, position: types.Position) OOM!?types.Position {
         const translator = try cursor.translatorForPosition(position) orelse return null;
         const rel = cursor.zigIndexForPosition(translator, position) orelse return null;
-        const translated = cursor.zigOffsetToZy(translator, rel);
+        const translated = translator.zigOffsetToZy(rel);
         const zy_rel = switch (translated) {
             .shared => |zy_rel| zy_rel,
             .mutant => return null,
@@ -3484,11 +3588,11 @@ const ZigPositionCursor = struct {
         const rel_end = cursor.zigIndexForPosition(translator, range.end) orelse return null;
         if (rel_end < rel_start or !translator.zigIntervalShared(rel_start, rel_end)) return null;
 
-        const start_rel = switch (cursor.zigOffsetToZy(translator, rel_start)) {
+        const start_rel = switch (translator.zigOffsetToZy(rel_start)) {
             .shared => |zy_rel| zy_rel,
             .mutant => return null,
         };
-        const end_rel = switch (cursor.zigOffsetToZy(translator, rel_end)) {
+        const end_rel = switch (translator.zigOffsetToZy(rel_end)) {
             .shared => |zy_rel| zy_rel,
             .mutant => return null,
         };
@@ -3526,13 +3630,8 @@ const ZigPositionCursor = struct {
     }
 
     fn resetToSpan(cursor: *ZigPositionCursor, span_index: usize) OOM!void {
-        const translator = try cursor.context.translatorForSpanIndex(span_index);
+        _ = try cursor.context.translatorForSpanIndex(span_index);
         cursor.span_index = span_index;
-        cursor.zig_line = translator.zig_span.zig_line;
-        cursor.zig_line_start = 0;
-        cursor.zy_line = translator.zy_range.start_point.row;
-        cursor.zy_line_start = 0;
-        cursor.diff = .{};
     }
 
     fn zigIndexForPosition(
@@ -3553,74 +3652,6 @@ const ZigPositionCursor = struct {
     ) types.Position {
         _ = cursor;
         return translator.zyPositionForRel(zy_rel);
-    }
-
-    fn zigOffsetToZy(cursor: *ZigPositionCursor, translator: *const SpanTranslator, rel: usize) SpanTranslator.OffsetTranslation {
-        if (rel < cursor.diff.zig_cursor) {
-            cursor.diff = .{};
-        }
-
-        const edits = translator.diffEdits();
-        var zy_cursor = cursor.diff.zy_cursor;
-        var zig_cursor = cursor.diff.zig_cursor;
-        var index = cursor.diff.edit_index;
-        while (index < edits.len) {
-            const edit = edits[index];
-            switch (edit.operation) {
-                .equal => {
-                    const zig_end = zig_cursor + edit.text.len;
-                    cursor.diff = .{
-                        .edit_index = index,
-                        .zy_cursor = zy_cursor,
-                        .zig_cursor = zig_cursor,
-                    };
-                    if (rel < zig_end or (rel == zig_end and zig_end == translator.zigLength())) {
-                        return .{ .shared = zy_cursor + (rel - zig_cursor) };
-                    }
-                    zy_cursor += edit.text.len;
-                    zig_cursor = zig_end;
-                    index += 1;
-                },
-                .delete, .insert => {
-                    const mutation_start_zy = zy_cursor;
-                    const mutation_start_zig = zig_cursor;
-                    const mutation_start_index = index;
-                    while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
-                        switch (edits[index].operation) {
-                            .delete => zy_cursor += edits[index].text.len,
-                            .insert => zig_cursor += edits[index].text.len,
-                            .equal => unreachable,
-                        }
-                    }
-                    cursor.diff = .{
-                        .edit_index = mutation_start_index,
-                        .zy_cursor = mutation_start_zy,
-                        .zig_cursor = mutation_start_zig,
-                    };
-                    if (rel == mutation_start_zig) {
-                        return .{ .shared = if (zig_cursor == mutation_start_zig)
-                            zy_cursor
-                        else
-                            mutation_start_zy };
-                    }
-                    if (mutation_start_zig < rel and rel < zig_cursor) {
-                        return .{ .mutant = translator.zyMutation(
-                            mutation_start_zy,
-                            zy_cursor,
-                            mutation_start_zig,
-                            zig_cursor,
-                        ) };
-                    }
-                    cursor.diff = .{
-                        .edit_index = index,
-                        .zy_cursor = zy_cursor,
-                        .zig_cursor = zig_cursor,
-                    };
-                },
-            }
-        }
-        if (rel == zig_cursor) return .{ .shared = zy_cursor };
-        return .{ .mutant = translator.zyMutation(0, translator.zyLength(), 0, translator.zigLength()) };
     }
 
     fn spanContainsZigPosition(span: CodeMap.ZigSpan, position: types.Position) bool {
@@ -3691,32 +3722,6 @@ fn workspaceEditCount(edit: types.WorkspaceEdit) usize {
         }
     }
     return count;
-}
-
-fn zigDiffIntervalShared(start: usize, end: usize, edits: []const Edit) bool {
-    if (end < start) return false;
-
-    var zig_cursor: usize = 0;
-    for (edits) |edit| {
-        switch (edit.operation) {
-            .equal => {
-                const equal_start = zig_cursor;
-                const equal_end = equal_start + edit.text.len;
-                if (start == end and equal_start <= start and start <= equal_end) return true;
-                if (equal_start <= start and start < equal_end and end <= equal_end) {
-                    if (start == equal_start and end == equal_end) return false;
-                    return true;
-                }
-                zig_cursor = equal_end;
-            },
-            .insert => {
-                zig_cursor += edit.text.len;
-            },
-            .delete => {},
-        }
-    }
-
-    return false;
 }
 
 fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
@@ -3904,17 +3909,31 @@ fn zyRangeToSortedZigRanges(
     };
     defer translation_context.deinit();
 
-    var ranges: std.ArrayList(types.Range) = .empty;
-    errdefer ranges.deinit(allocator);
+    const dirty_spans = try allocator.alloc(bool, code_map.zig_span.items.len);
+    defer allocator.free(dirty_spans);
+    @memset(dirty_spans, false);
 
     var zy_order_index = code_map.firstZyIndexPossiblyIntersecting(zy_range);
     while (zy_order_index < code_map.zy_order.items.len) : (zy_order_index += 1) {
         const span_index = code_map.zy_order.items[zy_order_index];
         const span_zy_range = zyRangeFromTsRange(code_map.zy_range.items[span_index]);
         if (!positionLessThan(span_zy_range.start, zy_range.end)) break;
+        if (rangeIntersection(zy_range, span_zy_range) != null) {
+            dirty_spans[span_index] = true;
+        }
+    }
 
+    var ranges: std.ArrayList(types.Range) = .empty;
+    errdefer ranges.deinit(allocator);
+
+    for (dirty_spans, 0..) |dirty_span, span_index| {
+        if (!dirty_span) continue;
+        const span_zy_range = zyRangeFromTsRange(code_map.zy_range.items[span_index]);
         const request_range = rangeIntersection(zy_range, span_zy_range) orelse continue;
-        const zig_range = if (code_map.fast_column_mapping.items[span_index])
+        const span = code_map.zig_span.items[span_index];
+        const zig_range = if (rangeContainsRange(zy_range, span_zy_range))
+            rangeFromByteRange(zig_text, span.zig_range.start, span.zig_range.end)
+        else if (code_map.fast_column_mapping.items[span_index])
             types.Range{
                 .start = code_map.zyPositionToZigInSpanFromText(span_index, zy_text, request_range.start),
                 .end = code_map.zyPositionToZigInSpanFromText(span_index, zy_text, request_range.end),
@@ -3929,8 +3948,6 @@ fn zyRangeToSortedZigRanges(
     }
 
     if (ranges.items.len == 0) return try ranges.toOwnedSlice(allocator);
-
-    std.mem.sort(types.Range, ranges.items, {}, rangeLessThan);
 
     var coalesced_len: usize = 0;
     for (ranges.items) |range| {
@@ -7306,6 +7323,107 @@ test "zig position cursor translates zig ranges" {
         .start = .{ .line = 0, .character = 15 },
         .end = .{ .line = 0, .character = 17 },
     })) orelse return error.UnexpectedCodeMap);
+}
+
+test "span translators keep independent diff cursors" {
+    const zy_line0 = "aaa bbb ccc";
+    const zy_line1 = "mmm nnn ooo";
+    const zig_line0 = "aaa XX bbb ccc";
+    const zig_line1 = "mmm YY nnn ooo";
+    const zy = zy_line0 ++ "\n" ++ zy_line1;
+    const zig = zig_line0 ++ "\n" ++ zig_line1;
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.zig_span.append(testing_allocator, .{
+        .zy_line = 0,
+        .zig_line = 0,
+        .line_count = 1,
+        .zig_range = .{ .start = 0, .end = zig_line0.len },
+    });
+    try map.zig_span.append(testing_allocator, .{
+        .zy_line = 1,
+        .zig_line = 1,
+        .line_count = 1,
+        .zig_range = .{ .start = zig_line0.len + 1, .end = zig.len },
+    });
+    try map.zy_range.append(testing_allocator, .{
+        .start_byte = 0,
+        .end_byte = zy_line0.len,
+        .start_point = .{ .row = 0, .column = 0 },
+        .end_point = .{ .row = 0, .column = zy_line0.len },
+    });
+    try map.zy_range.append(testing_allocator, .{
+        .start_byte = zy_line0.len + 1,
+        .end_byte = zy.len,
+        .start_point = .{ .row = 1, .column = 0 },
+        .end_point = .{ .row = 1, .column = zy_line1.len },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.rebuildZyOrder(testing_allocator);
+
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .zy_text = zy,
+        .zig_text = zig,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var cursor = ZigPositionCursor{ .context = &context };
+    try expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 4 },
+        .end = .{ .line = 0, .character = 7 },
+    }, (try cursor.zigRangeToZy(.{
+        .start = .{ .line = 0, .character = 7 },
+        .end = .{ .line = 0, .character = 10 },
+    })) orelse return error.UnexpectedCodeMap);
+    const first_cursor = map.translators.at(0).zig_to_zy_cursor;
+    try std.testing.expect(first_cursor.edit_index > 0);
+
+    try expectEqual(types.Range{
+        .start = .{ .line = 1, .character = 4 },
+        .end = .{ .line = 1, .character = 7 },
+    }, (try cursor.zigRangeToZy(.{
+        .start = .{ .line = 1, .character = 7 },
+        .end = .{ .line = 1, .character = 10 },
+    })) orelse return error.UnexpectedCodeMap);
+    try expectEqual(first_cursor, map.translators.at(0).zig_to_zy_cursor);
+    try std.testing.expect(map.translators.at(1).zig_to_zy_cursor.edit_index > 0);
+}
+
+test "semantic dirty range mapping uses full covered span extents" {
+    const zy =
+        \\first(A) ::= token(T). { A = first(T); }
+        \\second(B) ::= token(T). { B = second(T); }
+    ;
+    const zig =
+        \\// #line 1 zy.zy
+        \\ yygotominor.yy0 = first(yymsp[0].minor.yy42);
+        \\// #line 2 zy.zy
+        \\ yygotominor.yy0 = second(yymsp[0].minor.yy42);
+    ;
+
+    var map = try parseCodeMapForTest(zy, zig, "zy.zy");
+    defer map.deinit(testing_allocator);
+    try expectEqual(map.len(), map.translators.len());
+
+    const ranges = try zyRangeToSortedZigRanges(
+        testing_allocator,
+        &map,
+        1,
+        zy,
+        zig,
+        fullDocumentRange(zy),
+    );
+    defer testing_allocator.free(ranges);
+
+    try expectEqual(@as(usize, 2), ranges.len);
+    try expectEqual(rangeFromByteRange(zig, map.zig_span.items[0].zig_range.start, map.zig_span.items[0].zig_range.end), ranges[0]);
+    try expectEqual(rangeFromByteRange(zig, map.zig_span.items[1].zig_range.start, map.zig_span.items[1].zig_range.end), ranges[1]);
+    try expectEqual(@as(usize, 0), map.translators.freshLen(1));
 }
 
 test "semantic token edits apply to encoded token arrays" {

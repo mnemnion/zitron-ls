@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+DEFAULT_LOG = Path.home() / "Library/Caches/lsp_zitron/lsp_zitron.log"
+
 
 class RpcReader(threading.Thread):
     def __init__(self, proc: subprocess.Popen[bytes], write_lock: threading.Lock, pending_ids: set[int]):
@@ -76,18 +78,47 @@ class RpcReader(threading.Thread):
         with self.state_lock:
             return len(self.pending_ids)
 
+    def expect_response(self, request_id: int) -> None:
+        with self.state_lock:
+            self.pending_ids.add(request_id)
+
+    def completed(self, request_id: int) -> bool:
+        with self.state_lock:
+            return request_id in self.completed_ids
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--actions", type=Path, default=Path("zig-out/replay/latest.jsonl"))
     parser.add_argument("--server", default="zig-out/bin/lsp_zitron")
+    parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--delay-ms", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--no-auto-shutdown", action="store_true")
+    parser.add_argument(
+        "--semantic-update-probe",
+        dest="semantic_update_probe",
+        action="store_true",
+        default=True,
+        help="warm semantic tokens, apply an in-memory full-text edit, and request full tokens twice",
+    )
+    parser.add_argument(
+        "--no-semantic-update-probe",
+        dest="semantic_update_probe",
+        action="store_false",
+        help="replay without the semantic update timing probe",
+    )
+    parser.add_argument(
+        "--semantic-update-max-ms",
+        type=float,
+        default=500.0,
+        help="fail if a probed semantic current update exceeds this elapsed time",
+    )
     args = parser.parse_args()
 
     actions = load_actions(args.actions)
     pending_ids = expected_request_ids(actions, args.no_auto_shutdown)
+    next_probe_id = max(pending_ids | {900000}) + 1
     proc = subprocess.Popen(
         [args.server],
         stdin=subprocess.PIPE,
@@ -99,7 +130,9 @@ def main() -> int:
     reader.start()
 
     stats = {"request": 0, "notification": 0, "comment": 0}
+    documents: dict[str, dict[str, Any]] = {}
     sent_shutdown = False
+    ran_semantic_probe = False
     start = time.monotonic()
     try:
         for action in actions:
@@ -107,6 +140,17 @@ def main() -> int:
             if kind == "comment":
                 stats["comment"] += 1
                 continue
+            if args.semantic_update_probe and not ran_semantic_probe and is_shutdown_action(action):
+                next_probe_id = run_semantic_update_probe(
+                    proc,
+                    write_lock,
+                    reader,
+                    documents,
+                    next_probe_id,
+                    args.timeout,
+                    stats,
+                )
+                ran_semantic_probe = True
             if kind == "request":
                 stats["request"] += 1
                 if action.get("method") == "shutdown":
@@ -125,10 +169,23 @@ def main() -> int:
                     notification_message(action["method"], action.get("params")),
                     write_lock,
                 )
+                record_document_notification(documents, action)
             else:
                 raise ValueError(f"unknown action kind: {kind!r}")
             if args.delay_ms:
                 time.sleep(args.delay_ms / 1000.0)
+
+        if args.semantic_update_probe and not ran_semantic_probe:
+            next_probe_id = run_semantic_update_probe(
+                proc,
+                write_lock,
+                reader,
+                documents,
+                next_probe_id,
+                args.timeout,
+                stats,
+            )
+            ran_semantic_probe = True
 
         if not args.no_auto_shutdown and not sent_shutdown:
             stats["request"] += 1
@@ -165,6 +222,22 @@ def main() -> int:
     if reader.errors:
         print("reader_errors:", *reader.errors, sep="\n", file=sys.stderr)
         return 1
+    if args.semantic_update_probe:
+        probe_result = semantic_update_probe_result(args.log)
+        if not probe_result.rows:
+            print("semantic_update_probe: missing semantic current update log row", file=sys.stderr)
+            return 1
+        print("semantic_update_probe:")
+        for row in probe_result.rows:
+            print(f"  {row}")
+        if probe_result.max_update_ms is not None and probe_result.max_update_ms > args.semantic_update_max_ms:
+            print(
+                "semantic_update_probe: "
+                f"semantic current update took {probe_result.max_update_ms:.3f}ms "
+                f"> max {args.semantic_update_max_ms:.3f}ms",
+                file=sys.stderr,
+            )
+            return 1
     return 0 if reader.pending_count() == 0 and reader.duplicate_responses == 0 else 2
 
 
@@ -185,6 +258,185 @@ def expected_request_ids(actions: list[dict[str, Any]], no_auto_shutdown: bool) 
     if not no_auto_shutdown and not has_shutdown:
         ids.add(900000)
     return ids
+
+
+def is_shutdown_action(action: dict[str, Any]) -> bool:
+    return action.get("kind") == "request" and action.get("method") == "shutdown"
+
+
+def record_document_notification(documents: dict[str, dict[str, Any]], action: dict[str, Any]) -> None:
+    method = action.get("method")
+    params = action.get("params") or {}
+    if method == "textDocument/didOpen":
+        text_document = params.get("textDocument") or {}
+        uri = text_document.get("uri")
+        if isinstance(uri, str):
+            documents[uri] = {
+                "version": int(text_document.get("version") or 1),
+                "text": text_document.get("text") or "",
+            }
+    elif method == "textDocument/didChange":
+        text_document = params.get("textDocument") or {}
+        uri = text_document.get("uri")
+        if not isinstance(uri, str) or uri not in documents:
+            return
+        documents[uri]["version"] = int(text_document.get("version") or documents[uri]["version"])
+        changes = params.get("contentChanges") or []
+        if changes and "text" in changes[-1] and "range" not in changes[-1]:
+            documents[uri]["text"] = changes[-1]["text"]
+
+
+def run_semantic_update_probe(
+    proc: subprocess.Popen[bytes],
+    write_lock: threading.Lock,
+    reader: RpcReader,
+    documents: dict[str, dict[str, Any]],
+    next_id: int,
+    timeout: float,
+    stats: dict[str, int],
+) -> int:
+    if not documents:
+        raise ValueError("semantic update probe needs an opened document")
+    uri, document = next(iter(documents.items()))
+    original_text = document["text"]
+    probe_text = semantic_probe_text(original_text)
+    if probe_text == original_text:
+        raise ValueError(f"semantic update probe could not perturb {uri}")
+
+    warm_id = next_id
+    next_id += 1
+    send_probe_request(proc, write_lock, reader, warm_id, "textDocument/semanticTokens/full", {
+        "textDocument": {"uri": uri},
+    })
+    stats["request"] += 1
+    wait_for_response(reader, warm_id, timeout)
+
+    version = int(document["version"]) + 1
+    write_message(proc.stdin, notification_message("textDocument/didChange", {
+        "textDocument": {"uri": uri, "version": version},
+        "contentChanges": [{
+            "range": full_range(original_text),
+            "rangeLength": len(original_text.encode()),
+            "text": probe_text,
+        }],
+    }), write_lock)
+    stats["notification"] += 1
+    document["version"] = version
+    document["text"] = probe_text
+
+    first_full_id = next_id
+    next_id += 1
+    send_probe_request(proc, write_lock, reader, first_full_id, "textDocument/semanticTokens/full", {
+        "textDocument": {"uri": uri},
+    })
+    stats["request"] += 1
+    wait_for_response(reader, first_full_id, timeout)
+
+    second_full_id = next_id
+    next_id += 1
+    send_probe_request(proc, write_lock, reader, second_full_id, "textDocument/semanticTokens/full", {
+        "textDocument": {"uri": uri},
+    })
+    stats["request"] += 1
+    wait_for_response(reader, second_full_id, timeout)
+
+    print(
+        "semantic_update_probe: "
+        f"uri={uri} warm_id={warm_id} update_full_id={first_full_id} "
+        f"warm_full_id={second_full_id} bytes={len(probe_text)}"
+    )
+    return next_id
+
+
+def semantic_probe_text(text: str) -> str:
+    probe = "\nconst __lsp_zitron_replay_semantic_probe = 0;\n"
+    start = text.find("%include {")
+    if start == -1:
+        return text
+    close = text.find("\n}", start)
+    if close == -1:
+        return text
+    return text[:close] + probe + text[close:]
+
+
+def full_range(text: str) -> dict[str, Any]:
+    lines = text.split("\n")
+    return {
+        "start": {"line": 0, "character": 0},
+        "end": {"line": len(lines) - 1, "character": len(lines[-1])},
+    }
+
+
+def send_probe_request(
+    proc: subprocess.Popen[bytes],
+    write_lock: threading.Lock,
+    reader: RpcReader,
+    request_id: int,
+    method: str,
+    params: Any,
+) -> None:
+    reader.expect_response(request_id)
+    write_message(proc.stdin, request_message(request_id, method, params), write_lock)
+
+
+def wait_for_response(reader: RpcReader, request_id: int, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if reader.completed(request_id):
+            return
+        time.sleep(0.01)
+    raise TimeoutError(f"timed out waiting for replay probe request {request_id}")
+
+
+class SemanticUpdateProbeResult:
+    def __init__(self, rows: list[str], max_update_ms: float | None):
+        self.rows = rows
+        self.max_update_ms = max_update_ms
+
+
+def semantic_update_probe_result(log_path: Path) -> SemanticUpdateProbeResult:
+    if not log_path.exists():
+        return SemanticUpdateProbeResult([], None)
+    lines = log_path.read_text(errors="replace").splitlines()
+    latest = latest_session(lines)
+    rows = [
+        line.split("): ", 1)[-1]
+        for line in latest
+        if (
+            ("Zig semantic current " in line and " zls_tokens=" in line)
+            or "Zig forward semanticTokens/full -> " in line
+        )
+    ]
+    update_elapsed = [
+        elapsed_ms(row)
+        for row in rows
+        if "Zig semantic current update_" in row
+    ]
+    update_elapsed = [value for value in update_elapsed if value is not None]
+    max_update_ms = max(update_elapsed) if update_elapsed else None
+    return SemanticUpdateProbeResult(rows[-6:], max_update_ms)
+
+
+def elapsed_ms(row: str) -> float | None:
+    marker = "elapsed_ns="
+    start = row.find(marker)
+    if start == -1:
+        return None
+    start += len(marker)
+    end = start
+    while end < len(row) and row[end].isdigit():
+        end += 1
+    if end == start:
+        return None
+    return int(row[start:end]) / 1_000_000.0
+
+
+def latest_session(lines: list[str]) -> list[str]:
+    starts = [index for index, line in enumerate(lines) if "Log File:" in line]
+    if not starts:
+        return lines
+    start = starts[-1]
+    return lines[start:]
 
 
 def compact_response(message: dict[str, Any]) -> dict[str, Any]:
