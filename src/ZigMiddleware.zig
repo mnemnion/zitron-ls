@@ -249,19 +249,15 @@ const Middleware = struct {
         generation: *ZigDocument,
         start: std.Io.Timestamp,
     ) Error!void {
-        var text_changes: ?diff.TextChanges = null;
-        defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
         var notify_kind: enum { none, open, change } = .none;
         var notify_uri: []const u8 = &.{};
         var notify_version: i32 = 0;
         var notify_text: []const u8 = &.{};
-        var notify_zig_bytes: usize = 0;
         var log_version: i32 = 0;
         var log_opened = false;
         var log_zig_bytes: usize = 0;
         var log_span_count: usize = 0;
-        var log_change_count: usize = 0;
-        var diff_ns: i96 = 0;
+        var log_notified = false;
 
         const state_start = logStart(middleware.io);
         {
@@ -286,35 +282,20 @@ const Middleware = struct {
             }
 
             const send_to_zls = generation.generation_error == null;
-            if (send_to_zls and state.opened) {
-                const current = state.current orelse return error.MissingZigDocument;
-                const diff_start = logStart(middleware.io);
-                text_changes = try diff.textChanges(middleware.allocator, current.zig_text, generation.zig_text, .@"utf-8");
-                diff_ns = elapsedNs(middleware.io, diff_start);
-            }
-
             if (send_to_zls) {
                 notify_uri = generation.zig_uri;
                 notify_version = generation.version;
                 notify_text = generation.zig_text;
-                notify_zig_bytes = generation.zig_text.len;
                 if (state.opened) {
-                    const changes = text_changes orelse return error.MissingZigDocument;
-                    log_change_count = changes.items.len;
-                    if (changes.items.len != 0) {
-                        notify_kind = .change;
-                        state.zls_sync_count += 1;
-                        state.zls_synced_generation_id = generation.generation_id;
-                    } else {
-                        log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
-                            generation.zig_uri,
-                            generation.version,
-                        });
-                    }
+                    notify_kind = .change;
+                    log_notified = true;
+                    state.zls_sync_count += 1;
+                    state.zls_synced_generation_id = generation.generation_id;
                 } else {
                     notify_kind = .open;
                     notify_text = generation.zig_text;
                     state.opened = true;
+                    log_notified = true;
                     state.zls_sync_count += 1;
                     state.zls_synced_generation_id = generation.generation_id;
                 }
@@ -336,21 +317,9 @@ const Middleware = struct {
         switch (notify_kind) {
             .none => {},
             .change => {
-                const changes = text_changes orelse return error.MissingZigDocument;
-                log.debug("ZLS library <- textDocument/didChange uri={s} version={} changes={} zig_bytes={}", .{
-                    notify_uri,
-                    notify_version,
-                    changes.items.len,
-                    notify_zig_bytes,
-                });
                 try middleware.syncLibraryChange(notify_uri, notify_version, notify_text);
             },
             .open => {
-                log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
-                    notify_uri,
-                    notify_version,
-                    notify_zig_bytes,
-                });
                 try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
             },
         }
@@ -364,13 +333,12 @@ const Middleware = struct {
             log_span_count,
             elapsedNs(middleware.io, start),
         });
-        log.debug("Zig sync publish-phases uri={s} version={} kind={t} changes={} state_ns={} diff_ns={} notify_ns={} elapsed_ns={}", .{
+        log.debug("Zig sync publish-phases uri={s} version={} kind={t} notified={} state_ns={} notify_ns={} elapsed_ns={}", .{
             uri,
             log_version,
             notify_kind,
-            log_change_count,
+            log_notified,
             state_ns,
-            diff_ns,
             notify_ns,
             elapsedNs(middleware.io, start),
         });
@@ -2501,8 +2469,7 @@ pub const CodeMap = struct {
         fast_column_mapping: bool,
     };
 
-    /// Rebuilds the map and extracts volatile `#line` payloads from the zig
-    /// buffer before it is stored or sent to ZLS.
+    /// Rebuilds the map from Zitron `#line` markers.
     pub fn update(
         map: *CodeMap,
         allocator: std.mem.Allocator,
@@ -2689,7 +2656,6 @@ pub const CodeMap = struct {
             const next_zig_offset = if (line_end < zig_text.len) line_end + 1 else line_end;
 
             if (parseLineDirective(line)) |directive| {
-                extractLineDirective(zig_text, zig_offset, directive);
                 try map.processActiveSpan(allocator, &active_span, zig_line, zig_offset);
                 if (std.mem.eql(u8, directive.path, zy_path)) {
                     if (zigCodeSpanForLine(zy_text, zy_root, directive.line)) |zy_span| {
@@ -4064,8 +4030,6 @@ const LineDirective = struct {
     /// Path payload from the directive; only spans for the zy `.zy` path are
     /// mapped back to the client document.
     path: []const u8,
-    /// Byte range of the line-number payload relative to the directive line.
-    line_number_range: CodeMap.ByteRange,
 };
 
 /// Recognizes the exact zig-line marker format used by Zitron.
@@ -4090,17 +4054,7 @@ fn parseLineDirective(line: []const u8) ?LineDirective {
     return .{
         .line = line_number -| 1,
         .path = line[index..],
-        .line_number_range = .{
-            .start = number_start,
-            .end = number_end,
-        },
     };
-}
-
-fn extractLineDirective(zig_text: []u8, line_start: usize, directive: LineDirective) void {
-    const start = line_start + directive.line_number_range.start;
-    const end = line_start + directive.line_number_range.end;
-    @memset(zig_text[start..end], 'X');
 }
 
 pub fn translateHover(hover_result: *types.Hover, map: *RequestTranslationContext) OOM!void {
@@ -5522,7 +5476,7 @@ test "code map translates zy and zig positions" {
     }));
 }
 
-test "code map extraction scrubs line directive digits without losing map" {
+test "code map extraction preserves line directive text" {
     const zy =
         \\%code {
         \\const answer = 42;
@@ -5538,16 +5492,6 @@ test "code map extraction scrubs line directive digits without losing map" {
         \\// #line 99 zy.zig
         \\const zig_only = true;
     ;
-    const expected =
-        \\// #line X zy.zy
-        \\
-        \\const answer = 42;
-        \\// #line X zy.zy
-        \\ result = token;
-        \\// #line XX zy.zig
-        \\const zig_only = true;
-    ;
-
     const extracted = try testing_allocator.dupe(u8, zig);
     defer testing_allocator.free(extracted);
     const tree = try parseZitronTreeForTest(zy);
@@ -5557,7 +5501,7 @@ test "code map extraction scrubs line directive digits without losing map" {
 
     try map.update(testing_allocator, tree.rootNode(), zy, extracted, "zy.zy");
 
-    try expectEqualStrings(expected, extracted);
+    try expectEqualStrings(zig, extracted);
     try expectEqual(@as(usize, 2), map.len());
     try expectEqual(types.Position{ .line = 2, .character = 5 }, map.zyPositionToZig(.{
         .line = 1,
