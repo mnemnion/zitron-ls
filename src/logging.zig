@@ -4,9 +4,15 @@ const log_file_name = "lsp_zitron.log";
 const app_dir_name = "lsp_zitron";
 
 pub const Options = struct {
-    log_file_path: ?[]const u8 = null,
-    log_level: ?std.log.Level = null,
-    enable_stderr_logs: bool = false,
+    pub const init: Options = .{
+        .log_file_path = null,
+        .log_level = null,
+        .enable_stderr_logs = false,
+    };
+
+    log_file_path: ?[]const u8,
+    log_level: ?std.log.Level,
+    enable_stderr_logs: bool,
 };
 
 pub const State = struct {

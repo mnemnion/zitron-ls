@@ -48,9 +48,9 @@ pub fn main(init: std.process.Init) Error!void {
 }
 
 const SpinMutex = struct {
-    locked: std.atomic.Value(bool) = .init(false),
+    locked: std.atomic.Value(bool),
 
-    pub const init: SpinMutex = .{};
+    pub const init: SpinMutex = .{ .locked = .init(false) };
 
     pub fn lock(mutex: *SpinMutex, _: std.Io) !void {
         while (mutex.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -75,9 +75,15 @@ const usage =
 ;
 
 const Args = struct {
-    logging: logging.Options = .{},
-    exe_path: []const u8 = "",
-    panic_smoke_test: bool = false,
+    pub const init: Args = .{
+        .logging = .init,
+        .exe_path = "",
+        .panic_smoke_test = false,
+    };
+
+    logging: logging.Options,
+    exe_path: []const u8,
+    panic_smoke_test: bool,
 
     fn deinit(args: Args, allocator: std.mem.Allocator) void {
         if (args.logging.log_file_path) |path| allocator.free(path);
@@ -86,7 +92,7 @@ const Args = struct {
 };
 
 fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Args {
-    var result: Args = .{};
+    var result: Args = .init;
     errdefer result.deinit(allocator);
 
     var args_it = try std.process.Args.Iterator.initAllocator(process_args, allocator);

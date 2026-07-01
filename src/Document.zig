@@ -277,9 +277,9 @@ pub fn inlayHints(
     range: types.Range,
     offset_encoding: lsp.offsets.Encoding,
 ) OOM![]const types.InlayHint {
-    var type_table = TypeTable{};
+    var type_table: TypeTable = .empty;
     defer type_table.deinit(arena);
-    var action_signatures = ActionSignatureTable{};
+    var action_signatures: ActionSignatureTable = .empty;
     defer action_signatures.deinit(arena);
 
     const root = document.tree.rootNode();
@@ -357,7 +357,7 @@ pub fn aliasCodeBlockRangesForRename(
 ) OOM![]const ts.Range {
     if (symbol.kind != .alias) return &.{};
 
-    var scope = AliasRenameScope{};
+    var scope: AliasRenameScope = .empty;
     defer scope.deinit(arena);
     try scope.initForSymbol(arena, document.source, symbol.name_node);
 
@@ -380,7 +380,7 @@ pub fn aliasMagicCommentEditsForRename(
 ) OOM![]const types.TextEdit {
     if (symbol.kind != .alias) return &.{};
 
-    var scope = AliasRenameScope{};
+    var scope: AliasRenameScope = .empty;
     defer scope.deinit(arena);
     try scope.initForSymbol(arena, document.source, symbol.name_node);
 
@@ -654,9 +654,15 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
 }
 
 const TypeTable = struct {
-    symbol_types: std.StringHashMapUnmanaged([]const u8) = .empty,
-    token_type: ?[]const u8 = null,
-    default_type: ?[]const u8 = null,
+    const empty: TypeTable = .{
+        .symbol_types = .empty,
+        .token_type = null,
+        .default_type = null,
+    };
+
+    symbol_types: std.StringHashMapUnmanaged([]const u8),
+    token_type: ?[]const u8,
+    default_type: ?[]const u8,
 
     fn deinit(table: *TypeTable, allocator: std.mem.Allocator) void {
         table.symbol_types.deinit(allocator);
@@ -701,7 +707,9 @@ const ActionAliasType = struct {
 };
 
 const ActionSignatureTable = struct {
-    items: std.ArrayList(ActionAliasType) = .empty,
+    const empty: ActionSignatureTable = .{ .items = .empty };
+
+    items: std.ArrayList(ActionAliasType),
 
     fn deinit(table: *ActionSignatureTable, allocator: std.mem.Allocator) void {
         table.items.deinit(allocator);
@@ -1168,11 +1176,19 @@ fn renameNodeContainingIndex(node: ts.Node, source_index: usize) ?ts.Node {
 }
 
 const AliasRenameScope = struct {
-    rule_starts: std.AutoHashMapUnmanaged(usize, void) = .empty,
-    directive_starts: std.AutoHashMapUnmanaged(usize, void) = .empty,
-    rules: std.ArrayList(ts.Node) = .empty,
-    impl_directives: std.ArrayList(ts.Node) = .empty,
-    action_names: std.ArrayList([]const u8) = .empty,
+    const empty: AliasRenameScope = .{
+        .rule_starts = .empty,
+        .directive_starts = .empty,
+        .rules = .empty,
+        .impl_directives = .empty,
+        .action_names = .empty,
+    };
+
+    rule_starts: std.AutoHashMapUnmanaged(usize, void),
+    directive_starts: std.AutoHashMapUnmanaged(usize, void),
+    rules: std.ArrayList(ts.Node),
+    impl_directives: std.ArrayList(ts.Node),
+    action_names: std.ArrayList([]const u8),
 
     fn deinit(scope: *AliasRenameScope, allocator: std.mem.Allocator) void {
         scope.rule_starts.deinit(allocator);
@@ -1180,7 +1196,7 @@ const AliasRenameScope = struct {
         scope.rules.deinit(allocator);
         scope.impl_directives.deinit(allocator);
         scope.action_names.deinit(allocator);
-        scope.* = .{};
+        scope.* = .empty;
     }
 
     fn initForSymbol(
@@ -1247,7 +1263,7 @@ fn aliasRenameEdits(
     new_name: []const u8,
     offset_encoding: lsp.offsets.Encoding,
 ) OOM![]const types.TextEdit {
-    var scope = AliasRenameScope{};
+    var scope: AliasRenameScope = .empty;
     defer scope.deinit(arena);
     try scope.initForSymbol(arena, document.source, symbol.name_node);
 
