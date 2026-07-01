@@ -16,6 +16,8 @@ pub const SemanticDirtyRange = struct {
     current: types.Range,
 };
 
+const max_semantic_token_snapshots = 8;
+
 const Middleware = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -60,7 +62,7 @@ const Middleware = struct {
             if (!gop.found_existing) {
                 errdefer _ = middleware.documents.remove(uri);
                 gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
-                errdefer middleware.allocator.free(gop.key_ptr.*);
+                errdefer comptime unreachable;
                 gop.value_ptr.* = .{
                     .current = null,
                     .latest_requested_version = version,
@@ -247,19 +249,15 @@ const Middleware = struct {
         generation: *ZigDocument,
         start: std.Io.Timestamp,
     ) Error!void {
-        var text_changes: ?diff.TextChanges = null;
-        defer if (text_changes) |*changes| changes.deinit(middleware.allocator);
         var notify_kind: enum { none, open, change } = .none;
         var notify_uri: []const u8 = &.{};
         var notify_version: i32 = 0;
         var notify_text: []const u8 = &.{};
-        var notify_zig_bytes: usize = 0;
         var log_version: i32 = 0;
         var log_opened = false;
         var log_zig_bytes: usize = 0;
         var log_span_count: usize = 0;
-        var log_change_count: usize = 0;
-        var diff_ns: i96 = 0;
+        var log_notified = false;
 
         const state_start = logStart(middleware.io);
         {
@@ -284,35 +282,20 @@ const Middleware = struct {
             }
 
             const send_to_zls = generation.generation_error == null;
-            if (send_to_zls and state.opened) {
-                const current = state.current orelse return error.MissingZigDocument;
-                const diff_start = logStart(middleware.io);
-                text_changes = try diff.textChanges(middleware.allocator, current.zig_text, generation.zig_text, .@"utf-8");
-                diff_ns = elapsedNs(middleware.io, diff_start);
-            }
-
             if (send_to_zls) {
                 notify_uri = generation.zig_uri;
                 notify_version = generation.version;
                 notify_text = generation.zig_text;
-                notify_zig_bytes = generation.zig_text.len;
                 if (state.opened) {
-                    const changes = text_changes orelse return error.MissingZigDocument;
-                    log_change_count = changes.items.len;
-                    if (changes.items.len != 0) {
-                        notify_kind = .change;
-                        state.zls_sync_count += 1;
-                        state.zls_synced_generation_id = generation.generation_id;
-                    } else {
-                        log.debug("ZLS skip textDocument/didChange uri={s} version={} changes=0", .{
-                            generation.zig_uri,
-                            generation.version,
-                        });
-                    }
+                    notify_kind = .change;
+                    log_notified = true;
+                    state.zls_sync_count += 1;
+                    state.zls_synced_generation_id = generation.generation_id;
                 } else {
                     notify_kind = .open;
                     notify_text = generation.zig_text;
                     state.opened = true;
+                    log_notified = true;
                     state.zls_sync_count += 1;
                     state.zls_synced_generation_id = generation.generation_id;
                 }
@@ -334,21 +317,9 @@ const Middleware = struct {
         switch (notify_kind) {
             .none => {},
             .change => {
-                const changes = text_changes orelse return error.MissingZigDocument;
-                log.debug("ZLS library <- textDocument/didChange uri={s} version={} changes={} zig_bytes={}", .{
-                    notify_uri,
-                    notify_version,
-                    changes.items.len,
-                    notify_zig_bytes,
-                });
                 try middleware.syncLibraryChange(notify_uri, notify_version, notify_text);
             },
             .open => {
-                log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
-                    notify_uri,
-                    notify_version,
-                    notify_zig_bytes,
-                });
                 try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
             },
         }
@@ -362,13 +333,12 @@ const Middleware = struct {
             log_span_count,
             elapsedNs(middleware.io, start),
         });
-        log.debug("Zig sync publish-phases uri={s} version={} kind={t} changes={} state_ns={} diff_ns={} notify_ns={} elapsed_ns={}", .{
+        log.debug("Zig sync publish-phases uri={s} version={} kind={t} notified={} state_ns={} notify_ns={} elapsed_ns={}", .{
             uri,
             log_version,
             notify_kind,
-            log_change_count,
+            log_notified,
             state_ns,
-            diff_ns,
             notify_ns,
             elapsedNs(middleware.io, start),
         });
@@ -1116,8 +1086,14 @@ const Middleware = struct {
         zy_result_id: []const u8,
     ) ?*SemanticTokensSnapshot {
         const state = middleware.documents.getPtr(zy_uri) orelse return null;
-        for (state.semantic_tokens.items) |*snapshot| {
-            if (std.mem.eql(u8, snapshot.zy_result_id, zy_result_id)) return snapshot;
+        for (state.semantic_tokens.items, 0..) |*snapshot, index| {
+            if (std.mem.eql(u8, snapshot.zy_result_id, zy_result_id)) {
+                if (index != state.semantic_tokens.items.len - 1) {
+                    const touched = state.semantic_tokens.orderedRemove(index);
+                    state.semantic_tokens.appendAssumeCapacity(touched);
+                }
+                return &state.semantic_tokens.items[state.semantic_tokens.items.len - 1];
+            }
         }
         return null;
     }
@@ -1169,8 +1145,7 @@ const Middleware = struct {
             .zy_index = owned_zy_index,
         };
         try state.semantic_tokens.append(middleware.allocator, snapshot);
-        const max_snapshots = 8;
-        while (state.semantic_tokens.items.len > max_snapshots) {
+        while (state.semantic_tokens.items.len > max_semantic_token_snapshots) {
             var old = state.semantic_tokens.orderedRemove(0);
             old.deinit(middleware.allocator);
         }
@@ -1339,6 +1314,7 @@ const Middleware = struct {
             middleware.allocator,
             current.zy_index,
             dirty,
+            current_zy_range,
             current_range_data,
         );
         errdefer middleware.allocator.free(current_zy_data);
@@ -1383,14 +1359,14 @@ const Middleware = struct {
         owned_zy_data: []u32,
     ) OOM!*const SemanticTokenCollection {
         const state = middleware.documents.getPtr(zy_uri) orelse unreachable;
-        var replacement = try SemanticTokenCollection.initOwned(
+        const replacement = try SemanticTokenCollection.initOwned(
             middleware.allocator,
             doc.version,
             doc.zy_text,
             doc.zig_text,
             owned_zy_data,
         );
-        errdefer replacement.deinit(middleware.allocator);
+        errdefer comptime unreachable;
         if (state.semantic_tokens_current) |*old| old.deinit(middleware.allocator);
         state.semantic_tokens_current = replacement;
         return &(state.semantic_tokens_current.?);
@@ -1508,6 +1484,7 @@ const Middleware = struct {
             middleware.allocator,
             snapshot.zy_index,
             dirty,
+            current_zy_range,
             current_range_data,
         );
         const splice_ns = elapsedNs(middleware.io, splice_start);
@@ -1881,7 +1858,7 @@ const SemanticTokenCollection = struct {
         const owned_zig_text = try allocator.dupe(u8, zig_text);
         errdefer allocator.free(owned_zig_text);
         const owned_zy_index = try semanticTokenIndexFromData(allocator, owned_zy_data);
-        errdefer allocator.free(owned_zy_index);
+        errdefer comptime unreachable;
         return .{
             .version = version,
             .zy_text = owned_zy_text,
@@ -1945,7 +1922,7 @@ fn initImpl(
     errdefer freeStringSlices(allocator, zls_completion_triggers);
 
     const mware = try allocator.create(Middleware);
-    errdefer allocator.destroy(mware);
+    errdefer comptime unreachable;
     mware.* = .{
         .allocator = allocator,
         .io = io,
@@ -2492,8 +2469,7 @@ pub const CodeMap = struct {
         fast_column_mapping: bool,
     };
 
-    /// Rebuilds the map and extracts volatile `#line` payloads from the zig
-    /// buffer before it is stored or sent to ZLS.
+    /// Rebuilds the map from Zitron `#line` markers.
     pub fn update(
         map: *CodeMap,
         allocator: std.mem.Allocator,
@@ -2680,7 +2656,6 @@ pub const CodeMap = struct {
             const next_zig_offset = if (line_end < zig_text.len) line_end + 1 else line_end;
 
             if (parseLineDirective(line)) |directive| {
-                extractLineDirective(zig_text, zig_offset, directive);
                 try map.processActiveSpan(allocator, &active_span, zig_line, zig_offset);
                 if (std.mem.eql(u8, directive.path, zy_path)) {
                     if (zigCodeSpanForLine(zy_text, zy_root, directive.line)) |zy_span| {
@@ -3565,29 +3540,29 @@ fn workspaceEditCount(edit: types.WorkspaceEdit) usize {
 }
 
 fn zigDiffIntervalShared(start: usize, end: usize, edits: []const Edit) bool {
-    var index: usize = 0;
+    if (end < start) return false;
+
     var zig_cursor: usize = 0;
-    while (index < edits.len) {
-        switch (edits[index].operation) {
+    for (edits) |edit| {
+        switch (edit.operation) {
             .equal => {
-                zig_cursor += edits[index].text.len;
-                index += 1;
-            },
-            .delete, .insert => {
-                const mutation_start = zig_cursor;
-                while (index < edits.len and edits[index].operation != .equal) : (index += 1) {
-                    if (edits[index].operation == .insert) zig_cursor += edits[index].text.len;
+                const equal_start = zig_cursor;
+                const equal_end = equal_start + edit.text.len;
+                if (start == end and equal_start <= start and start <= equal_end) return true;
+                if (equal_start <= start and start < equal_end and end <= equal_end) {
+                    if (start == equal_start and end == equal_end) return false;
+                    return true;
                 }
-                if (rangesOverlap(start, end, mutation_start, zig_cursor)) return false;
-                if (mutation_start == zig_cursor and start < mutation_start and mutation_start < end) return false;
+                zig_cursor = equal_end;
             },
+            .insert => {
+                zig_cursor += edit.text.len;
+            },
+            .delete => {},
         }
     }
-    return true;
-}
 
-fn rangesOverlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) bool {
-    return a_start < b_end and b_start < a_end;
+    return false;
 }
 
 fn positionLessThan(lhs: types.Position, rhs: types.Position) bool {
@@ -4055,8 +4030,6 @@ const LineDirective = struct {
     /// Path payload from the directive; only spans for the zy `.zy` path are
     /// mapped back to the client document.
     path: []const u8,
-    /// Byte range of the line-number payload relative to the directive line.
-    line_number_range: CodeMap.ByteRange,
 };
 
 /// Recognizes the exact zig-line marker format used by Zitron.
@@ -4081,17 +4054,7 @@ fn parseLineDirective(line: []const u8) ?LineDirective {
     return .{
         .line = line_number -| 1,
         .path = line[index..],
-        .line_number_range = .{
-            .start = number_start,
-            .end = number_end,
-        },
     };
-}
-
-fn extractLineDirective(zig_text: []u8, line_start: usize, directive: LineDirective) void {
-    const start = line_start + directive.line_number_range.start;
-    const end = line_start + directive.line_number_range.end;
-    @memset(zig_text[start..end], 'X');
 }
 
 pub fn translateHover(hover_result: *types.Hover, map: *RequestTranslationContext) OOM!void {
@@ -4190,8 +4153,9 @@ fn translateDocumentHighlights(
     map: *RequestTranslationContext,
 ) OOM!?[]const types.DocumentHighlight {
     var translated: std.ArrayList(types.DocumentHighlight) = .empty;
+    var position_cursor = ZigPositionCursor{ .context = map };
     for (highlights) |highlight| {
-        if (try translateDocumentHighlight(highlight, map)) |mapped| {
+        if (try translateDocumentHighlight(highlight, &position_cursor)) |mapped| {
             try translated.append(arena, mapped);
         }
     }
@@ -4201,10 +4165,10 @@ fn translateDocumentHighlights(
 
 fn translateDocumentHighlight(
     highlight: types.DocumentHighlight,
-    map: *RequestTranslationContext,
+    position_cursor: *ZigPositionCursor,
 ) OOM!?types.DocumentHighlight {
     return .{
-        .range = (try map.zigRangeToZy(highlight.range)) orelse return null,
+        .range = (try position_cursor.zigRangeToZy(highlight.range)) orelse return null,
         .kind = highlight.kind,
     };
 }
@@ -4599,7 +4563,7 @@ fn semanticTokenIndexFromData(
 ) OOM![]AbsoluteSemanticToken {
     const token_count = data.len / 5;
     const index = try allocator.alloc(AbsoluteSemanticToken, token_count);
-    errdefer allocator.free(index);
+    errdefer comptime unreachable;
 
     var line: u32 = 0;
     var character: u32 = 0;
@@ -4626,6 +4590,7 @@ fn rebuildSemanticTokenDataFromRange(
     allocator: std.mem.Allocator,
     previous_index: []const AbsoluteSemanticToken,
     dirty: SemanticDirtyRange,
+    replacement_range: types.Range,
     current_range_data: []const u32,
 ) Error![]u32 {
     const current_range_index = try semanticTokenIndexFromData(allocator, current_range_data);
@@ -4644,6 +4609,7 @@ fn rebuildSemanticTokenDataFromRange(
         else
             previous_token;
 
+        if (semanticTokenIntersectsRange(semanticTokenRange(current_token), replacement_range)) continue;
         if (semanticTokenIntersectsAny(current_token, current_range_index)) continue;
         try rebuilt.append(allocator, current_token);
     }
@@ -5510,7 +5476,7 @@ test "code map translates zy and zig positions" {
     }));
 }
 
-test "code map extraction scrubs line directive digits without losing map" {
+test "code map extraction preserves line directive text" {
     const zy =
         \\%code {
         \\const answer = 42;
@@ -5526,16 +5492,6 @@ test "code map extraction scrubs line directive digits without losing map" {
         \\// #line 99 zy.zig
         \\const zig_only = true;
     ;
-    const expected =
-        \\// #line X zy.zy
-        \\
-        \\const answer = 42;
-        \\// #line X zy.zy
-        \\ result = token;
-        \\// #line XX zy.zig
-        \\const zig_only = true;
-    ;
-
     const extracted = try testing_allocator.dupe(u8, zig);
     defer testing_allocator.free(extracted);
     const tree = try parseZitronTreeForTest(zy);
@@ -5545,7 +5501,7 @@ test "code map extraction scrubs line directive digits without losing map" {
 
     try map.update(testing_allocator, tree.rootNode(), zy, extracted, "zy.zy");
 
-    try expectEqualStrings(expected, extracted);
+    try expectEqualStrings(zig, extracted);
     try expectEqual(@as(usize, 2), map.len());
     try expectEqual(types.Position{ .line = 2, .character = 5 }, map.zyPositionToZig(.{
         .line = 1,
@@ -7070,6 +7026,9 @@ test "semantic token range rebuild preserves suffix token" {
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7102,6 +7061,9 @@ test "semantic token range rebuild shifts suffix after line delete" {
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7136,6 +7098,9 @@ test "semantic token range rebuild preserves sparse gaps between returned tokens
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7170,6 +7135,9 @@ test "semantic token range rebuild treats returned token overlap as authoritativ
             .start = .{ .line = 1, .character = 0 },
             .end = .{ .line = 2, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 2, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7202,6 +7170,9 @@ test "semantic token range rebuild preserves adjacent sparse omissions" {
             .start = .{ .line = 2, .character = 0 },
             .end = .{ .line = 3, .character = 0 },
         },
+    }, .{
+        .start = .{ .line = 2, .character = 0 },
+        .end = .{ .line = 3, .character = 0 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7210,6 +7181,37 @@ test "semantic token range rebuild preserves adjacent sparse omissions" {
         1, 0, 3, 2, 0,
         1, 0, 4, 5, 0,
         1, 0, 6, 4, 0,
+    }, updated);
+}
+
+test "semantic token range rebuild deletes stale tokens omitted by refreshed range" {
+    const previous = [_]u32{
+        0, 0, 5, 1, 0,
+        1, 0, 3, 2, 0,
+        2, 0, 6, 3, 0,
+    };
+    const current_range = [_]u32{};
+    const previous_index = try semanticTokenIndexFromData(testing_allocator, &previous);
+    defer testing_allocator.free(previous_index);
+
+    const updated = try rebuildSemanticTokenDataFromRange(testing_allocator, previous_index, .{
+        .previous = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+        .current = .{
+            .start = .{ .line = 2, .character = 0 },
+            .end = .{ .line = 2, .character = 0 },
+        },
+    }, .{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 3, .character = 0 },
+    }, &current_range);
+    defer testing_allocator.free(updated);
+
+    try expectEqualSlices(u32, &.{
+        0, 0, 5, 1, 0,
+        3, 0, 6, 3, 0,
     }, updated);
 }
 
@@ -7231,6 +7233,9 @@ test "semantic token range rebuild shifts same-line suffix columns" {
             .start = .{ .line = 0, .character = 5 },
             .end = .{ .line = 0, .character = 8 },
         },
+    }, .{
+        .start = .{ .line = 0, .character = 5 },
+        .end = .{ .line = 0, .character = 8 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7260,6 +7265,9 @@ test "semantic token range rebuild invalidates insertion inside token" {
             .start = .{ .line = 0, .character = 2 },
             .end = .{ .line = 0, .character = 3 },
         },
+    }, .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 8 },
     }, &current_range);
     defer testing_allocator.free(updated);
 
@@ -7451,6 +7459,8 @@ test "semantic token requests serve fresh current collection without zls" {
     })) orelse return error.UnexpectedResponse;
     try expectEqualStrings("lsp-zitron-semantic-1", full.resultId.?);
     try expectEqualSlices(u32, &current_data, full.data);
+    const baseline_result_id = try testing_allocator.dupe(u8, full.resultId.?);
+    defer testing_allocator.free(baseline_result_id);
 
     const range = (try middleware.forwardSemanticTokensRange(arena, uri, .{
         .textDocument = .{ .uri = uri },
@@ -7473,6 +7483,18 @@ test "semantic token requests serve fresh current collection without zls" {
     try expectEqualStrings("lsp-zitron-semantic-2", delta_result.resultId.?);
     try expectEqual(@as(usize, 0), delta_result.edits.len);
 
+    for (0..max_semantic_token_snapshots + 2) |_| {
+        const touched = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
+            .textDocument = .{ .uri = uri },
+            .previousResultId = baseline_result_id,
+        })) orelse return error.UnexpectedResponse;
+        const touched_delta = switch (touched) {
+            .semantic_tokens_delta => |value| value,
+            .semantic_tokens => return error.UnexpectedResponse,
+        };
+        try expectEqual(@as(usize, 0), touched_delta.edits.len);
+    }
+
     const unknown = (try middleware.forwardSemanticTokensFullDelta(arena, uri, .{
         .textDocument = .{ .uri = uri },
         .previousResultId = "missing",
@@ -7481,7 +7503,7 @@ test "semantic token requests serve fresh current collection without zls" {
         .semantic_tokens => |value| value,
         .semantic_tokens_delta => return error.UnexpectedResponse,
     };
-    try expectEqualStrings("lsp-zitron-semantic-3", unknown_full.resultId.?);
+    try expectEqualStrings("lsp-zitron-semantic-13", unknown_full.resultId.?);
     try expectEqualSlices(u32, &current_data, unknown_full.data);
 }
 
@@ -7654,6 +7676,67 @@ test "semantic token inline action spans use column-aware slow path" {
 
     try expectEqualSlices(u32, &.{ 0, answer_zy_column, 6, 8, 0 }, translated);
     try expectEqual(@as(usize, 1), map.translators.freshLen(0));
+}
+
+test "semantic token slow path drops partial source-token matches and reencodes following tokens" {
+    const zy = "A = pik_position_between(X, P1, P2);\n";
+    const zig = "A = pik_position_between(X, stack[1], P2);\n";
+    const function_zy_column: u32 = @intCast(std.mem.indexOf(u8, zy, "pik_position_between").?);
+    const function_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "pik_position_between").?);
+    const one_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "[1]").? + 1);
+    const p2_zy_column: u32 = @intCast(std.mem.indexOf(u8, zy, "P2").?);
+    const p2_zig_column: u32 = @intCast(std.mem.indexOf(u8, zig, "P2").?);
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.zig_span.append(testing_allocator, .{
+        .zy_line = 0,
+        .zig_line = 0,
+        .line_count = 1,
+        .zig_range = .{ .start = 0, .end = zig.len },
+    });
+    try map.zy_range.append(testing_allocator, .{
+        .start_byte = 0,
+        .end_byte = zy.len,
+        .start_point = .{ .row = 0, .column = 0 },
+        .end_point = .{ .row = 1, .column = 0 },
+    });
+    try map.fast_column_mapping.append(testing_allocator, false);
+    try map.rebuildZyOrder(testing_allocator);
+    var context = RequestTranslationContext{
+        .allocator = testing_allocator,
+        .map = &map,
+        .zy_text = zy,
+        .zig_text = zig,
+        .active_span_index = null,
+    };
+    defer context.deinit();
+
+    var position_cursor = ZigPositionCursor{ .context = &context };
+    try std.testing.expect(try position_cursor.zigRangeToZy(.{
+        .start = .{ .line = 0, .character = one_zig_column },
+        .end = .{ .line = 0, .character = one_zig_column + 1 },
+    }) == null);
+
+    var zig_tokens = [_]u32{
+        0, function_zig_column,                  20, 12, 0,
+        0, one_zig_column - function_zig_column, 1,  20, 0,
+        0, p2_zig_column - one_zig_column,       2,  8,  0,
+    };
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const translated = try translateSemanticTokenData(
+        arena_state.allocator(),
+        &zig_tokens,
+        &context,
+    );
+
+    try expectEqualSlices(u32, &.{
+        0, function_zy_column,                20, 12, 0,
+        0, p2_zy_column - function_zy_column, 2,  8,  0,
+    }, translated);
 }
 
 test "translates semantic tokens in zy span order" {

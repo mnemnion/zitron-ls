@@ -10,6 +10,7 @@ const server_version = "0.0.1";
 const zitron_completion_triggers = [_][]const u8{ "%", "(" };
 const zitron_signature_help_triggers = [_][]const u8{ "(", ";", "," };
 const zitron_signature_help_retriggers = [_][]const u8{ ";", "," };
+const first_server_request_id = 1_000_000;
 
 fn zitronLanguage() *const ts.Language {
     return ts.Language.fromRaw(zitron_grammar.language());
@@ -112,6 +113,9 @@ pub const Server = struct {
     zig_middleware: ZigMiddleware,
     client_transport: ?*lsp.Transport,
     io: ?std.Io,
+    client_supports_work_done_progress: bool,
+    client_supports_semantic_tokens_refresh: bool,
+    next_server_request_id: i64,
 
     /// Creates a server instance and compiles the grammar tag query.
     pub fn init(allocator: std.mem.Allocator) ts.Query.Error!Server {
@@ -119,7 +123,7 @@ pub const Server = struct {
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
         errdefer tags_query.destroy();
         const rename_query = try ts.Query.create(zitronLanguage(), rename_query_source, &query_error_offset);
-        errdefer rename_query.destroy();
+        errdefer comptime unreachable;
 
         return .{
             .allocator = allocator,
@@ -131,6 +135,9 @@ pub const Server = struct {
             .zig_middleware = .disabled,
             .client_transport = null,
             .io = null,
+            .client_supports_work_done_progress = false,
+            .client_supports_semantic_tokens_refresh = false,
+            .next_server_request_id = first_server_request_id,
         };
     }
 
@@ -313,6 +320,14 @@ pub const Server = struct {
                 break;
             }
         }
+        if (params.capabilities.window) |window| {
+            server.client_supports_work_done_progress = window.workDoneProgress orelse false;
+        }
+        if (params.capabilities.workspace) |workspace| {
+            if (workspace.semanticTokens) |semantic_tokens| {
+                server.client_supports_semantic_tokens_refresh = semantic_tokens.refreshSupport orelse false;
+            }
+        }
 
         const result: types.InitializeResult = .{
             .capabilities = serverCapabilities(
@@ -369,6 +384,7 @@ pub const Server = struct {
             null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
+        try server.warmSemanticTokens(params.textDocument.uri);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,
@@ -1036,6 +1052,130 @@ pub const Server = struct {
         server.allocator.free(removed.key);
         var document = removed.value;
         document.deinit(server.allocator);
+    }
+
+    fn warmSemanticTokens(server: *Server, uri: []const u8) Error!void {
+        const start = server.logStart();
+        const token = server.nextProgressToken();
+        try server.beginWorkDoneProgress(token, "Building semantic tokens", uri);
+        defer server.endWorkDoneProgress(token, "Ready") catch |err| {
+            log.warn("LSP semantic-token progress end failed uri={s}: {}", .{ uri, err });
+        };
+
+        var arena_state = std.heap.ArenaAllocator.init(server.allocator);
+        defer arena_state.deinit();
+        _ = try server.zig_middleware.forwardSemanticTokensFull(
+            arena_state.allocator(),
+            uri,
+            .{
+                .textDocument = .{ .uri = uri },
+                .workDoneToken = null,
+                .partialResultToken = null,
+            },
+        );
+        try server.refreshSemanticTokens();
+        log.debug("LSP semanticTokens/warm uri={s} elapsed_ns={}", .{
+            uri,
+            server.logElapsedNs(start),
+        });
+    }
+
+    fn nextRequestId(server: *Server) lsp.JsonRPCMessage.ID {
+        const id = server.next_server_request_id;
+        server.next_server_request_id += 1;
+        return .{ .number = id };
+    }
+
+    fn nextProgressToken(server: *Server) types.ProgressToken {
+        const token = server.next_server_request_id;
+        server.next_server_request_id += 1;
+        return .{ .integer = @intCast(token) };
+    }
+
+    fn beginWorkDoneProgress(
+        server: *Server,
+        token: types.ProgressToken,
+        title: []const u8,
+        message: []const u8,
+    ) Error!void {
+        if (!server.client_supports_work_done_progress) return;
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+
+        try transport.writeRequest(
+            io,
+            server.allocator,
+            server.nextRequestId(),
+            "window/workDoneProgress/create",
+            lsp.ParamsType("window/workDoneProgress/create"),
+            .{ .token = token },
+            .{ .emit_null_optional_fields = false },
+        );
+        try transport.writeNotification(
+            io,
+            server.allocator,
+            "$/progress",
+            struct {
+                token: types.ProgressToken,
+                value: struct {
+                    kind: []const u8 = "begin",
+                    title: []const u8,
+                    message: []const u8,
+                },
+            },
+            .{
+                .token = token,
+                .value = .{
+                    .title = title,
+                    .message = message,
+                },
+            },
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+
+    fn endWorkDoneProgress(
+        server: *Server,
+        token: types.ProgressToken,
+        message: []const u8,
+    ) Error!void {
+        if (!server.client_supports_work_done_progress) return;
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+
+        try transport.writeNotification(
+            io,
+            server.allocator,
+            "$/progress",
+            struct {
+                token: types.ProgressToken,
+                value: struct {
+                    kind: []const u8 = "end",
+                    message: []const u8,
+                },
+            },
+            .{
+                .token = token,
+                .value = .{ .message = message },
+            },
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+
+    fn refreshSemanticTokens(server: *Server) Error!void {
+        if (!server.client_supports_semantic_tokens_refresh) return;
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+
+        try transport.writeRequest(
+            io,
+            server.allocator,
+            server.nextRequestId(),
+            "workspace/semanticTokens/refresh",
+            ?void,
+            null,
+            .{ .emit_null_optional_fields = false },
+        );
     }
 
     fn getDocument(server: *Server, uri: []const u8) ?*Document {

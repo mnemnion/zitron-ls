@@ -79,7 +79,7 @@ pub fn init(allocator: std.mem.Allocator, version: i32, text: []const u8) Error!
     errdefer parsed.tree.destroy();
 
     const text_copy = try allocator.dupe(u8, text);
-    errdefer allocator.free(text_copy);
+    errdefer comptime unreachable;
 
     return .{
         .source = text_copy,
@@ -103,7 +103,7 @@ pub fn replace(document: *Document, allocator: std.mem.Allocator, version: i32, 
     errdefer parsed.tree.destroy();
 
     const text_copy = try allocator.dupe(u8, text);
-    errdefer allocator.free(text_copy);
+    errdefer comptime unreachable;
 
     allocator.free(document.source);
     document.tree.destroy();
@@ -139,7 +139,7 @@ pub fn updateIncremental(
     errdefer parsed.tree.destroy();
 
     const text_copy = try allocator.dupe(u8, applied_change.text);
-    errdefer allocator.free(text_copy);
+    errdefer comptime unreachable;
 
     allocator.free(document.source);
     document.tree.destroy();

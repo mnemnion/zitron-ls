@@ -4,6 +4,8 @@ const error_set = error{
     MissingResult,
     MissingServerInfo,
     ChildProcessFailed,
+    MissingWorkDoneProgress,
+    MissingSemanticTokensRefresh,
 };
 const Error = error_set ||
     zitron.FixtureError ||
@@ -21,6 +23,11 @@ const Error = error_set ||
         TestExpectedEqual,
         TestUnexpectedResult,
     };
+
+var saw_work_done_progress_create = false;
+var saw_progress_begin = false;
+var saw_progress_end = false;
+var saw_semantic_tokens_refresh = false;
 
 /// Runs the end-to-end stdio smoke client against the built server binary.
 pub fn main(init: std.process.Init) Error!void {
@@ -62,6 +69,12 @@ pub fn main(init: std.process.Init) Error!void {
             .capabilities = .{
                 .general = .{
                     .positionEncodings = &.{ .@"utf-8", .@"utf-16" },
+                },
+                .workspace = .{
+                    .semanticTokens = .{ .refreshSupport = true },
+                },
+                .window = .{
+                    .workDoneProgress = true,
                 },
             },
         },
@@ -388,6 +401,13 @@ pub fn main(init: std.process.Init) Error!void {
         .{ .emit_null_optional_fields = false },
     );
     try expectSuccessfulResponse(init.io, allocator, &transport.transport, 19);
+
+    if (!saw_work_done_progress_create or !saw_progress_begin or !saw_progress_end) {
+        return error_set.MissingWorkDoneProgress;
+    }
+    if (!saw_semantic_tokens_refresh) {
+        return error_set.MissingSemanticTokensRefresh;
+    }
 
     try transport.transport.writeNotification(
         init.io,
@@ -824,15 +844,64 @@ fn readResponseJsonMessage(
                 return json_message;
             },
             .notification => {
+                try observeServerNotification(parsed.value.notification);
                 allocator.free(json_message);
                 continue;
             },
             .request => {
+                try answerServerRequest(io, allocator, transport, parsed.value.request);
                 allocator.free(json_message);
                 continue;
             },
         }
     }
+}
+
+fn observeServerNotification(notification: lsp.JsonRPCMessage.Notification) Error!void {
+    if (!std.mem.eql(u8, notification.method, "$/progress")) return;
+    const params = notification.params orelse return error_set.UnexpectedResponse;
+    const params_object = switch (params) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const value = params_object.get("value") orelse return error_set.UnexpectedResponse;
+    const value_object = switch (value) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const kind = switch (value_object.get("kind") orelse return error_set.UnexpectedResponse) {
+        .string => |kind| kind,
+        else => return error_set.UnexpectedResponse,
+    };
+    if (std.mem.eql(u8, kind, "begin")) {
+        saw_progress_begin = true;
+    } else if (std.mem.eql(u8, kind, "end")) {
+        saw_progress_end = true;
+    }
+}
+
+fn answerServerRequest(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    request: lsp.JsonRPCMessage.Request,
+) Error!void {
+    if (std.mem.eql(u8, request.method, "window/workDoneProgress/create")) {
+        saw_work_done_progress_create = true;
+    } else if (std.mem.eql(u8, request.method, "workspace/semanticTokens/refresh")) {
+        saw_semantic_tokens_refresh = true;
+    } else {
+        return error_set.UnexpectedResponse;
+    }
+
+    try transport.writeResponse(
+        io,
+        allocator,
+        request.id,
+        ?void,
+        null,
+        .{ .emit_null_optional_fields = false },
+    );
 }
 
 fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {

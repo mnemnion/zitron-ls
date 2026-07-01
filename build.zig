@@ -116,6 +116,37 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "run the end-to-end stdio smoke test");
     smoke_step.dependOn(&run_client_cmd.step);
 
+    const python = b.option(
+        []const u8,
+        "python",
+        "Python interpreter for development tools",
+    ) orelse "/Users/atman/Dropbox/deck/m/skills/.venv/bin/python";
+
+    const extract_replay_cmd = b.addSystemCommand(&.{
+        python,
+        "tools/extract_replay.py",
+    });
+    if (b.args) |args| extract_replay_cmd.addArgs(args);
+    const extract_replay_step = b.step("extract-replay", "extract a replay file from the latest runtime log session");
+    extract_replay_step.dependOn(&extract_replay_cmd.step);
+
+    const replay_client_cmd = b.addSystemCommand(&.{
+        python,
+        "tools/replay_client.py",
+    });
+    replay_client_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| replay_client_cmd.addArgs(args);
+    const replay_client_step = b.step("replay-client", "replay extracted client actions against lsp_zitron");
+    replay_client_step.dependOn(&replay_client_cmd.step);
+
+    const timing_report_cmd = b.addSystemCommand(&.{
+        python,
+        "tools/timing_report.py",
+    });
+    if (b.args) |args| timing_report_cmd.addArgs(args);
+    const timing_report_step = b.step("timing-report", "summarize timings from the latest runtime log session");
+    timing_report_step.dependOn(&timing_report_cmd.step);
+
     const test_filters = b.option(
         []const []const u8,
         "test-filter",
