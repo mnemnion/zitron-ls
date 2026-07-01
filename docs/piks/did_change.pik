@@ -1,0 +1,25 @@
+Client: file "client" fill darksalmon
+down; move height 0.3
+DidChange: box "didChange" textcolor red fill lightpink
+arrow from Client.end to DidChange.start
+down; move from DidChange.s; left; move
+Diff: box "update" "tree-sitter"
+arrow from DidChange.w left until even with Diff.n then down to Diff.n
+down; move from DidChange.e; move; right; move width 0.5
+Lines: box "Zitron" big fill yellow color orange textcolor orange
+arrow from DidChange.e right until even with Lines.n then down to Lines.n color darkred dashed
+line from 0.05 north of DidChange.e right until even with Lines.n invisible "call" big above textcolor darkred
+move from DidChange.e right until even with Lines.n;
+line invisible to Lines.n "stdin" aligned above textcolor blue;
+arrow from Zitron.w left width 0.5
+circle "diagnostics" small small fit
+line from last arrow to Zitron.w invisible "stderr    " aligned above textcolor pink
+down
+arrow from Zitron.s color gold dashed "⚡️     " "     ⚡️";
+Zig: diamond "Zig" fit
+down; move; left; move;
+Spans: box radius 0.1 "Span" "translator";
+arrow from Zig.sw to Spans.ne;
+down; move from Zig.s; right; move;
+ZLS: box radius 0.1 "ZLS" big big textcolor RebeccaPurple;
+arrow from Zig.se to ZLS.nw;
