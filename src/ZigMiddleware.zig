@@ -25,11 +25,17 @@ const Middleware = struct {
     diagnostics_publisher: ?DiagnosticsPublisher,
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
+    zls_mutex: std.Io.Mutex = .init,
+    pending_zls_updates: std.Deque(ZlsUpdateFuture) = .empty,
     zls_library: ZlsAdapter = undefined,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
 
     fn deinit(middleware: *Middleware) void {
+        middleware.drainPendingZlsUpdates() catch |err| {
+            log.warn("ZLS update drain failed during deinit: {}", .{err});
+        };
+        middleware.pending_zls_updates.deinit(middleware.allocator);
         freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
         middleware.zls_library.deinit();
 
@@ -220,6 +226,10 @@ const Middleware = struct {
         const start = logStart(middleware.io);
         log.debug("Zig close <- uri={s}", .{uri});
 
+        middleware.drainPendingZlsUpdates() catch |err| {
+            log.warn("ZLS update drain failed before close uri={s}: {}", .{ uri, err });
+        };
+
         const removed = blk: {
             middleware.documents_mutex.lockUncancelable(middleware.io);
             defer middleware.documents_mutex.unlock(middleware.io);
@@ -230,12 +240,8 @@ const Middleware = struct {
         var state = removed.value;
         if (state.opened) {
             if (state.currentGeneration()) |generation| {
-                log.debug("ZLS library <- textDocument/didClose uri={s}", .{generation.zig_uri});
-                middleware.zls_library.closeDocument(middleware.allocator, generation.zig_uri) catch |err| {
+                middleware.syncLibraryCloseLocked(generation.zig_uri) catch |err| {
                     log.warn("ZLS library didClose failed uri={s}: {}", .{ generation.zig_uri, err });
-                };
-                middleware.processCapturedZlsMessages() catch |err| {
-                    log.warn("ZLS library captured message ignored after didClose: {}", .{err});
                 };
             }
         }
@@ -258,6 +264,8 @@ const Middleware = struct {
         var log_zig_bytes: usize = 0;
         var log_span_count: usize = 0;
         var log_notified = false;
+
+        try middleware.drainPendingZlsUpdates();
 
         const state_start = logStart(middleware.io);
         {
@@ -283,9 +291,6 @@ const Middleware = struct {
 
             const send_to_zls = generation.generation_error == null;
             if (send_to_zls) {
-                notify_uri = generation.zig_uri;
-                notify_version = generation.version;
-                notify_text = generation.zig_text;
                 if (state.opened) {
                     notify_kind = .change;
                     log_notified = true;
@@ -293,7 +298,6 @@ const Middleware = struct {
                     state.zls_synced_generation_id = generation.generation_id;
                 } else {
                     notify_kind = .open;
-                    notify_text = generation.zig_text;
                     state.opened = true;
                     log_notified = true;
                     state.zls_sync_count += 1;
@@ -310,6 +314,11 @@ const Middleware = struct {
             log_opened = state.opened;
             log_zig_bytes = doc.zig_text.len;
             log_span_count = doc.code_map.len();
+            if (send_to_zls) {
+                notify_uri = doc.zig_uri;
+                notify_version = doc.version;
+                notify_text = doc.zig_text;
+            }
         }
         const state_ns = elapsedNs(middleware.io, state_start);
 
@@ -317,7 +326,7 @@ const Middleware = struct {
         switch (notify_kind) {
             .none => {},
             .change => {
-                try middleware.syncLibraryChange(notify_uri, notify_version, notify_text);
+                try middleware.launchZlsChangeUpdate(notify_uri, notify_version, notify_text);
             },
             .open => {
                 try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
@@ -342,8 +351,6 @@ const Middleware = struct {
             notify_ns,
             elapsedNs(middleware.io, start),
         });
-
-        try middleware.refreshSemanticTokensCurrentIfInitialized(uri);
     }
 
     fn forwardHover(
@@ -407,6 +414,19 @@ const Middleware = struct {
         version: i32,
         zig_text: []const u8,
     ) Error!void {
+        try middleware.drainPendingZlsUpdates();
+        try middleware.syncLibraryOpenLocked(zig_uri, version, zig_text);
+    }
+
+    fn syncLibraryOpenLocked(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        middleware.zls_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_mutex.unlock(middleware.io);
+
         log.debug("ZLS library <- textDocument/didOpen uri={s} version={} zig_bytes={}", .{
             zig_uri,
             version,
@@ -422,6 +442,19 @@ const Middleware = struct {
         version: i32,
         zig_text: []const u8,
     ) Error!void {
+        try middleware.drainPendingZlsUpdates();
+        try middleware.syncLibraryChangeLocked(zig_uri, version, zig_text);
+    }
+
+    fn syncLibraryChangeLocked(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        middleware.zls_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_mutex.unlock(middleware.io);
+
         log.debug("ZLS library <- textDocument/didChange uri={s} version={} zig_bytes={}", .{
             zig_uri,
             version,
@@ -429,6 +462,76 @@ const Middleware = struct {
         });
         try middleware.zls_library.replaceDocument(middleware.allocator, zig_uri, version, zig_text);
         try middleware.processCapturedZlsMessages();
+    }
+
+    fn syncLibraryCloseLocked(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+    ) Error!void {
+        middleware.zls_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_mutex.unlock(middleware.io);
+
+        log.debug("ZLS library <- textDocument/didClose uri={s}", .{zig_uri});
+        try middleware.zls_library.closeDocument(middleware.allocator, zig_uri);
+        try middleware.processCapturedZlsMessages();
+    }
+
+    fn launchZlsChangeUpdate(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        var future = std.Io.concurrent(
+            middleware.io,
+            runZlsChangeUpdate,
+            .{ middleware, zig_uri, version, zig_text },
+        ) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => {
+                log.debug("ZLS update async unavailable uri={s} version={} reason=concurrency_unavailable", .{
+                    zig_uri,
+                    version,
+                });
+                try middleware.runZlsChangeUpdate(zig_uri, version, zig_text);
+                return;
+            },
+        };
+        errdefer _ = future.cancel(middleware.io) catch {};
+
+        middleware.pending_zls_updates.pushBack(middleware.allocator, future) catch |err| {
+            try future.await(middleware.io);
+            return err;
+        };
+    }
+
+    fn runZlsChangeUpdate(
+        middleware: *Middleware,
+        zig_uri: []const u8,
+        version: i32,
+        zig_text: []const u8,
+    ) Error!void {
+        const start = logStart(middleware.io);
+        try middleware.syncLibraryChangeLocked(zig_uri, version, zig_text);
+        log.debug("ZLS update async -> textDocument/didChange uri={s} version={} elapsed_ns={}", .{
+            zig_uri,
+            version,
+            elapsedNs(middleware.io, start),
+        });
+    }
+
+    fn drainPendingZlsUpdates(middleware: *Middleware) Error!void {
+        var first_error: ?Error = null;
+        while (middleware.pending_zls_updates.popFront()) |future_value| {
+            var future = future_value;
+            const start = logStart(middleware.io);
+            future.await(middleware.io) catch |err| {
+                log.warn("ZLS update wait failed: {}", .{err});
+                if (first_error == null) first_error = err;
+                continue;
+            };
+            log.debug("ZLS update wait elapsed_ns={}", .{elapsedNs(middleware.io, start)});
+        }
+        if (first_error) |err| return err;
     }
 
     fn forwardDeclaration(
@@ -1214,7 +1317,7 @@ const Middleware = struct {
         const start = logStart(middleware.io);
         var mapped = params;
         mapped.textDocument = .{ .uri = doc.zig_uri };
-        const result = (try middleware.request(arena, "textDocument/semanticTokens/full", mapped)) orelse {
+        const result = (try middleware.requestZlsLocked(arena, "textDocument/semanticTokens/full", mapped)) orelse {
             log.debug("Zig semantic current init_full uri={s} result=null reason=zls_null elapsed_ns={}", .{
                 zy_uri,
                 elapsedNs(middleware.io, start),
@@ -1232,21 +1335,6 @@ const Middleware = struct {
             elapsedNs(middleware.io, start),
         });
         return current;
-    }
-
-    fn refreshSemanticTokensCurrentIfInitialized(
-        middleware: *Middleware,
-        zy_uri: []const u8,
-    ) Error!void {
-        const state = middleware.documents.getPtr(zy_uri) orelse return;
-        const doc = state.currentGeneration() orelse return;
-        if (doc.generation_error != null) return;
-        const current = &(state.semantic_tokens_current orelse return);
-        if (current.version == doc.version) return;
-
-        var arena_state = std.heap.ArenaAllocator.init(middleware.allocator);
-        defer arena_state.deinit();
-        try middleware.updateSemanticTokensCurrent(arena_state.allocator(), zy_uri, doc, current, null);
     }
 
     fn updateSemanticTokensCurrent(
@@ -1287,7 +1375,7 @@ const Middleware = struct {
             .workDoneToken = null,
             .partialResultToken = null,
         };
-        const range_result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
+        const range_result = (try middleware.requestZlsLocked(arena, "textDocument/semanticTokens/range", mapped)) orelse {
             log.debug("Zig semantic current {t} uri={s} result=null reason=zls_range_null elapsed_ns={}", .{
                 route,
                 zy_uri,
@@ -1455,7 +1543,7 @@ const Middleware = struct {
             .partialResultToken = params.partialResultToken,
         };
         const zls_start = logStart(middleware.io);
-        const range_result = (try middleware.request(arena, "textDocument/semanticTokens/range", mapped)) orelse {
+        const range_result = (try middleware.requestZlsLocked(arena, "textDocument/semanticTokens/range", mapped)) orelse {
             log.debug("Zig forward semanticTokens/full/delta -> uri={s} result=null reason=zls_range_null elapsed_ns={}", .{
                 zy_uri,
                 elapsedNs(middleware.io, start),
@@ -1595,6 +1683,19 @@ const Middleware = struct {
         comptime method: []const u8,
         params: lsp.ParamsType(method),
     ) Error!lsp.ResultType(method) {
+        try middleware.drainPendingZlsUpdates();
+        return try middleware.requestZlsLocked(arena, method, params);
+    }
+
+    fn requestZlsLocked(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        comptime method: []const u8,
+        params: lsp.ParamsType(method),
+    ) Error!lsp.ResultType(method) {
+        middleware.zls_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_mutex.unlock(middleware.io);
+
         const start = logStart(middleware.io);
         log.debug("ZLS library <- {s}", .{method});
         const result = try middleware.zls_library.request(arena, method, params);
@@ -1620,6 +1721,7 @@ const Middleware = struct {
     }
 
     fn documentReady(middleware: *Middleware, zy_uri: []const u8) Error!*ZigDocument {
+        try middleware.drainPendingZlsUpdates();
         const state = middleware.documents.getPtr(zy_uri) orelse return error.MissingZigDocument;
         const doc = state.currentGeneration() orelse return error.MissingZigDocument;
         if (doc.generation_error != null) return error.RequestFailed;
@@ -1758,6 +1860,8 @@ pub const Error =
         UnexpectedResponse,
         UnsupportedUri,
     };
+
+const ZlsUpdateFuture = std.Io.Future(Error!void);
 
 const ZigDocument = struct {
     generation_id: usize = 0,
@@ -2449,9 +2553,10 @@ pub const CodeMap = struct {
         }
 
         fn zyPositionToZig(span: ZigSpan, position: types.Position) types.Position {
+            const line_delta = position.line -| span.zy_line;
             return .{
-                .line = span.zig_line + (position.line - span.zy_line),
-                .character = position.character,
+                .line = span.zig_line + line_delta,
+                .character = if (position.line < span.zy_line) 0 else position.character,
             };
         }
 
@@ -5724,6 +5829,51 @@ test "directive shortcut fast mapping honors first-line zy column skew" {
     }, translated);
     try expectEqual(map.len(), map.translators.len());
     try expectEqual(@as(usize, 0), map.translators.freshLen(0));
+}
+
+test "directive shortcut fast mapping clamps ranges before line directive span" {
+    const zy =
+        \\rule ::= TOKEN. {
+        \\const answer = 42;
+        \\}
+    ;
+    const zig = "const answer = 42;";
+
+    var map: CodeMap = .{};
+    defer map.deinit(testing_allocator);
+    try map.zig_span.append(testing_allocator, .{
+        .zy_line = 1,
+        .zig_line = 0,
+        .line_count = 1,
+        .zig_range = .{ .start = 0, .end = zig.len },
+    });
+    try map.zy_range.append(testing_allocator, .{
+        .start_byte = 16,
+        .end_byte = zy.len - 1,
+        .start_point = .{ .row = 0, .column = 16 },
+        .end_point = .{ .row = 2, .column = 0 },
+    });
+    try map.fast_column_mapping.append(testing_allocator, true);
+    try map.rebuildZyOrder(testing_allocator);
+
+    try expectEqual(types.Position{ .line = 0, .character = 0 }, map.zyPositionToZigInSpanFromText(0, zy, .{
+        .line = 0,
+        .character = 16,
+    }));
+    try expectEqual(types.Range{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 0, .character = 8 },
+    }, (try zyRangeToZigRange(
+        testing_allocator,
+        &map,
+        0,
+        zy,
+        zig,
+        .{
+            .start = .{ .line = 0, .character = 16 },
+            .end = .{ .line = 1, .character = 8 },
+        },
+    )).?);
 }
 
 test "code map reports optimized-away code blocks as unmapped" {
