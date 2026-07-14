@@ -26,7 +26,14 @@ const Middleware = struct {
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
     zls_mutex: std.Io.Mutex,
-    pending_zls_updates: std.Deque(ZlsUpdateFuture),
+    zls_update_buffer: [max_pending_zls_updates]ZlsChangeUpdate = undefined,
+    zls_updates: std.Io.Queue(ZlsChangeUpdate) = undefined,
+    zls_update_worker: ?ZlsUpdateWorkerFuture = null,
+    zls_updates_mutex: std.Io.Mutex = .init,
+    zls_updates_changed: std.Io.Condition = .init,
+    zls_updates_submitted: usize = 0,
+    zls_updates_completed: usize = 0,
+    zls_update_error: ?Error = null,
     zls_library: ZlsAdapter,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
@@ -35,7 +42,11 @@ const Middleware = struct {
         middleware.drainPendingZlsUpdates() catch |err| {
             log.warn("ZLS update drain failed during deinit: {}", .{err});
         };
-        middleware.pending_zls_updates.deinit(middleware.allocator);
+        if (middleware.zls_update_worker) |*worker| {
+            middleware.zls_updates.close(middleware.io);
+            worker.await(middleware.io);
+            middleware.zls_update_worker = null;
+        }
         freeStringSlices(middleware.allocator, middleware.zls_completion_triggers);
         middleware.zls_library.deinit();
 
@@ -255,14 +266,13 @@ const Middleware = struct {
         var notify_kind: enum { none, open, change } = .none;
         var notify_uri: []const u8 = &.{};
         var notify_version: i32 = 0;
+        var notify_generation_id: usize = 0;
         var notify_text: []const u8 = &.{};
         var log_version: i32 = 0;
         var log_opened = false;
         var log_zig_bytes: usize = 0;
         var log_span_count: usize = 0;
         var log_notified = false;
-
-        try middleware.drainPendingZlsUpdates();
 
         const state_start = logStart(middleware.io);
         {
@@ -291,7 +301,6 @@ const Middleware = struct {
                 if (state.opened) {
                     notify_kind = .change;
                     log_notified = true;
-                    state.zls_synced_generation_id = generation.generation_id;
                 } else {
                     notify_kind = .open;
                     state.opened = true;
@@ -312,6 +321,7 @@ const Middleware = struct {
             if (send_to_zls) {
                 notify_uri = doc.zig_uri;
                 notify_version = doc.version;
+                notify_generation_id = doc.generation_id;
                 notify_text = doc.zig_text;
             }
         }
@@ -321,7 +331,7 @@ const Middleware = struct {
         switch (notify_kind) {
             .none => {},
             .change => {
-                try middleware.launchZlsChangeUpdate(notify_uri, notify_version, notify_text);
+                try middleware.launchZlsChangeUpdate(notify_uri, notify_version, notify_generation_id, notify_text);
             },
             .open => {
                 try middleware.syncLibraryOpen(notify_uri, notify_version, notify_text);
@@ -475,28 +485,82 @@ const Middleware = struct {
         middleware: *Middleware,
         zig_uri: []const u8,
         version: i32,
+        generation_id: usize,
         zig_text: []const u8,
     ) Error!void {
-        var future = std.Io.concurrent(
-            middleware.io,
-            runZlsChangeUpdate,
-            .{ middleware, zig_uri, version, zig_text },
-        ) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                log.debug("ZLS update async unavailable uri={s} version={} reason=concurrency_unavailable", .{
-                    zig_uri,
-                    version,
-                });
-                try middleware.runZlsChangeUpdate(zig_uri, version, zig_text);
-                return;
-            },
-        };
-        errdefer _ = future.cancel(middleware.io) catch {};
+        if (middleware.zls_update_worker == null) {
+            middleware.markZlsUpdateStarted(zig_uri, generation_id);
+            try middleware.runZlsChangeUpdate(zig_uri, version, zig_text);
+            return;
+        }
 
-        middleware.pending_zls_updates.pushBack(middleware.allocator, future) catch |err| {
-            try future.await(middleware.io);
-            return err;
+        var update = ZlsChangeUpdate{
+            .zig_uri = try middleware.allocator.dupe(u8, zig_uri),
+            .version = version,
+            .generation_id = generation_id,
+            .zig_text = &.{},
+            .sequence = 0,
         };
+        errdefer update.deinit(middleware.allocator);
+        update.zig_text = try middleware.allocator.dupe(u8, zig_text);
+
+        middleware.zls_updates_mutex.lockUncancelable(middleware.io);
+        middleware.zls_updates_submitted += 1;
+        update.sequence = middleware.zls_updates_submitted;
+        middleware.zls_updates_mutex.unlock(middleware.io);
+
+        middleware.zls_updates.putOneUncancelable(middleware.io, update) catch unreachable;
+        log.debug("ZLS update queued uri={s} version={} sequence={}", .{ zig_uri, version, update.sequence });
+    }
+
+    fn runZlsUpdateWorker(middleware: *Middleware) void {
+        var batch: [max_pending_zls_updates]ZlsChangeUpdate = undefined;
+        while (true) {
+            batch[0] = middleware.zls_updates.getOneUncancelable(middleware.io) catch return;
+            const extra_count = middleware.zls_updates.getUncancelable(middleware.io, batch[1..], 0) catch 0;
+            const batch_count = extra_count + 1;
+
+            var index: usize = 0;
+            while (index < batch_count) {
+                var update = batch[index];
+                index += 1;
+                while (index < batch_count and std.mem.eql(u8, update.zig_uri, batch[index].zig_uri)) : (index += 1) {
+                    const superseded = update.version;
+                    update.deinit(middleware.allocator);
+                    update = batch[index];
+                    log.debug("ZLS update coalesced uri={s} superseded_version={} selected_version={}", .{
+                        update.zig_uri,
+                        superseded,
+                        update.version,
+                    });
+                }
+
+                middleware.markZlsUpdateStarted(update.zig_uri, update.generation_id);
+                var update_error: ?Error = null;
+                middleware.runZlsChangeUpdate(update.zig_uri, update.version, update.zig_text) catch |err| {
+                    update_error = err;
+                };
+                middleware.finishZlsUpdate(update.sequence, update_error);
+                update.deinit(middleware.allocator);
+            }
+        }
+    }
+
+    fn markZlsUpdateStarted(middleware: *Middleware, zig_uri: []const u8, generation_id: usize) void {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        const state = middleware.documentForZigUri(zig_uri) orelse return;
+        state.zls_synced_generation_id = generation_id;
+    }
+
+    fn finishZlsUpdate(middleware: *Middleware, sequence: usize, maybe_error: ?Error) void {
+        middleware.zls_updates_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_updates_mutex.unlock(middleware.io);
+        middleware.zls_updates_completed = sequence;
+        if (maybe_error) |err| {
+            if (middleware.zls_update_error == null) middleware.zls_update_error = err;
+        }
+        middleware.zls_updates_changed.broadcast(middleware.io);
     }
 
     fn runZlsChangeUpdate(
@@ -515,18 +579,26 @@ const Middleware = struct {
     }
 
     fn drainPendingZlsUpdates(middleware: *Middleware) Error!void {
-        var first_error: ?Error = null;
-        while (middleware.pending_zls_updates.popFront()) |future_value| {
-            var future = future_value;
-            const start = logStart(middleware.io);
-            future.await(middleware.io) catch |err| {
-                log.warn("ZLS update wait failed: {}", .{err});
-                if (first_error == null) first_error = err;
-                continue;
-            };
-            log.debug("ZLS update wait elapsed_ns={}", .{elapsedNs(middleware.io, start)});
+        if (middleware.zls_update_worker == null) return;
+        const start = logStart(middleware.io);
+        middleware.zls_updates_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_updates_mutex.unlock(middleware.io);
+        const target = middleware.zls_updates_submitted;
+        var waited = false;
+        while (middleware.zls_updates_completed < target) {
+            waited = true;
+            middleware.zls_updates_changed.waitUncancelable(middleware.io, &middleware.zls_updates_mutex);
         }
-        if (first_error) |err| return err;
+        const maybe_error = middleware.zls_update_error;
+        middleware.zls_update_error = null;
+        if (waited or maybe_error != null) {
+            log.debug("ZLS update barrier target={} completed={} elapsed_ns={}", .{
+                target,
+                middleware.zls_updates_completed,
+                elapsedNs(middleware.io, start),
+            });
+        }
+        if (maybe_error) |err| return err;
     }
 
     fn forwardDeclaration(
@@ -1734,7 +1806,21 @@ pub const Error =
         UnsupportedUri,
     };
 
-const ZlsUpdateFuture = std.Io.Future(Error!void);
+const max_pending_zls_updates = 64;
+const ZlsUpdateWorkerFuture = std.Io.Future(void);
+
+const ZlsChangeUpdate = struct {
+    zig_uri: []u8,
+    version: i32,
+    generation_id: usize,
+    zig_text: []u8,
+    sequence: usize,
+
+    fn deinit(update: *ZlsChangeUpdate, allocator: std.mem.Allocator) void {
+        allocator.free(update.zig_uri);
+        allocator.free(update.zig_text);
+    }
+};
 
 const ZigDocument = struct {
     generation_id: usize,
@@ -1883,10 +1969,14 @@ fn initImpl(
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = zls_library,
         .zls_completion_triggers = zls_completion_triggers,
         .next_generation_id = 1,
+    };
+    mware.zls_updates = .init(&mware.zls_update_buffer);
+    mware.zls_update_worker = std.Io.concurrent(io, Middleware.runZlsUpdateWorker, .{mware}) catch |err| blk: {
+        log.debug("ZLS update worker unavailable reason={}", .{err});
+        break :blk null;
     };
     log.info("ZLS middleware enabled", .{});
     return .{ .mode = .{ .enabled = mware } };
@@ -5983,7 +6073,6 @@ test "alias code block rename refuses unmapped zy blocks" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -6065,7 +6154,6 @@ test "forward requests return null while generation has errors" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -6282,7 +6370,6 @@ test "ZLS diagnostics for stale generation do not replace current diagnostics" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -6342,7 +6429,6 @@ test "ZLS diagnostics with null version publish after repeated current syncs" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -7833,7 +7919,6 @@ test "semantic token requests serve fresh current collection without zls" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -7932,7 +8017,6 @@ test "stale semantic token current updates without zls when zig is unchanged" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
@@ -7988,7 +8072,6 @@ test "stale document dirty range does not under-cover semantic current update" {
         .documents_mutex = .init,
         .documents = .empty,
         .zls_mutex = .init,
-        .pending_zls_updates = .empty,
         .zls_library = undefined,
         .zls_completion_triggers = &.{},
         .next_generation_id = 1,
