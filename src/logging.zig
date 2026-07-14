@@ -33,6 +33,7 @@ pub const State = struct {
 var log_file: ?std.Io.File = null;
 var runtime_log_level: std.log.Level = if (builtin.mode == .Debug) .debug else .info;
 var log_stderr: bool = true;
+var log_mutex: std.Io.Mutex = .init;
 
 pub fn init(
     io: std.Io,
@@ -64,6 +65,8 @@ pub fn logFn(
     const io = std.Options.debug_io;
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
+    log_mutex.lockUncancelable(io);
+    defer log_mutex.unlock(io);
 
     var buffer: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);

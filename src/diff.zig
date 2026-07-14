@@ -1,32 +1,21 @@
 //! Applies LSP document change events.
 
 const AppliedChange = struct {
-    text: [:0]const u8,
+    text: ?[]u8,
     input_edits: ArrayList(ts.InputEdit),
+
+    pub fn takeText(applied_change: *AppliedChange) []u8 {
+        const text = applied_change.text orelse unreachable;
+        applied_change.text = null;
+        return text;
+    }
 
     /// Releases the owned text buffer and collected tree-sitter edits.
     pub fn deinit(applied_change: *AppliedChange, allocator: Allocator) void {
-        allocator.free(applied_change.text);
+        if (applied_change.text) |text| allocator.free(text);
         applied_change.input_edits.deinit(allocator);
     }
 };
-
-/// Applies a sequence of LSP content changes to `text` in notification order.
-pub fn applyContentChanges(
-    allocator: Allocator,
-    text: []const u8,
-    content_changes: []const types.TextDocumentContentChangeEvent,
-    encoding: lsp.offsets.Encoding,
-) OOM![:0]const u8 {
-    var applied_change = try applyContentChangesWithEdits(
-        allocator,
-        text,
-        content_changes,
-        encoding,
-    );
-    defer applied_change.deinit(allocator);
-    return try allocator.dupeZ(u8, applied_change.text);
-}
 
 /// Applies content changes and returns both the updated text and tree-sitter edits.
 pub fn applyContentChangesWithEdits(
@@ -61,38 +50,34 @@ pub fn applyContentChangesWithEdits(
             .text_document_content_change_partial => |change| change,
             .text_document_content_change_whole_document => unreachable,
         };
-        const input_edit = inputEditForPartialChange(
-            text_array.items,
-            partial,
-            encoding,
-        );
         const loc = lsp.offsets.rangeToLoc(text_array.items, partial.range, encoding);
+        const input_edit = inputEditForPartialChange(text_array.items, partial.text, loc.start, loc.end);
         try input_edits.append(allocator, input_edit);
         try text_array.replaceRange(allocator, loc.start, loc.end - loc.start, partial.text);
     }
 
     return .{
-        .text = try text_array.toOwnedSliceSentinel(allocator, 0),
+        .text = try text_array.toOwnedSlice(allocator),
         .input_edits = input_edits,
     };
 }
 
 fn inputEditForPartialChange(
     text: []const u8,
-    partial: anytype,
-    encoding: lsp.offsets.Encoding,
+    replacement: []const u8,
+    start: usize,
+    old_end: usize,
 ) ts.InputEdit {
-    const loc = lsp.offsets.rangeToLoc(text, partial.range, encoding);
-    const start_point = pointFromByteIndex(text, loc.start);
-    const old_end_point = pointFromByteIndex(text, loc.end);
+    const start_point = pointFromByteIndex(text, start);
+    const old_end_point = advancePoint(start_point, text[start..old_end]);
 
     return .{
-        .start_byte = @intCast(loc.start),
-        .old_end_byte = @intCast(loc.end),
-        .new_end_byte = @intCast(loc.start + partial.text.len),
+        .start_byte = @intCast(start),
+        .old_end_byte = @intCast(old_end),
+        .new_end_byte = @intCast(start + replacement.len),
         .start_point = start_point,
         .old_end_point = old_end_point,
-        .new_end_point = advancePoint(start_point, partial.text),
+        .new_end_point = advancePoint(start_point, replacement),
     };
 }
 
@@ -131,16 +116,16 @@ const expectEqualDeep = testing.expectEqualDeep;
 const expectEqualStrings = testing.expectEqualStrings;
 
 test "apply content changes handles whole document replacement" {
-    const updated = try applyContentChanges(testing.allocator, "old", &.{
+    var applied_change = try applyContentChangesWithEdits(testing.allocator, "old", &.{
         .{ .text_document_content_change_whole_document = .{ .text = "new" } },
     }, .@"utf-8");
-    defer testing.allocator.free(updated);
+    defer applied_change.deinit(testing.allocator);
 
-    try expectEqualStrings("new", updated);
+    try expectEqualStrings("new", applied_change.text.?);
 }
 
 test "apply content changes handles ordered partial edits" {
-    const updated = try applyContentChanges(testing.allocator, "calc ::= expr\n", &.{
+    var applied_change = try applyContentChangesWithEdits(testing.allocator, "calc ::= expr\n", &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
@@ -158,13 +143,13 @@ test "apply content changes handles ordered partial edits" {
             .text = "term",
         } },
     }, .@"utf-8");
-    defer testing.allocator.free(updated);
+    defer applied_change.deinit(testing.allocator);
 
-    try expectEqualStrings("start ::= term\n", updated);
+    try expectEqualStrings("start ::= term\n", applied_change.text.?);
 }
 
 test "apply content changes uses last full text before trailing partial edits" {
-    const updated = try applyContentChanges(testing.allocator, "ignored", &.{
+    var applied_change = try applyContentChangesWithEdits(testing.allocator, "ignored", &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
@@ -183,13 +168,13 @@ test "apply content changes uses last full text before trailing partial edits" {
             .text = "term",
         } },
     }, .@"utf-8");
-    defer testing.allocator.free(updated);
+    defer applied_change.deinit(testing.allocator);
 
-    try expectEqualStrings("calc ::= term", updated);
+    try expectEqualStrings("calc ::= term", applied_change.text.?);
 }
 
 test "apply content changes handles utf-16 ranges" {
-    const updated = try applyContentChanges(testing.allocator, "a¶↉🠁", &.{
+    var applied_change = try applyContentChangesWithEdits(testing.allocator, "a¶↉🠁", &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 2 },
@@ -199,9 +184,9 @@ test "apply content changes handles utf-16 ranges" {
             .text = "!",
         } },
     }, .@"utf-16");
-    defer testing.allocator.free(updated);
+    defer applied_change.deinit(testing.allocator);
 
-    try expectEqualStrings("a¶!🠁", updated);
+    try expectEqualStrings("a¶!🠁", applied_change.text.?);
 }
 
 test "input edit handles single-line replacement" {
@@ -213,7 +198,9 @@ test "input edit handles single-line replacement" {
         .rangeLength = 4,
         .text = "start",
     } };
-    const input_edit = inputEditForPartialChange("calc ::= expr\n", partial.text_document_content_change_partial, .@"utf-8");
+    const change = partial.text_document_content_change_partial;
+    const loc = lsp.offsets.rangeToLoc("calc ::= expr\n", change.range, .@"utf-8");
+    const input_edit = inputEditForPartialChange("calc ::= expr\n", change.text, loc.start, loc.end);
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 0,
@@ -234,7 +221,9 @@ test "input edit handles insertion at end of file" {
         .rangeLength = 0,
         .text = "\n",
     } };
-    const input_edit = inputEditForPartialChange("calc", partial.text_document_content_change_partial, .@"utf-8");
+    const change = partial.text_document_content_change_partial;
+    const loc = lsp.offsets.rangeToLoc("calc", change.range, .@"utf-8");
+    const input_edit = inputEditForPartialChange("calc", change.text, loc.start, loc.end);
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 4,
@@ -255,7 +244,9 @@ test "input edit handles utf-16 positions over multibyte text" {
         .rangeLength = 1,
         .text = "!",
     } };
-    const input_edit = inputEditForPartialChange("a¶↉🠁", partial.text_document_content_change_partial, .@"utf-16");
+    const change = partial.text_document_content_change_partial;
+    const loc = lsp.offsets.rangeToLoc("a¶↉🠁", change.range, .@"utf-16");
+    const input_edit = inputEditForPartialChange("a¶↉🠁", change.text, loc.start, loc.end);
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 3,
@@ -276,7 +267,9 @@ test "input edit keeps same-line new end after nonzero column insert" {
         .rangeLength = 0,
         .text = " ::= TOKEN",
     } };
-    const input_edit = inputEditForPartialChange("rule.", partial.text_document_content_change_partial, .@"utf-8");
+    const change = partial.text_document_content_change_partial;
+    const loc = lsp.offsets.rangeToLoc("rule.", change.range, .@"utf-8");
+    const input_edit = inputEditForPartialChange("rule.", change.text, loc.start, loc.end);
 
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 4,
@@ -310,7 +303,7 @@ test "apply content changes with edits handles multiple ordered partial edits" {
     defer applied_change.deinit(testing.allocator);
 
     try expectEqual(@as(usize, 2), applied_change.input_edits.items.len);
-    try expectEqualStrings("start ::= term\n", applied_change.text);
+    try expectEqualStrings("start ::= term\n", applied_change.text.?);
     try expectEqualDeep(ts.InputEdit{
         .start_byte = 0,
         .old_end_byte = 4,
@@ -344,7 +337,7 @@ test "apply content changes with edits handles last full text and trailing parti
     defer applied_change.deinit(testing.allocator);
 
     try expectEqual(@as(usize, 1), applied_change.input_edits.items.len);
-    try expectEqualStrings("calc ::= term", applied_change.text);
+    try expectEqualStrings("calc ::= term", applied_change.text.?);
 }
 
 const std = @import("std");

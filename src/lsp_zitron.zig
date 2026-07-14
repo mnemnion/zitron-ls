@@ -105,7 +105,6 @@ pub const Server = struct {
     pub const Error = Document.Error || ZigMiddleware.Error;
 
     allocator: std.mem.Allocator,
-    scratch_arena: std.heap.ArenaAllocator,
     documents: std.StringHashMapUnmanaged(Document),
     tags_query: *ts.Query,
     rename_query: *ts.Query,
@@ -127,7 +126,6 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
-            .scratch_arena = std.heap.ArenaAllocator.init(allocator),
             .documents = .empty,
             .tags_query = tags_query,
             .rename_query = rename_query,
@@ -168,7 +166,6 @@ pub const Server = struct {
             entry.value_ptr.deinit(server.allocator);
         }
         server.documents.deinit(server.allocator);
-        server.scratch_arena.deinit();
         server.rename_query.destroy();
         server.tags_query.destroy();
     }
@@ -381,7 +378,6 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
-            null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         try server.warmSemanticTokens(params.textDocument.uri);
@@ -405,7 +401,7 @@ pub const Server = struct {
             params.contentChanges.len,
         });
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
-        const change_range = try doc.updateIncremental(
+        try doc.updateIncremental(
             server.allocator,
             params.textDocument.version,
             params.contentChanges,
@@ -416,10 +412,6 @@ pub const Server = struct {
             params.textDocument.version,
             doc.source,
             doc.tree.rootNode(),
-            if (change_range) |range| .{
-                .previous = range.previous,
-                .current = range.current,
-            } else null,
         );
         try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
@@ -1785,7 +1777,7 @@ test "incremental tree-sitter reparse matches fresh parse" {
     var incremental = try Document.init(testing_allocator, 1, sample);
     defer incremental.deinit(testing_allocator);
 
-    _ = try incremental.updateIncremental(testing_allocator, 2, &.{
+    try incremental.updateIncremental(testing_allocator, 2, &.{
         .{ .text_document_content_change_partial = .{
             .range = .{
                 .start = .{ .line = 0, .character = 0 },
