@@ -1337,6 +1337,7 @@ const Middleware = struct {
         arena: std.mem.Allocator,
         doc: *ZigDocument,
         data: []const u32,
+        requested_zig_range: types.Range,
         replacement_zy_range: types.Range,
     ) Error!FilteredSemanticTokens {
         var translation_context = RequestTranslationContext{
@@ -1348,7 +1349,13 @@ const Middleware = struct {
             .active_span_index = null,
         };
         defer translation_context.deinit();
-        return try translateSemanticTokenRangeDataFiltered(arena, data, &translation_context, replacement_zy_range);
+        return try translateSemanticTokenRangeDataFiltered(
+            arena,
+            data,
+            &translation_context,
+            requested_zig_range,
+            replacement_zy_range,
+        );
     }
 
     fn ensureSemanticTokensCurrent(
@@ -1387,7 +1394,7 @@ const Middleware = struct {
         const translated_data = try middleware.translateSemanticTokenRangeForDocument(arena, doc, @constCast(result.data));
         const owned_zy_data = try middleware.allocator.dupe(u32, translated_data);
         errdefer middleware.allocator.free(owned_zy_data);
-        const current = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, owned_zy_data);
+        const current = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, owned_zy_data, null);
         log.debug("Zig semantic current init_full uri={s} zls_tokens={} translated_tokens={} elapsed_ns={}", .{
             zy_uri,
             result.data.len / 5,
@@ -1461,6 +1468,7 @@ const Middleware = struct {
             arena,
             doc,
             range_result.data,
+            zig_range,
             current_zy_range,
         ) catch |err| switch (err) {
             error.UnexpectedResponse => {
@@ -1478,21 +1486,26 @@ const Middleware = struct {
         };
         const filter_translate_ns = elapsedNs(middleware.io, filter_translate_start);
         const rebuild_start = logStart(middleware.io);
-        const current_zy_data = try rebuildSemanticTokenDataFromRange(
+        var rebuilt = try rebuildSemanticTokensFromRange(
             middleware.allocator,
             current.zy_index,
             dirty,
             current_zy_range,
             current_range_tokens.data,
         );
-        errdefer middleware.allocator.free(current_zy_data);
+        errdefer rebuilt.deinit(middleware.allocator);
         const rebuild_ns = elapsedNs(middleware.io, rebuild_start);
         const store_start = logStart(middleware.io);
-        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, current_zy_data);
+        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, rebuilt.data, rebuilt.index);
         const store_ns = elapsedNs(middleware.io, store_start);
-        log.debug("Zig semantic current {t} uri={s} zls_tokens={} scanned_tokens={} translated_tokens={} map_ns={} zls_ns={} filter_translate_ns={} rebuild_ns={} store_ns={} elapsed_ns={}", .{
+        log.debug("Zig semantic current {t} uri={s} zig_ranges={} zig_start={}:{} zig_end={}:{} zls_tokens={} scanned_tokens={} translated_tokens={} map_ns={} zls_ns={} filter_translate_ns={} rebuild_ns={} store_ns={} elapsed_ns={}", .{
             route,
             zy_uri,
+            dirty_zig_ranges.len,
+            zig_range.start.line,
+            zig_range.start.character,
+            zig_range.end.line,
+            zig_range.end.character,
             range_result.data.len / 5,
             current_range_tokens.scanned_count,
             current_range_tokens.translated_count,
@@ -1520,7 +1533,7 @@ const Middleware = struct {
         else
             try middleware.allocator.dupe(u32, current.zy_data);
         errdefer middleware.allocator.free(current_zy_data);
-        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, current_zy_data);
+        _ = try middleware.replaceSemanticTokensCurrentOwned(zy_uri, doc, current_zy_data, null);
         log.debug("Zig semantic current update_no_zig_change uri={s} token_count={} elapsed_ns={}", .{
             zy_uri,
             current_zy_data.len / 5,
@@ -1533,15 +1546,26 @@ const Middleware = struct {
         zy_uri: []const u8,
         doc: *ZigDocument,
         owned_zy_data: []u32,
+        owned_zy_index: ?[]AbsoluteSemanticToken,
     ) OOM!*const SemanticTokenCollection {
         const state = middleware.documents.getPtr(zy_uri) orelse unreachable;
-        const replacement = try SemanticTokenCollection.initOwned(
-            middleware.allocator,
-            doc.version,
-            doc.zy_text,
-            doc.zig_text,
-            owned_zy_data,
-        );
+        const replacement = if (owned_zy_index) |index|
+            try SemanticTokenCollection.initOwnedWithIndex(
+                middleware.allocator,
+                doc.version,
+                doc.zy_text,
+                doc.zig_text,
+                owned_zy_data,
+                index,
+            )
+        else
+            try SemanticTokenCollection.initOwned(
+                middleware.allocator,
+                doc.version,
+                doc.zy_text,
+                doc.zig_text,
+                owned_zy_data,
+            );
         errdefer comptime unreachable;
         if (state.semantic_tokens_current) |*old| old.deinit(middleware.allocator);
         state.semantic_tokens_current = replacement;
@@ -1897,12 +1921,30 @@ const SemanticTokenCollection = struct {
         owned_zy_data: []u32,
     ) OOM!SemanticTokenCollection {
         errdefer allocator.free(owned_zy_data);
+        const owned_zy_index = try semanticTokenIndexFromData(allocator, owned_zy_data);
+        errdefer allocator.free(owned_zy_index);
+        return initOwnedWithIndex(
+            allocator,
+            version,
+            zy_text,
+            zig_text,
+            owned_zy_data,
+            owned_zy_index,
+        );
+    }
+
+    fn initOwnedWithIndex(
+        allocator: std.mem.Allocator,
+        version: i32,
+        zy_text: []const u8,
+        zig_text: []const u8,
+        owned_zy_data: []u32,
+        owned_zy_index: []AbsoluteSemanticToken,
+    ) OOM!SemanticTokenCollection {
         const owned_zy_text = try allocator.dupe(u8, zy_text);
         errdefer allocator.free(owned_zy_text);
         const owned_zig_text = try allocator.dupe(u8, zig_text);
         errdefer allocator.free(owned_zig_text);
-        const owned_zy_index = try semanticTokenIndexFromData(allocator, owned_zy_data);
-        errdefer comptime unreachable;
         return .{
             .version = version,
             .zy_text = owned_zy_text,
@@ -4489,6 +4531,7 @@ fn translateSemanticTokenRangeDataFiltered(
     arena: std.mem.Allocator,
     data: []const u32,
     map: *RequestTranslationContext,
+    requested_zig_range: types.Range,
     replacement_zy_range: types.Range,
 ) Error!FilteredSemanticTokens {
     if (rangeIsEmpty(replacement_zy_range)) {
@@ -4499,9 +4542,9 @@ fn translateSemanticTokenRangeDataFiltered(
         };
     }
 
-    const span_mappings = try semanticSpanMappings(arena, map.map, map.zig_text);
-    defer arena.free(span_mappings);
     var position_cursor = ZigPositionCursor{ .context = map, .span_index = null };
+    var mapped_span_index: ?usize = null;
+    var mapped_span: SemanticSpanMapping = undefined;
     var translated: std.ArrayList(AbsoluteSemanticToken) = .empty;
     defer translated.deinit(arena);
 
@@ -4521,12 +4564,22 @@ fn translateSemanticTokenRangeDataFiltered(
             .end = .{ .line = line, .character = character + length },
         };
         scanned_count += 1;
+        if (!positionLessThan(zig_range.start, requested_zig_range.end)) break;
+        if (!positionLessThan(requested_zig_range.start, zig_range.end)) continue;
 
         const span_index = map.map.zigSpanIndexForRange(zig_range) orelse continue;
-        const zy_range = (try translateSemanticTokenRange(
+        if (mapped_span_index != span_index) {
+            mapped_span_index = span_index;
+            mapped_span = semanticSpanMappingForSpan(
+                map.zig_text,
+                map.map.zig_span.items[span_index],
+                map.map.fast_column_mapping.items[span_index],
+            );
+        }
+        const zy_range = (try translateSemanticTokenRangeFromMapping(
             map,
             &position_cursor,
-            span_mappings,
+            mapped_span,
             span_index,
             zig_range,
         )) orelse continue;
@@ -4831,13 +4884,23 @@ fn semanticTokenIndexFromData(
     return index;
 }
 
-fn rebuildSemanticTokenDataFromRange(
+const SemanticTokenRebuild = struct {
+    data: []u32,
+    index: []AbsoluteSemanticToken,
+
+    fn deinit(rebuilt: *SemanticTokenRebuild, allocator: std.mem.Allocator) void {
+        allocator.free(rebuilt.data);
+        allocator.free(rebuilt.index);
+    }
+};
+
+fn rebuildSemanticTokensFromRange(
     allocator: std.mem.Allocator,
     previous_index: []const AbsoluteSemanticToken,
     dirty: SemanticDirtyRange,
     replacement_range: types.Range,
     current_range_data: []const u32,
-) Error![]u32 {
+) Error!SemanticTokenRebuild {
     const current_range_index = try semanticTokenIndexFromData(allocator, current_range_data);
     defer allocator.free(current_range_index);
     std.mem.sort(AbsoluteSemanticToken, current_range_index, {}, absoluteSemanticTokenLessThan);
@@ -4862,7 +4925,30 @@ fn rebuildSemanticTokenDataFromRange(
     try rebuilt.appendSlice(allocator, current_range_index);
     std.mem.sort(AbsoluteSemanticToken, rebuilt.items, {}, absoluteSemanticTokenLessThan);
 
-    return try semanticTokenDataFromIndex(allocator, rebuilt.items);
+    const data = try semanticTokenDataFromIndex(allocator, rebuilt.items);
+    errdefer allocator.free(data);
+    return .{
+        .data = data,
+        .index = try rebuilt.toOwnedSlice(allocator),
+    };
+}
+
+fn rebuildSemanticTokenDataFromRange(
+    allocator: std.mem.Allocator,
+    previous_index: []const AbsoluteSemanticToken,
+    dirty: SemanticDirtyRange,
+    replacement_range: types.Range,
+    current_range_data: []const u32,
+) Error![]u32 {
+    const rebuilt = try rebuildSemanticTokensFromRange(
+        allocator,
+        previous_index,
+        dirty,
+        replacement_range,
+        current_range_data,
+    );
+    allocator.free(rebuilt.index);
+    return rebuilt.data;
 }
 
 fn rebuildSemanticTokenDataWithoutZigChange(
@@ -7766,9 +7852,9 @@ test "filtered semantic token translation keeps early source range" {
         .start = .{ .line = 2, .character = 0 },
         .end = .{ .line = 3, .character = 0 },
     };
-    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range);
+    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range, replacement_range);
 
-    try expectEqual(@as(usize, line_count), filtered.scanned_count);
+    try expectEqual(@as(usize, 4), filtered.scanned_count);
     try expectEqual(@as(usize, 1), filtered.translated_count);
     try expectFilteredTokenLines(filtered.data, &.{2});
 }
@@ -7797,7 +7883,7 @@ test "filtered semantic token translation keeps source range near end" {
         .start = .{ .line = 126, .character = 0 },
         .end = .{ .line = 127, .character = 0 },
     };
-    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range);
+    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range, replacement_range);
 
     try expectEqual(@as(usize, line_count), filtered.scanned_count);
     try expectEqual(@as(usize, 1), filtered.translated_count);
@@ -7828,9 +7914,9 @@ test "filtered semantic token translation keeps contiguous source replacement ra
         .start = .{ .line = 2, .character = 0 },
         .end = .{ .line = 8, .character = 0 },
     };
-    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range);
+    const filtered = try translateSemanticTokenRangeDataFiltered(arena_state.allocator(), data, &context, replacement_range, replacement_range);
 
-    try expectEqual(@as(usize, line_count), filtered.scanned_count);
+    try expectEqual(@as(usize, 9), filtered.scanned_count);
     try expectEqual(@as(usize, 6), filtered.translated_count);
     try expectFilteredTokenLines(filtered.data, &.{ 2, 3, 4, 5, 6, 7 });
 }
