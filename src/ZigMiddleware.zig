@@ -85,6 +85,7 @@ const Middleware = struct {
                     .in_flight_version = version,
                     .opened = false,
                     .zls_synced_generation_id = null,
+                    .code_map_spare = .empty,
                     .semantic_tokens_current = null,
                     .semantic_tokens = .empty,
                     .next_semantic_tokens_result_id = 1,
@@ -188,6 +189,7 @@ const Middleware = struct {
                 z_out.stderr.len,
                 elapsedNs(middleware.io, generation_start),
             });
+            code_map = middleware.takeCodeMapSpare(uri, version);
             const code_map_start = logStart(middleware.io);
             try code_map.update(middleware.allocator, zy_root, zy_text, zig_text, zy_path);
             code_map_ns = elapsedNs(middleware.io, code_map_start);
@@ -228,6 +230,16 @@ const Middleware = struct {
             publish_ns,
             elapsedNs(middleware.io, start),
         });
+    }
+
+    fn takeCodeMapSpare(middleware: *Middleware, uri: []const u8, version: i32) CodeMap {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        const state = middleware.documents.getPtr(uri) orelse return .empty;
+        if (state.latest_requested_version != version) return .empty;
+        const spare = state.code_map_spare;
+        state.code_map_spare = .empty;
+        return spare;
     }
 
     fn closeDocument(middleware: *Middleware, uri: []const u8) void {
@@ -291,6 +303,9 @@ const Middleware = struct {
                     generation.version,
                     state.latest_requested_version,
                 });
+                state.code_map_spare.deinit(middleware.allocator);
+                state.code_map_spare = generation.code_map;
+                generation.code_map = .empty;
                 generation.deinit(middleware.allocator);
                 generation.* = undefined;
                 return;
@@ -309,7 +324,15 @@ const Middleware = struct {
                 }
             }
 
-            if (state.current) |*old| old.deinit(middleware.allocator);
+            if (state.current) |*old| {
+                if (send_to_zls) {
+                    try generation.code_map.reuseTranslatorsFrom(middleware.allocator, &old.code_map);
+                }
+                state.code_map_spare.deinit(middleware.allocator);
+                state.code_map_spare = old.code_map;
+                old.code_map = .empty;
+                old.deinit(middleware.allocator);
+            }
             state.current = generation.*;
             state.in_flight_version = null;
             generation.* = undefined;
@@ -1879,6 +1902,7 @@ const DocumentState = struct {
     in_flight_version: ?i32,
     opened: bool,
     zls_synced_generation_id: ?usize,
+    code_map_spare: CodeMap,
     semantic_tokens_current: ?SemanticTokenCollection,
     semantic_tokens: std.ArrayListUnmanaged(SemanticTokensSnapshot),
     next_semantic_tokens_result_id: usize,
@@ -1900,6 +1924,7 @@ const DocumentState = struct {
 
     fn deinit(state: *DocumentState, allocator: std.mem.Allocator) void {
         if (state.current) |*current| current.deinit(allocator);
+        state.code_map_spare.deinit(allocator);
         if (state.semantic_tokens_current) |*semantic_tokens_current| semantic_tokens_current.deinit(allocator);
         for (state.semantic_tokens.items) |*semantic_tokens| semantic_tokens.deinit(allocator);
         state.semantic_tokens.deinit(allocator);
@@ -2470,6 +2495,7 @@ pub const CodeMap = struct {
         .zy_range = .empty,
         .fast_column_mapping = .empty,
         .zy_order = .empty,
+        .zy_code_span = .empty,
         .translators = .empty,
     };
 
@@ -2484,6 +2510,9 @@ pub const CodeMap = struct {
     /// Indexes into `zig_span` and `zy_range`, sorted by zy-line order for zy -> zig
     /// lookups. The buffer is retained across updates.
     zy_order: std.ArrayList(usize),
+    /// Source `zig_code` nodes in tree order, retained to resolve generated
+    /// `#line` directives by binary search during the next update.
+    zy_code_span: std.ArrayList(ZigCodeSpan),
     translators: SpanTranslators,
 
     /// Half-open byte range in either the zy or zig text.
@@ -2576,8 +2605,10 @@ pub const CodeMap = struct {
         map.zy_range.clearRetainingCapacity();
         map.fast_column_mapping.clearRetainingCapacity();
         map.zy_order.clearRetainingCapacity();
+        map.zy_code_span.clearRetainingCapacity();
 
-        try map.collectSpans(allocator, zy_root, zy_text, zig_text, zy_path);
+        try map.collectZigCodeSpans(allocator, zy_root, zy_text);
+        try map.collectSpans(allocator, zig_text, zy_path);
         try map.rebuildZyOrder(allocator);
         try map.translators.resetForSpans(allocator, map);
     }
@@ -2588,6 +2619,7 @@ pub const CodeMap = struct {
         map.zy_range.deinit(allocator);
         map.fast_column_mapping.deinit(allocator);
         map.zy_order.deinit(allocator);
+        map.zy_code_span.deinit(allocator);
         map.translators.deinit(allocator);
         map.* = .empty;
     }
@@ -2727,6 +2759,12 @@ pub const CodeMap = struct {
         return try map.translators.get(allocator, map, document_version, zy_text, zig_text, span_index);
     }
 
+    fn reuseTranslatorsFrom(map: *CodeMap, allocator: std.mem.Allocator, previous: *CodeMap) OOM!void {
+        try previous.translators.ensureSlots(allocator, map, map.len());
+        std.mem.swap(SpanTranslators, &previous.translators, &map.translators);
+        map.translators.resetForSpans(allocator, map) catch unreachable;
+    }
+
     fn translatorAt(map: *CodeMap, span_index: usize) *SpanTranslator {
         return map.translators.at(span_index);
     }
@@ -2736,8 +2774,6 @@ pub const CodeMap = struct {
     fn collectSpans(
         map: *CodeMap,
         allocator: std.mem.Allocator,
-        zy_root: ts.Node,
-        zy_text: []const u8,
         zig_text: []u8,
         zy_path: []const u8,
     ) OOM!void {
@@ -2752,7 +2788,7 @@ pub const CodeMap = struct {
             if (parseLineDirective(line)) |directive| {
                 try map.processActiveSpan(allocator, &active_span, zig_line, zig_offset);
                 if (std.mem.eql(u8, directive.path, zy_path)) {
-                    if (zigCodeSpanForLine(zy_text, zy_root, directive.line)) |zy_span| {
+                    if (map.zigCodeSpanForLine(directive.line)) |zy_span| {
                         active_span = .{
                             .zig_span = .{
                                 .zy_line = directive.line,
@@ -2775,6 +2811,43 @@ pub const CodeMap = struct {
         }
 
         try map.processActiveSpan(allocator, &active_span, zig_line, zig_offset);
+    }
+
+    fn collectZigCodeSpans(
+        map: *CodeMap,
+        allocator: std.mem.Allocator,
+        zy_root: ts.Node,
+        zy_text: []const u8,
+    ) OOM!void {
+        var cursor = zy_root.walk();
+        defer cursor.destroy();
+
+        while (true) {
+            const node = cursor.node();
+            if (std.mem.eql(u8, node.kind(), "zig_code")) {
+                try map.zy_code_span.append(allocator, zigCodeSpan(zy_text, node));
+            }
+            if (cursor.gotoFirstChild()) continue;
+            while (!cursor.gotoNextSibling()) {
+                if (!cursor.gotoParent()) return;
+            }
+        }
+    }
+
+    fn zigCodeSpanForLine(map: *const CodeMap, line: u32) ?ZigCodeSpan {
+        var low: usize = 0;
+        var high = map.zy_code_span.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (map.zy_code_span.items[mid].range.end_point.row < line) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if (low == map.zy_code_span.items.len) return null;
+        const span = map.zy_code_span.items[low];
+        return if (span.range.start_point.row <= line) span else null;
     }
 
     fn columnAtOffset(text: []const u8, offset: usize) u32 {
@@ -5706,6 +5779,7 @@ fn makeTestDocumentState(
         .in_flight_version = null,
         .opened = false,
         .zls_synced_generation_id = null,
+        .code_map_spare = .empty,
         .semantic_tokens_current = null,
         .semantic_tokens = .empty,
         .next_semantic_tokens_result_id = 1,
@@ -6184,6 +6258,7 @@ test "alias code block rename refuses unmapped zy blocks" {
         .in_flight_version = null,
         .opened = false,
         .zls_synced_generation_id = null,
+        .code_map_spare = .empty,
         .semantic_tokens_current = null,
         .semantic_tokens = .empty,
         .next_semantic_tokens_result_id = 1,
@@ -6270,6 +6345,7 @@ test "forward requests return null while generation has errors" {
                 .in_flight_version = null,
                 .opened = false,
                 .zls_synced_generation_id = null,
+                .code_map_spare = .empty,
                 .semantic_tokens_current = null,
                 .semantic_tokens = .empty,
                 .next_semantic_tokens_result_id = 1,
@@ -8621,17 +8697,16 @@ test "code map preserves span translators and refreshes them across regeneration
     try expectEqual(map.len(), map.translators.len());
     try expectEqual(@as(usize, 1), map.translators.freshLen(0));
 
-    const updated_tree = try parseZitronTreeForTest(zy);
-    defer updated_tree.destroy();
-    const updated = try testing_allocator.dupe(u8, updated_zig);
-    defer testing_allocator.free(updated);
-    try map.update(testing_allocator, updated_tree.rootNode(), zy, updated, "zy.zy");
-    try expectEqual(map.len(), map.translators.len());
-    try expectEqual(@as(usize, 0), map.translators.freshLen(1));
+    var updated_map = try parseCodeMapForTest(zy, updated_zig, "zy.zy");
+    defer updated_map.deinit(testing_allocator);
+    try updated_map.reuseTranslatorsFrom(testing_allocator, &map);
+    try expectEqual(updated_map.len(), updated_map.translators.len());
+    try expectEqual(@as(usize, 0), updated_map.translators.freshLen(1));
 
-    _ = try map.spanTranslator(testing_allocator, 1, zy, updated, 0);
-    try expectEqual(map.len(), map.translators.len());
-    try expectEqual(@as(usize, 1), map.translators.freshLen(1));
+    const updated = try updated_map.spanTranslator(testing_allocator, 1, zy, updated_zig, 0);
+    try std.testing.expect(first == updated);
+    try expectEqual(updated_map.len(), updated_map.translators.len());
+    try expectEqual(@as(usize, 1), updated_map.translators.freshLen(1));
 }
 
 test "translates workspace edit changes back to zy ranges" {
