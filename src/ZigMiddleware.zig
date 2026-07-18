@@ -4,6 +4,18 @@ mode: Mode,
 
 const ZigMiddleware = @This();
 
+/// References translated from Zig, plus a named-enum identity resolved by ZLS hover.
+pub const ForwardReferencesResult = struct {
+    references: lsp.ResultType("textDocument/references"),
+    enum_member: ?EnumMemberIdentity,
+};
+
+/// A named enum member and its resolved enum type from ZLS hover.
+pub const EnumMemberIdentity = struct {
+    enum_name: []const u8,
+    member_name: []const u8,
+};
+
 pub const TerminalEnumReferencesResult = union(enum) {
     unavailable,
     enum_member_missing,
@@ -750,7 +762,7 @@ const Middleware = struct {
         arena: std.mem.Allocator,
         zy_uri: []const u8,
         params: types.ReferenceParams,
-    ) Error!lsp.ResultType("textDocument/references") {
+    ) Error!ForwardReferencesResult {
         const start = logStart(middleware.io);
         log.debug("Zig forward references <- uri={s} zy_position={any} include_declaration={}", .{
             zy_uri,
@@ -764,7 +776,7 @@ const Middleware = struct {
                 zy_uri,
                 elapsedNs(middleware.io, start),
             });
-            return null;
+            return .{ .references = null, .enum_member = null };
         };
         var translation_context = RequestTranslationContext{
             .allocator = middleware.allocator,
@@ -784,7 +796,7 @@ const Middleware = struct {
                 span_index,
                 elapsedNs(middleware.io, start),
             });
-            return null;
+            return .{ .references = null, .enum_member = null };
         };
         log.debug("Zig forward references mapped uri={s} zig_uri={s} span={} zig_position={any}", .{
             zy_uri,
@@ -793,12 +805,28 @@ const Middleware = struct {
             mapped.position,
         });
 
+        const hover = middleware.request(arena, "textDocument/hover", types.HoverParams{
+            .textDocument = mapped.textDocument,
+            .position = mapped.position,
+            .workDoneToken = null,
+        }) catch |err| switch (err) {
+            error.RequestFailed => blk: {
+                log.debug("Zig forward references hover -> uri={s} result=null reason=request_failed", .{zy_uri});
+                break :blk null;
+            },
+            else => return err,
+        };
+        const enum_member = if (hover) |hover_result|
+            enumMemberIdentityFromHover(hover_result, doc.zig_uri, doc.zig_text)
+        else
+            null;
+
         const result = (try middleware.request(arena, "textDocument/references", mapped)) orelse {
             log.debug("Zig forward references -> uri={s} result=null reason=zls_null elapsed_ns={}", .{
                 zy_uri,
                 elapsedNs(middleware.io, start),
             });
-            return null;
+            return .{ .references = null, .enum_member = enum_member };
         };
         const translated = try translateLocations(arena, result, &translation_context, doc.zig_uri, doc.zy_uri);
         log.debug("Zig forward references -> uri={s} zls_count={} translated_count={} null={} elapsed_ns={}", .{
@@ -808,7 +836,7 @@ const Middleware = struct {
             translated == null,
             elapsedNs(middleware.io, start),
         });
-        return translated;
+        return .{ .references = translated, .enum_member = enum_member };
     }
 
     fn terminalEnumReferences(
@@ -2233,12 +2261,12 @@ pub fn forwardReferences(
     arena: std.mem.Allocator,
     zy_uri: []const u8,
     params: types.ReferenceParams,
-) Error!lsp.ResultType("textDocument/references") {
+) Error!ForwardReferencesResult {
     return switch (middleware.mode) {
-        .disabled => null,
+        .disabled => .{ .references = null, .enum_member = null },
         .enabled => |mware| mware.forwardReferences(arena, zy_uri, params) catch |err| {
             try suppressForwardRequestFailure("references", zy_uri, err);
-            return null;
+            return .{ .references = null, .enum_member = null };
         },
     };
 }
@@ -2444,6 +2472,96 @@ fn zitronTermFailed(term: std.process.Child.Term) bool {
         .exited => |code| code != 0,
         else => true,
     };
+}
+
+fn enumMemberIdentityFromHover(
+    hover: types.Hover,
+    zig_uri: []const u8,
+    zig_text: []const u8,
+) ?EnumMemberIdentity {
+    var markdown = switch (hover.contents) {
+        .markup_content => |content| if (content.kind == .markdown) content.value else return null,
+        .marked_string, .marked_strings => return null,
+    };
+    const definition = nextZigMarkdownBlock(&markdown) orelse return null;
+    const resolved_type = nextZigMarkdownBlock(&markdown) orelse return null;
+    if (resolved_type.len < 3 or
+        resolved_type[0] != '(' or
+        resolved_type[resolved_type.len - 1] != ')') return null;
+    const enum_name = resolved_type[1 .. resolved_type.len - 1];
+    if (!std.zig.isValidId(enum_name)) return null;
+
+    const terminal_name = enumMemberNameFromDefinition(definition) orelse return null;
+    const enum_line_number = referencedTypeLine(markdown, enum_name, zig_uri) orelse return null;
+    const enum_line = lineAtOneBased(zig_text, enum_line_number) orelse return null;
+    if (!isNamedEnumDeclarationLine(enum_line, enum_name)) return null;
+    return .{ .enum_name = enum_name, .member_name = terminal_name };
+}
+
+fn nextZigMarkdownBlock(markdown: *[]const u8) ?[]const u8 {
+    const prefix = "```zig\n";
+    const start_rel = std.mem.indexOf(u8, markdown.*, prefix) orelse return null;
+    const content_start = start_rel + prefix.len;
+    const end_rel = std.mem.indexOf(u8, markdown.*[content_start..], "\n```") orelse return null;
+    const content_end = content_start + end_rel;
+    const result = markdown.*[content_start..content_end];
+    markdown.* = markdown.*[content_end + "\n```".len ..];
+    return result;
+}
+
+fn enumMemberNameFromDefinition(definition: []const u8) ?[]const u8 {
+    var name_end: usize = 0;
+    while (name_end < definition.len and
+        (std.ascii.isAlphanumeric(definition[name_end]) or definition[name_end] == '_')) : (name_end += 1)
+    {}
+    if (name_end == 0) return null;
+
+    const remainder = definition[name_end..];
+    if (remainder.len != 0 and
+        !std.mem.eql(u8, remainder, ",") and
+        !std.mem.startsWith(u8, remainder, " = ")) return null;
+    const name = definition[0..name_end];
+    return if (std.zig.isValidId(name)) name else null;
+}
+
+fn referencedTypeLine(markdown: []const u8, enum_name: []const u8, zig_uri: []const u8) ?u32 {
+    var cursor: usize = 0;
+    while (std.mem.indexOfScalar(u8, markdown[cursor..], '[')) |open_rel| {
+        const label_start = cursor + open_rel + 1;
+        cursor = label_start;
+        if (!std.mem.startsWith(u8, markdown[label_start..], enum_name)) continue;
+
+        const after_label = markdown[label_start + enum_name.len ..];
+        if (!std.mem.startsWith(u8, after_label, "](")) continue;
+        const after_uri_start = after_label[2..];
+        if (!std.mem.startsWith(u8, after_uri_start, zig_uri)) continue;
+
+        const after_uri = after_uri_start[zig_uri.len..];
+        if (!std.mem.startsWith(u8, after_uri, "#L")) continue;
+        const line_text = after_uri[2..];
+        const close = std.mem.indexOfScalar(u8, line_text, ')') orelse return null;
+        return std.fmt.parseInt(u32, line_text[0..close], 10) catch null;
+    }
+    return null;
+}
+
+fn lineAtOneBased(text: []const u8, line_number: u32) ?[]const u8 {
+    if (line_number == 0) return null;
+    var current: u32 = 1;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| : (current += 1) {
+        if (current == line_number) return line;
+    }
+    return null;
+}
+
+fn isNamedEnumDeclarationLine(line: []const u8, enum_name: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " ");
+    const declaration_prefix = "pub const ";
+    if (!std.mem.startsWith(u8, trimmed, declaration_prefix)) return false;
+    const after_prefix = trimmed[declaration_prefix.len..];
+    if (!std.mem.startsWith(u8, after_prefix, enum_name)) return false;
+    return std.mem.startsWith(u8, after_prefix[enum_name.len..], " = enum(");
 }
 
 fn tokenEnumMemberPosition(
@@ -7271,6 +7389,56 @@ test "finds members in default and custom generated token enums" {
     try expectEqual(types.Position{ .line = 5, .character = 4 }, tokenEnumMemberPosition(zig, "TokenKind", "FOO").?);
     try expectEqual(types.Position{ .line = 9, .character = 4 }, tokenEnumMemberPosition(zig, "MySpecialEnumType", "BAR").?);
     try expectEqual(@as(?types.Position, null), tokenEnumMemberPosition(zig, "TokenKind", "BAR"));
+}
+
+test "classifies named enum members from ZLS hover" {
+    const zig_uri = "file:///generated.zig";
+    const zig =
+        \\pub const TokenKind = enum(u2) {
+        \\    SLASH,
+        \\};
+    ;
+    const member_hover = types.Hover{
+        .contents = .{ .markup_content = .{
+            .kind = .markdown,
+            .value =
+            \\```zig
+            \\SLASH
+            \\```
+            \\```zig
+            \\(TokenKind)
+            \\```
+            \\
+            \\Go to [TokenKind](file:///generated.zig#L1)
+            \\A large doc comment may follow.
+            ,
+        } },
+        .range = null,
+    };
+    const identity = (enumMemberIdentityFromHover(
+        member_hover,
+        zig_uri,
+        zig,
+    )) orelse return error.UnexpectedHover;
+    try expectEqualStrings("TokenKind", identity.enum_name);
+    try expectEqualStrings("SLASH", identity.member_name);
+
+    var variable_hover = member_hover;
+    variable_hover.contents.markup_content.value =
+        \\```zig
+        \\const slash = TokenKind.SLASH
+        \\```
+        \\```zig
+        \\(TokenKind)
+        \\```
+        \\
+        \\Go to [TokenKind](file:///generated.zig#L1)
+    ;
+    try expectEqual(@as(?EnumMemberIdentity, null), enumMemberIdentityFromHover(
+        variable_hover,
+        zig_uri,
+        zig,
+    ));
 }
 
 test "translates completion edits back to zy ranges" {

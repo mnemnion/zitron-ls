@@ -403,6 +403,10 @@ pub fn main(init: std.process.Init) Error!void {
     try expectSuccessfulResponse(init.io, allocator, &transport.transport, 19);
 
     const slash_grammar_position = try positionOfText(fixture_text, "STAR SLASH PERCENT");
+    const slash_terminal_position = lsp.types.flat.Position{
+        .line = slash_grammar_position.line,
+        .character = slash_grammar_position.character + @as(u32, "STAR ".len),
+    };
     try transport.transport.writeRequest(
         init.io,
         allocator,
@@ -411,10 +415,7 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("textDocument/references"),
         .{
             .textDocument = .{ .uri = fixture_uri },
-            .position = .{
-                .line = slash_grammar_position.line,
-                .character = slash_grammar_position.character + @as(u32, "STAR ".len),
-            },
+            .position = slash_terminal_position,
             .context = .{ .includeDeclaration = false },
         },
         .{ .emit_null_optional_fields = false },
@@ -426,8 +427,31 @@ pub fn main(init: std.process.Init) Error!void {
         init.io,
         allocator,
         &transport.transport,
+        20,
         fixture_uri,
         slash_code_position,
+    );
+
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 21 },
+        "textDocument/references",
+        lsp.ParamsType("textDocument/references"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = slash_code_position,
+            .context = .{ .includeDeclaration = false },
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectTerminalReferencesResponse(
+        init.io,
+        allocator,
+        &transport.transport,
+        21,
+        fixture_uri,
+        slash_terminal_position,
     );
 
     if (!saw_work_done_progress_create or !saw_progress_begin or !saw_progress_end) {
@@ -740,10 +764,11 @@ fn expectTerminalReferencesResponse(
     io: std.Io,
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
+    request_id: i64,
     fixture_uri: []const u8,
-    zig_use_position: lsp.types.Position,
+    expected_position: lsp.types.Position,
 ) Error!void {
-    const json_message = try readResponseJsonMessage(io, allocator, transport, 20);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, request_id);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -753,7 +778,7 @@ fn expectTerminalReferencesResponse(
 
     const references_value = switch (parsed.value) {
         .response => |response| blk: {
-            if (response.id == null or !response.id.?.eql(.{ .number = 20 })) {
+            if (response.id == null or !response.id.?.eql(.{ .number = request_id })) {
                 return error_set.UnexpectedResponse;
             }
             switch (response.result_or_error) {
@@ -773,12 +798,12 @@ fn expectTerminalReferencesResponse(
     defer references.deinit();
 
     const resolved = references.value orelse return error_set.UnexpectedResponse;
-    var found_zig_use = false;
+    var found_expected_position = false;
     for (resolved) |location| {
         try expectEqualStrings(fixture_uri, location.uri);
-        found_zig_use = found_zig_use or std.meta.eql(location.range.start, zig_use_position);
+        found_expected_position = found_expected_position or std.meta.eql(location.range.start, expected_position);
     }
-    try expect(found_zig_use);
+    try expect(found_expected_position);
 }
 
 fn expectCompletionResponse(

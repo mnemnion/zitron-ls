@@ -439,6 +439,47 @@ pub fn findReferences(
     include_declaration: bool,
     offset_encoding: lsp.offsets.Encoding,
 ) OOM!lsp.ResultType("textDocument/references") {
+    return document.findReferencesForSymbol(
+        tags_query,
+        arena,
+        uri,
+        symbol.kind,
+        symbol.symbol_name,
+        include_declaration,
+        offset_encoding,
+    );
+}
+
+/// Collects same-document terminal references for a terminal identified by Zig analysis.
+pub fn findTerminalReferences(
+    document: Document,
+    tags_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    uri: []const u8,
+    terminal_name: []const u8,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!lsp.ResultType("textDocument/references") {
+    return document.findReferencesForSymbol(
+        tags_query,
+        arena,
+        uri,
+        .terminal_reference,
+        terminal_name,
+        false,
+        offset_encoding,
+    );
+}
+
+fn findReferencesForSymbol(
+    document: Document,
+    tags_query: *const ts.Query,
+    arena: std.mem.Allocator,
+    uri: []const u8,
+    symbol_kind: SemanticKind,
+    symbol_name: []const u8,
+    include_declaration: bool,
+    offset_encoding: lsp.offsets.Encoding,
+) OOM!lsp.ResultType("textDocument/references") {
     var references: std.ArrayList(types.Location) = .empty;
 
     const cursor = ts.QueryCursor.create();
@@ -447,9 +488,9 @@ pub fn findReferences(
 
     while (cursor.nextMatch()) |match| {
         const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
-        if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
+        if (!std.mem.eql(u8, candidate.symbol_name, symbol_name)) continue;
 
-        switch (symbol.kind) {
+        switch (symbol_kind) {
             .rule_definition, .rule_reference => {
                 if (candidate.kind == .rule_reference) {
                     try references.append(arena, document.locationForNode(

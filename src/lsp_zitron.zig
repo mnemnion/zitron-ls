@@ -705,7 +705,25 @@ pub const Server = struct {
         };
         const result: lsp.ResultType("textDocument/references") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
-            .unsupported_zig_code => try server.zig_middleware.forwardReferences(arena, params.textDocument.uri, params),
+            .unsupported_zig_code => blk: {
+                const zig_result = try server.zig_middleware.forwardReferences(arena, params.textDocument.uri, params);
+                const enum_member = zig_result.enum_member orelse break :blk zig_result.references;
+
+                var token_enum_name = try doc.tokenEnumName(server.allocator, server.token_enum_query);
+                if (!std.mem.eql(u8, enum_member.enum_name, token_enum_name)) {
+                    token_enum_name = try doc.refreshTokenEnumName(server.allocator, server.token_enum_query);
+                }
+                if (!std.mem.eql(u8, enum_member.enum_name, token_enum_name)) break :blk zig_result.references;
+
+                const grammar_references = try doc.findTerminalReferences(
+                    server.tags_query,
+                    arena,
+                    params.textDocument.uri,
+                    enum_member.member_name,
+                    server.offset_encoding,
+                );
+                break :blk try mergeLocations(arena, zig_result.references, grammar_references);
+            },
             .symbol => |symbol| blk: {
                 const grammar_references = try doc.findReferences(
                     server.tags_query,
