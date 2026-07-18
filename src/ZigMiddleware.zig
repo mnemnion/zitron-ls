@@ -4,6 +4,12 @@ mode: Mode,
 
 const ZigMiddleware = @This();
 
+pub const TerminalEnumReferencesResult = union(enum) {
+    unavailable,
+    enum_member_missing,
+    references: lsp.ResultType("textDocument/references"),
+};
+
 const Mode = union(enum) {
     disabled,
     enabled: *Middleware,
@@ -803,6 +809,62 @@ const Middleware = struct {
             elapsedNs(middleware.io, start),
         });
         return translated;
+    }
+
+    fn terminalEnumReferences(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        zy_uri: []const u8,
+        enum_name: []const u8,
+        terminal_name: []const u8,
+        include_declaration: bool,
+    ) Error!TerminalEnumReferencesResult {
+        const start = logStart(middleware.io);
+        const doc = try middleware.documentReady(zy_uri);
+        const zig_position = tokenEnumMemberPosition(doc.zig_text, enum_name, terminal_name) orelse {
+            log.debug("Zig terminal references -> uri={s} enum={s} terminal={s} result=null reason=missing_enum_member elapsed_ns={}", .{
+                zy_uri,
+                enum_name,
+                terminal_name,
+                elapsedNs(middleware.io, start),
+            });
+            return .enum_member_missing;
+        };
+        log.debug("Zig terminal references mapped uri={s} zig_uri={s} enum={s} terminal={s} zig_position={any}", .{
+            zy_uri,
+            doc.zig_uri,
+            enum_name,
+            terminal_name,
+            zig_position,
+        });
+
+        const result = (try middleware.request(arena, "textDocument/references", types.ReferenceParams{
+            .textDocument = .{ .uri = doc.zig_uri },
+            .position = zig_position,
+            .context = .{ .includeDeclaration = include_declaration },
+            .workDoneToken = null,
+            .partialResultToken = null,
+        })) orelse return .{ .references = null };
+        var translation_context = RequestTranslationContext{
+            .allocator = middleware.allocator,
+            .map = &doc.code_map,
+            .document_version = doc.version,
+            .zy_text = doc.zy_text,
+            .zig_text = doc.zig_text,
+            .active_span_index = null,
+        };
+        defer translation_context.deinit();
+
+        const translated = try translateLocations(arena, result, &translation_context, doc.zig_uri, doc.zy_uri);
+        log.debug("Zig terminal references -> uri={s} enum={s} terminal={s} zls_count={} translated_count={} elapsed_ns={}", .{
+            zy_uri,
+            enum_name,
+            terminal_name,
+            result.len,
+            if (translated) |locations| locations.len else 0,
+            elapsedNs(middleware.io, start),
+        });
+        return .{ .references = translated };
     }
 
     fn forwardDocumentHighlight(
@@ -2181,6 +2243,29 @@ pub fn forwardReferences(
     };
 }
 
+pub fn terminalEnumReferences(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    zy_uri: []const u8,
+    enum_name: []const u8,
+    terminal_name: []const u8,
+    include_declaration: bool,
+) Error!TerminalEnumReferencesResult {
+    return switch (middleware.mode) {
+        .disabled => .unavailable,
+        .enabled => |mware| mware.terminalEnumReferences(
+            arena,
+            zy_uri,
+            enum_name,
+            terminal_name,
+            include_declaration,
+        ) catch |err| {
+            try suppressForwardRequestFailure("terminalReferences", zy_uri, err);
+            return .unavailable;
+        },
+    };
+}
+
 pub fn forwardDocumentHighlight(
     middleware: *ZigMiddleware,
     arena: std.mem.Allocator,
@@ -2359,6 +2444,39 @@ fn zitronTermFailed(term: std.process.Child.Term) bool {
         .exited => |code| code != 0,
         else => true,
     };
+}
+
+fn tokenEnumMemberPosition(
+    zig_text: []const u8,
+    enum_name: []const u8,
+    terminal_name: []const u8,
+) ?types.Position {
+    var in_token_enum = false;
+    var line_number: u32 = 0;
+    var lines = std.mem.splitScalar(u8, zig_text, '\n');
+    while (lines.next()) |line| : (line_number += 1) {
+        const trimmed = std.mem.trimStart(u8, line, " ");
+        if (!in_token_enum) {
+            const declaration_prefix = "pub const ";
+            if (!std.mem.startsWith(u8, trimmed, declaration_prefix)) continue;
+            const after_prefix = trimmed[declaration_prefix.len..];
+            if (!std.mem.startsWith(u8, after_prefix, enum_name)) continue;
+            const after_name = after_prefix[enum_name.len..];
+            if (!std.mem.startsWith(u8, after_name, " = enum(")) continue;
+            in_token_enum = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, trimmed, "};")) return null;
+        if (!std.mem.startsWith(u8, trimmed, terminal_name)) continue;
+        const suffix = trimmed[terminal_name.len..];
+        if (suffix.len == 0 or (suffix[0] != ',' and suffix[0] != ' ' and suffix[0] != '=')) continue;
+        return .{
+            .line = line_number,
+            .character = @intCast(trimmed.ptr - line.ptr),
+        };
+    }
+    return null;
 }
 
 fn parseZitronDiagnostics(allocator: std.mem.Allocator, stderr: []const u8) OOM![]types.Diagnostic {
@@ -7133,6 +7251,26 @@ test "translates hover and definition results back to zy ranges" {
         },
         else => return error.UnexpectedDefinition,
     }
+}
+
+test "finds members in default and custom generated token enums" {
+    const zig =
+        \\pub const Unrelated = enum(u2) {
+        \\    FOO,
+        \\};
+        \\pub const TokenKind = enum(u3) {
+        \\    end_of_input = 0,
+        \\    FOO,
+        \\    FOOBAR,
+        \\};
+        \\pub const MySpecialEnumType = enum(u2) {
+        \\    BAR,
+        \\};
+    ;
+
+    try expectEqual(types.Position{ .line = 5, .character = 4 }, tokenEnumMemberPosition(zig, "TokenKind", "FOO").?);
+    try expectEqual(types.Position{ .line = 9, .character = 4 }, tokenEnumMemberPosition(zig, "MySpecialEnumType", "BAR").?);
+    try expectEqual(@as(?types.Position, null), tokenEnumMemberPosition(zig, "TokenKind", "BAR"));
 }
 
 test "translates completion edits back to zy ranges" {

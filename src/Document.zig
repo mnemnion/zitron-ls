@@ -5,6 +5,8 @@ version: i32,
 parsed: ParseSummary,
 tree: *ts.Tree,
 parser: *ts.Parser,
+// Optimistically retained across edits; refreshed when generated Zig no longer contains it.
+token_enum_name: ?[]u8,
 
 const Document = @This();
 
@@ -82,12 +84,14 @@ pub fn init(allocator: std.mem.Allocator, version: i32, text: []const u8) Error!
         .parsed = parsed.summary,
         .tree = parsed.tree,
         .parser = parser,
+        .token_enum_name = null,
     };
 }
 
 /// Releases the source buffer and parse tree owned by the document.
 pub fn deinit(document: *Document, allocator: std.mem.Allocator) void {
     allocator.free(document.source);
+    if (document.token_enum_name) |name| allocator.free(name);
     document.tree.destroy();
     document.parser.destroy();
 }
@@ -140,12 +144,14 @@ pub fn updateIncremental(
     allocator.free(document.source);
     document.tree.destroy();
     const parser = document.parser;
+    const token_enum_name = document.token_enum_name;
     document.* = .{
         .source = new_source,
         .version = version,
         .parsed = parsed.summary,
         .tree = parsed.tree,
         .parser = parser,
+        .token_enum_name = token_enum_name,
     };
 }
 
@@ -260,6 +266,49 @@ pub fn findRuleDefinition(document: Document, tags_query: *const ts.Query, symbo
 /// Finds the definition symbol for a named action in this document.
 pub fn findActionDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
     return document.findDefinition(tags_query, symbol_name, .action_definition);
+}
+
+/// Returns the generated token enum name selected by `%token_enum`.
+pub fn tokenEnumName(
+    document: *Document,
+    allocator: std.mem.Allocator,
+    token_enum_query: *const ts.Query,
+) OOM![]const u8 {
+    return document.token_enum_name orelse try document.refreshTokenEnumName(allocator, token_enum_query);
+}
+
+pub fn refreshTokenEnumName(
+    document: *Document,
+    allocator: std.mem.Allocator,
+    token_enum_query: *const ts.Query,
+) OOM![]const u8 {
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(token_enum_query, document.tree.rootNode());
+
+    var enum_name: []const u8 = "TokenKind";
+    while (cursor.nextMatch()) |match| {
+        var directive_name: ?[]const u8 = null;
+        var candidate_name: ?[]const u8 = null;
+        for (match.captures) |capture| {
+            const capture_name = token_enum_query.captureNameForId(capture.index) orelse continue;
+            if (std.mem.eql(u8, capture_name, "directive"))
+                directive_name = sliceForNode(document.source, capture.node)
+            else if (std.mem.eql(u8, capture_name, "name"))
+                candidate_name = sliceForNode(document.source, capture.node);
+        }
+        if (directive_name) |directive| {
+            if (std.mem.eql(u8, directive, "token_enum")) {
+                enum_name = candidate_name orelse continue;
+                break;
+            }
+        }
+    }
+
+    const owned_name = try allocator.dupe(u8, enum_name);
+    if (document.token_enum_name) |name| allocator.free(name);
+    document.token_enum_name = owned_name;
+    return owned_name;
 }
 
 /// Builds same-document text edits for a grammar-side rename.
@@ -1994,6 +2043,46 @@ test "resolution and references work without server" {
         .@"utf-8",
     )) orelse return error.UnexpectedReferences;
     try expect(references.len >= 2);
+}
+
+test "token enum name defaults and follows token_enum" {
+    var query_error_offset: u32 = 0;
+    const token_enum_query = try ts.Query.create(
+        zitronLanguage(),
+        "(directive (directive_name) @directive (identifier) @name)",
+        &query_error_offset,
+    );
+    defer token_enum_query.destroy();
+
+    var default_document = try Document.init(testing_allocator, 1, "start ::= FOO.");
+    defer default_document.deinit(testing_allocator);
+    try expectEqualStrings("TokenKind", try default_document.tokenEnumName(testing_allocator, token_enum_query));
+
+    var custom_document = try Document.init(
+        testing_allocator,
+        1,
+        "%token_enum MySpecialEnumType\nstart ::= FOO.",
+    );
+    defer custom_document.deinit(testing_allocator);
+    try expectEqualStrings("MySpecialEnumType", try custom_document.tokenEnumName(testing_allocator, token_enum_query));
+
+    const name_start = "%token_enum ".len;
+    const name_end = name_start + "MySpecialEnumType".len;
+    try custom_document.updateIncremental(
+        testing_allocator,
+        2,
+        &.{.{ .text_document_content_change_partial = .{
+            .range = .{
+                .start = lsp.offsets.indexToPosition(custom_document.source, name_start, .@"utf-8"),
+                .end = lsp.offsets.indexToPosition(custom_document.source, name_end, .@"utf-8"),
+            },
+            .rangeLength = "MySpecialEnumType".len,
+            .text = "RenamedEnumType",
+        } }},
+        .@"utf-8",
+    );
+    try expectEqualStrings("MySpecialEnumType", try custom_document.tokenEnumName(testing_allocator, token_enum_query));
+    try expectEqualStrings("RenamedEnumType", try custom_document.refreshTokenEnumName(testing_allocator, token_enum_query));
 }
 
 test "documentSymbols returns local definitions and named action implementations" {

@@ -108,6 +108,7 @@ pub const Server = struct {
     documents: std.StringHashMapUnmanaged(Document),
     tags_query: *ts.Query,
     rename_query: *ts.Query,
+    token_enum_query: *ts.Query,
     offset_encoding: lsp.offsets.Encoding,
     zig_middleware: ZigMiddleware,
     client_transport: ?*lsp.Transport,
@@ -122,6 +123,8 @@ pub const Server = struct {
         const tags_query = try ts.Query.create(zitronLanguage(), tags_query_source, &query_error_offset);
         errdefer tags_query.destroy();
         const rename_query = try ts.Query.create(zitronLanguage(), rename_query_source, &query_error_offset);
+        errdefer rename_query.destroy();
+        const token_enum_query = try ts.Query.create(zitronLanguage(), token_enum_query_source, &query_error_offset);
         errdefer comptime unreachable;
 
         return .{
@@ -129,6 +132,7 @@ pub const Server = struct {
             .documents = .empty,
             .tags_query = tags_query,
             .rename_query = rename_query,
+            .token_enum_query = token_enum_query,
             .offset_encoding = .@"utf-16",
             .zig_middleware = .disabled,
             .client_transport = null,
@@ -166,6 +170,7 @@ pub const Server = struct {
             entry.value_ptr.deinit(server.allocator);
         }
         server.documents.deinit(server.allocator);
+        server.token_enum_query.destroy();
         server.rename_query.destroy();
         server.tags_query.destroy();
     }
@@ -701,14 +706,47 @@ pub const Server = struct {
         const result: lsp.ResultType("textDocument/references") = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => null,
             .unsupported_zig_code => try server.zig_middleware.forwardReferences(arena, params.textDocument.uri, params),
-            .symbol => |symbol| try doc.findReferences(
-                server.tags_query,
-                arena,
-                params.textDocument.uri,
-                symbol,
-                params.context.includeDeclaration,
-                server.offset_encoding,
-            ),
+            .symbol => |symbol| blk: {
+                const grammar_references = try doc.findReferences(
+                    server.tags_query,
+                    arena,
+                    params.textDocument.uri,
+                    symbol,
+                    params.context.includeDeclaration,
+                    server.offset_encoding,
+                );
+                if (symbol.kind != .terminal_reference) break :blk grammar_references;
+
+                const enum_name = try doc.tokenEnumName(server.allocator, server.token_enum_query);
+                const enum_result = try server.zig_middleware.terminalEnumReferences(
+                    arena,
+                    params.textDocument.uri,
+                    enum_name,
+                    symbol.symbol_name,
+                    params.context.includeDeclaration,
+                );
+                const zig_references = switch (enum_result) {
+                    .unavailable => null,
+                    .references => |references| references,
+                    .enum_member_missing => retry: {
+                        const stale_enum_name = try arena.dupe(u8, enum_name);
+                        const refreshed_name = try doc.refreshTokenEnumName(server.allocator, server.token_enum_query);
+                        if (std.mem.eql(u8, stale_enum_name, refreshed_name)) break :retry null;
+                        const retry_result = try server.zig_middleware.terminalEnumReferences(
+                            arena,
+                            params.textDocument.uri,
+                            refreshed_name,
+                            symbol.symbol_name,
+                            params.context.includeDeclaration,
+                        );
+                        break :retry switch (retry_result) {
+                            .references => |references| references,
+                            .unavailable, .enum_member_missing => null,
+                        };
+                    },
+                };
+                break :blk try mergeLocations(arena, grammar_references, zig_references);
+            },
         };
         log.debug("LSP -> textDocument/references uri={s} result_count={} null={} elapsed_ns={}", .{
             params.textDocument.uri,
@@ -1192,6 +1230,20 @@ pub const Server = struct {
             },
             .definition_links => |links| links.len,
         };
+    }
+
+    fn mergeLocations(
+        arena: std.mem.Allocator,
+        first: ?[]const types.Location,
+        second: ?[]const types.Location,
+    ) OOM!lsp.ResultType("textDocument/references") {
+        if (first == null) return second;
+        if (second == null) return first;
+
+        var merged: std.ArrayList(types.Location) = .empty;
+        try merged.appendSlice(arena, first.?);
+        try merged.appendSlice(arena, second.?);
+        return try merged.toOwnedSlice(arena);
     }
 
     fn workspaceEditResultCount(result: lsp.ResultType("textDocument/rename")) usize {
@@ -2590,6 +2642,7 @@ const build_options = @import("build_options");
 const ts = @import("tree-sitter");
 const tags_query_source = @embedFile("zitron-tags-query");
 const rename_query_source = @embedFile("zitron-rename-query");
+const token_enum_query_source = @embedFile("zitron-token-enum-query");
 const zitron_grammar = @import("tree_sitter_zitron");
 const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";
 const log = std.log.scoped(.lsp_zitron);
