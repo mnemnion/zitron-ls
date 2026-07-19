@@ -259,7 +259,7 @@ pub const Server = struct {
                 }),
             },
             .symbol => |symbol| switch (symbol.kind) {
-                .rule_definition, .action_definition => .{
+                .rule_definition, .token_class_definition, .action_definition => .{
                     .definition = .{
                         .location = doc.locationForNode(
                             uri,
@@ -269,6 +269,18 @@ pub const Server = struct {
                     },
                 },
                 .rule_reference => if (doc.findRuleDefinition(
+                    server.tags_query,
+                    symbol.symbol_name,
+                )) |definition| .{
+                    .definition = .{
+                        .location = doc.locationForNode(
+                            uri,
+                            definition.name_node,
+                            server.offset_encoding,
+                        ),
+                    },
+                } else null,
+                .token_class_reference => if (doc.findTokenClassDefinition(
                     server.tags_query,
                     symbol.symbol_name,
                 )) |definition| .{
@@ -1043,6 +1055,7 @@ pub const Server = struct {
 
         const symbol = doc.renameSymbolAtPosition(
             server.rename_query,
+            server.tags_query,
             server.offset_encoding,
             params.position,
         ) orelse {
@@ -1372,6 +1385,16 @@ pub const Server = struct {
                 "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
                 .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
             ),
+            .token_class_definition => std.fmt.allocPrint(
+                arena,
+                "token class definition `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
+            .token_class_reference => std.fmt.allocPrint(
+                arena,
+                "token class reference `{s}`\n\ncapture `{s}` on `{s}`",
+                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
+            ),
             .terminal_reference => std.fmt.allocPrint(
                 arena,
                 "terminal reference `{s}`\n\ncapture `{s}` on `{s}`",
@@ -1421,6 +1444,25 @@ fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound
 fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, test_offset_encoding);
+}
+
+fn expectInlayHintAfter(
+    source: []const u8,
+    hints: []const types.InlayHint,
+    start_index: usize,
+    alias_name: []const u8,
+    label: []const u8,
+) !void {
+    const alias_index = std.mem.indexOf(u8, source[start_index..], alias_name) orelse return error.NeedleNotFound;
+    const position = lsp.offsets.indexToPosition(source, start_index + alias_index + alias_name.len, test_offset_encoding);
+    for (hints) |hint| {
+        if (!std.meta.eql(hint.position, position)) continue;
+        switch (hint.label) {
+            .string => |hint_label| if (std.mem.eql(u8, hint_label, label)) return,
+            else => return error.UnexpectedInlayHints,
+        }
+    }
+    return error.UnexpectedInlayHints;
 }
 
 /// Loads the configured fixture source into memory for smoke tests and helpers.
@@ -1570,7 +1612,7 @@ test "embedded tags query compiles for the zitron grammar" {
     const query = try ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
     defer query.destroy();
 
-    try expectEqual(@as(u32, 13), query.patternCount());
+    try expectEqual(@as(u32, 15), query.patternCount());
     try expect(query.captureCount() >= 3);
 }
 
@@ -2098,6 +2140,160 @@ test "type definition resolves grammar particles to their assigning directives" 
     try Test.expectDirective(&server, arena_state.allocator(), uri, sample, rule, "fallback", 1, 14);
     try Test.expectDirective(&server, arena_state.allocator(), uri, sample, rule, "NUMBER", 0, 12);
     try Test.expectDirective(&server, arena_state.allocator(), uri, sample, rule, "PLUS", 0, 12);
+}
+
+test "token classes behave as named multiterminals across grammar features" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/token_class.zy";
+    const sample =
+        \\%default_type Default
+        \\%token_class additive PLUS|MINUS .
+        \\%type expr Expr
+        \\start ::= expr(A) additive(O) comparison.
+        \\expr(A) ::= additive(B).
+        \\%token_class comparison EQ|NE .
+        \\%token_type Token
+        \\other ::= comp
+    ;
+    try server.putDocument(uri, 1, sample);
+
+    const definition_name = try positionOfTextAfter(sample, try byteIndexOf(sample, "%token_class"), "additive");
+    const first_reference = try positionOfTextAfter(sample, try byteIndexOf(sample, "start ::="), "additive");
+    const second_reference = try positionOfTextAfter(sample, try byteIndexOf(sample, "expr(A) ::="), "additive");
+    const doc = server.getDocument(uri).?;
+
+    switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, definition_name)) {
+        .symbol => |symbol| try expectEqual(Document.SemanticKind.token_class_definition, symbol.kind),
+        else => return error.UnexpectedResolution,
+    }
+    switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, first_reference)) {
+        .symbol => |symbol| try expectEqual(Document.SemanticKind.token_class_reference, symbol.kind),
+        else => return error.UnexpectedResolution,
+    }
+
+    const hover = (try server.@"textDocument/hover"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+    })) orelse return error.UnexpectedHoverContents;
+    switch (hover.contents) {
+        .markup_content => |content| try expect(std.mem.indexOf(u8, content.value, "token class reference `additive`") != null),
+        else => return error.UnexpectedHoverContents,
+    }
+
+    const definition = (try server.@"textDocument/definition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (definition) {
+        .definition => |target| switch (target) {
+            .location => |location| try expectEqual(definition_name, location.range.start),
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
+    const type_definition = (try server.@"textDocument/typeDefinition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (type_definition) {
+        .definition => |target| switch (target) {
+            .location => |location| {
+                try expectEqual(@as(u32, 6), location.range.start.line);
+                try expectEqual(@as(u32, 12), location.range.start.character);
+            },
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
+    const references = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+        .context = .{ .includeDeclaration = true },
+    })) orelse return error.UnexpectedDefinitionTarget;
+    try expectEqual(@as(usize, 3), references.len);
+    try expect(Server.hasLocationAt(references, uri, definition_name));
+    try expect(Server.hasLocationAt(references, uri, first_reference));
+    try expect(Server.hasLocationAt(references, uri, second_reference));
+
+    const highlights = (try server.@"textDocument/documentHighlight"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+    })) orelse return error.UnexpectedDocumentHighlights;
+    try expectEqual(@as(usize, 3), highlights.len);
+    try Server.expectHighlightAtWithKind(highlights, definition_name, .Write);
+    try Server.expectHighlightAtWithKind(highlights, first_reference, .Read);
+    try Server.expectHighlightAtWithKind(highlights, second_reference, .Read);
+
+    const symbols = (try server.@"textDocument/documentSymbol"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+    })).?.document_symbols;
+    var maybe_token_class_symbol: ?types.DocumentSymbol = null;
+    for (symbols) |symbol| {
+        if (std.mem.eql(u8, symbol.name, "additive")) maybe_token_class_symbol = symbol;
+    }
+    const token_class_symbol = maybe_token_class_symbol orelse return error.UnexpectedDocumentSymbols;
+    try expectEqualStrings("token class", token_class_symbol.detail.?);
+    try expectEqual(types.SymbolKind.Constant, token_class_symbol.kind);
+
+    const rename = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = first_reference,
+        .newName = "operator",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, rename, uri, "additive", "operator", 3);
+
+    const completion_result = (try server.@"textDocument/completion"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = lsp.offsets.indexToPosition(sample, sample.len, test_offset_encoding),
+    })) orelse return error.UnexpectedCompletionResult;
+    const completion_items = switch (completion_result) {
+        .completion_items => |items| items,
+        else => return error.UnexpectedCompletionResult,
+    };
+    const token_class_completion = completionItemWithLabel(completion_items, "comparison") orelse return error.UnexpectedCompletionResult;
+    try expectEqualStrings("token class", token_class_completion.detail.?);
+    try expectEqual(types.CompletionItemKind.Constant, token_class_completion.kind.?);
+
+    const hints = (try server.@"textDocument/inlayHint"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .range = .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 100, .character = 0 },
+        },
+    })) orelse return error.UnexpectedInlayHints;
+    const first_rule = try byteIndexOf(sample, "start ::=");
+    try expectInlayHintAfter(sample, hints, first_rule, "O", ": Token");
+    const second_rule = try byteIndexOf(sample, "expr(A) ::=");
+    try expectInlayHintAfter(sample, hints, second_rule, "B", ": Token");
+
+    const untyped_uri = "file:///samples/untyped_token_class.zy";
+    const untyped_sample =
+        \\%default_type Default
+        \\%token_class operators PLUS|MINUS .
+        \\start ::= operators(O).
+    ;
+    try server.putDocument(untyped_uri, 1, untyped_sample);
+    const untyped_doc = server.getDocument(untyped_uri).?;
+    const untyped_reference = try positionOfTextAfter(untyped_sample, try byteIndexOf(untyped_sample, "start ::="), "operators");
+    switch (untyped_doc.typeDefinitionAtPosition(server.offset_encoding, untyped_reference)) {
+        .no_match => {},
+        else => return error.UnexpectedDefinitionTarget,
+    }
+    const untyped_hints = try untyped_doc.inlayHints(
+        arena_state.allocator(),
+        .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 100, .character = 0 },
+        },
+        server.offset_encoding,
+    );
+    try expectEqual(@as(usize, 0), untyped_hints.len);
 }
 
 test "server returns grammar inlay hints with disabled Zig middleware" {
