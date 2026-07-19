@@ -39,7 +39,7 @@ Legend:
 - [✅ ⚡️] Signature help
 - [✅ ⚡️] Declaration
 - [✅ ⚡️] Definition
-- [ ] Type definition
+- [✅ ⚡️] Type definition
 - [ ] Implementation
 - [✅ ⚡️] References
 - [✅ ⚡️] Document highlights
@@ -113,6 +113,8 @@ Legend:
 - [✅] Generated Zig hover passthrough
 - [✅] Grammar go-to-definition (no ⚡️)
 - [✅] Generated Zig go-to-definition passthrough
+- [✅] Grammar value-type definition navigation (no ⚡️)
+- [✅] Generated Zig type-definition passthrough
 - [✅] Same-document grammar references (no ⚡️)
 - [✅] Generated Zig references passthrough
 - [✅] Grammar terminal/generated token-enum references

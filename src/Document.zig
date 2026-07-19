@@ -57,6 +57,13 @@ pub const Resolution = union(enum) {
     symbol: SemanticSymbol,
 };
 
+/// Result of resolving the semantic type assigned to a grammar particle.
+pub const TypeDefinitionResolution = union(enum) {
+    no_match,
+    unsupported_zig_code,
+    target: ts.Node,
+};
+
 /// Errors that can occur while parsing or updating a document.
 pub const Error = OOM || ts.Query.Error || error{
     IncompatibleLanguage,
@@ -226,6 +233,58 @@ pub fn containsZigCodeAtPosition(
     if (containsUnsupportedCode(raw_node)) return true;
     const node = root.namedDescendantForPointRange(point, point) orelse return false;
     return containsUnsupportedCode(node);
+}
+
+/// Finds the directive that assigns the semantic type of the grammar particle at a position.
+pub fn typeDefinitionAtPosition(
+    document: Document,
+    offset_encoding: lsp.offsets.Encoding,
+    position: types.Position,
+) TypeDefinitionResolution {
+    const source_index = lsp.offsets.positionToIndex(document.source, position, offset_encoding);
+    const point = tsPointFromIndex(document.source, source_index);
+    const root = document.tree.rootNode();
+    const raw_node = root.descendantForPointRange(point, point) orelse return .no_match;
+    if (containsUnsupportedCode(raw_node)) return .unsupported_zig_code;
+    const node = root.namedDescendantForPointRange(point, point) orelse return .no_match;
+    if (containsUnsupportedCode(node)) return .unsupported_zig_code;
+
+    const particle = grammarParticleContainingIndex(node, source_index) orelse return .no_match;
+    const particle_kind = grammarParticleKind(particle).?;
+    const particle_name = sliceForNode(document.source, particle);
+    var explicit_type: ?ts.Node = null;
+    var default_type: ?ts.Node = null;
+    var token_type: ?ts.Node = null;
+
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        if (!std.mem.eql(u8, directive.kind(), "directive")) continue;
+        const payload = directiveTypePayloadNode(directive) orelse continue;
+
+        switch (directiveTypeKind(document.source, directive) orelse continue) {
+            .symbol_type => if (particle_kind == .nonterminal) {
+                const target = directiveNonterminalTypeTargetNode(directive) orelse continue;
+                if (std.mem.eql(u8, particle_name, sliceForNode(document.source, target))) {
+                    explicit_type = target;
+                }
+            },
+            .default_type => default_type = payload,
+            .token_type => token_type = payload,
+        }
+    }
+
+    return switch (particle_kind) {
+        .nonterminal => if (explicit_type orelse default_type) |directive|
+            .{ .target = directive }
+        else
+            .no_match,
+        .terminal, .multiterminal => if (token_type) |directive|
+            .{ .target = directive }
+        else
+            .no_match,
+    };
 }
 
 /// Builds grammar-side inlay hints for aliases with known Zitron value types.
@@ -807,7 +866,7 @@ fn collectTypeFacts(
         const type_value = directiveTypePayload(source, directive) orelse continue;
         switch (directive_kind) {
             .symbol_type => {
-                const symbol = directiveSymbolTypeTarget(source, directive) orelse continue;
+                const symbol = directiveNonterminalTypeTarget(source, directive) orelse continue;
                 try type_table.putSymbolType(allocator, symbol, type_value);
             },
             .token_type => type_table.token_type = type_value,
@@ -1023,7 +1082,11 @@ fn directiveTypeKind(source: []const u8, directive: ts.Node) ?DirectiveTypeKind 
     return null;
 }
 
-fn directiveSymbolTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8 {
+fn directiveNonterminalTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8 {
+    return sliceForNode(source, directiveNonterminalTypeTargetNode(directive) orelse return null);
+}
+
+fn directiveNonterminalTypeTargetNode(directive: ts.Node) ?ts.Node {
     const child_count = directive.namedChildCount();
     var seen_name = false;
     var index: u32 = 0;
@@ -1033,12 +1096,23 @@ fn directiveSymbolTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8
             if (isDirectiveNameNode(child)) seen_name = true;
             continue;
         }
-        if (grammarParticleKind(child) != null) return sliceForNode(source, child);
+        if (grammarParticleKind(child) == .nonterminal) return child;
     }
     return null;
 }
 
 fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
+    const leaf = directiveTypePayloadNode(directive) orelse return null;
+    const value = sliceForNode(source, leaf);
+    if (std.mem.eql(u8, leaf.kind(), "string")) {
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            return value[1 .. value.len - 1];
+        }
+    }
+    return value;
+}
+
+fn directiveTypePayloadNode(directive: ts.Node) ?ts.Node {
     var maybe_payload: ?ts.Node = null;
     const child_count = directive.namedChildCount();
     var index: u32 = 0;
@@ -1052,17 +1126,11 @@ fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
     else
         payload;
 
-    const value = sliceForNode(source, leaf);
-    if (std.mem.eql(u8, leaf.kind(), "string")) {
-        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
-            return value[1 .. value.len - 1];
-        }
-    }
     if (std.mem.eql(u8, leaf.kind(), "zig_code") or
         std.mem.eql(u8, leaf.kind(), "identifier") or
         std.mem.eql(u8, leaf.kind(), "string"))
     {
-        return value;
+        return leaf;
     }
     return null;
 }
@@ -1081,6 +1149,16 @@ fn grammarParticleKind(node: ts.Node) ?GrammarParticleKind {
     if (std.mem.eql(u8, kind, "terminal")) return .terminal;
     if (std.mem.eql(u8, kind, "multiterminal")) return .multiterminal;
     return null;
+}
+
+fn grammarParticleContainingIndex(node: ts.Node, source_index: usize) ?ts.Node {
+    var cursor = node;
+    while (true) {
+        if (nodeContainsIndex(cursor, source_index) and grammarParticleKind(cursor) != null) {
+            return cursor;
+        }
+        cursor = cursor.parent() orelse return null;
+    }
 }
 
 fn positionInRange(position: types.Position, range: types.Range) bool {
@@ -2182,7 +2260,6 @@ test "inlay hints type grammar aliases from type directives" {
         \\%default_type {*Default}
         \\%type expr f64
         \\%type expr i64
-        \\%type NUMBER {f64}
         \\start ::= expr(A) PLUS|MINUS(O) fallback(F).
         \\expr(E) ::= NUMBER(N).
         \\fallback(D) ::= .
@@ -2206,13 +2283,13 @@ test "inlay hints type grammar aliases from type directives" {
     const expr_rule = try byteIndexOf(sample, "expr(E)");
     try expectInlayHintAfter(sample, hints, expr_rule, "E", ": i64");
     const number_alias = try byteIndexOf(sample, "NUMBER(N)");
-    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": f64");
+    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": Token");
 }
 
 test "inlay hints type named action and impl aliases by name and position" {
     const sample =
+        \\%token_type f64
         \\%type expr f64
-        \\%type NUMBER {f64}
         \\expr(A) ::= NUMBER(N). @on_expr(A; N)
         \\%impl @on_expr(A; N) { _ = .{ A, N }; }
         \\%impl @on_expr(N; A) { _ = .{ N, A }; }
