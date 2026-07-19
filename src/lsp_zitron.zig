@@ -609,7 +609,7 @@ pub const Server = struct {
                 });
                 return result;
             },
-            .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol),
+            .symbol => |symbol| try hoverMarkdownForSymbol(arena, symbol, doc.hoverDirectiveForSymbol(symbol)),
         };
 
         const result: ?types.Hover = .{
@@ -1373,44 +1373,37 @@ pub const Server = struct {
         return error.UnexpectedDocumentHighlights;
     }
 
-    fn hoverMarkdownForSymbol(arena: std.mem.Allocator, symbol: Document.SemanticSymbol) OOM![]const u8 {
-        return switch (symbol.kind) {
-            .rule_definition => std.fmt.allocPrint(
-                arena,
-                "rule definition `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .rule_reference => std.fmt.allocPrint(
-                arena,
-                "rule reference `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .token_class_definition => std.fmt.allocPrint(
-                arena,
-                "token class definition `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .token_class_reference => std.fmt.allocPrint(
-                arena,
-                "token class reference `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .terminal_reference => std.fmt.allocPrint(
-                arena,
-                "terminal reference `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .action_definition => std.fmt.allocPrint(
-                arena,
-                "named action definition `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
-            .action_implementation => std.fmt.allocPrint(
-                arena,
-                "named action implementation `{s}`\n\ncapture `{s}` on `{s}`",
-                .{ symbol.symbol_name, symbol.capture_name, symbol.enclosing_kind },
-            ),
+    fn hoverMarkdownForSymbol(
+        arena: std.mem.Allocator,
+        symbol: Document.SemanticSymbol,
+        directive: ?[]const u8,
+    ) OOM![]const u8 {
+        const description = switch (symbol.kind) {
+            .rule_definition => "rule definition",
+            .rule_reference => "rule reference",
+            .token_class_definition => "token class definition",
+            .token_class_reference => "token class reference",
+            .terminal_reference => "terminal reference",
+            .action_definition => "named action definition",
+            .action_implementation => "named action implementation",
         };
+
+        if (directive) |text| {
+            return std.fmt.allocPrint(
+                arena,
+                "```zitron\n{s}\n```",
+                .{text},
+            );
+        }
+        switch (symbol.kind) {
+            .rule_definition, .rule_reference => return arena.dupe(u8, "```zitron\n%default_type void\n```"),
+            else => {},
+        }
+        return std.fmt.allocPrint(
+            arena,
+            "{s} `{s}`",
+            .{ description, symbol.symbol_name },
+        );
     }
 };
 
@@ -1444,6 +1437,23 @@ fn positionOfText(haystack: []const u8, needle: []const u8) error{NeedleNotFound
 fn positionOfTextAfter(haystack: []const u8, start_index: usize, needle: []const u8) error{NeedleNotFound}!types.Position {
     const index = try byteIndexOfAfter(haystack, start_index, needle);
     return lsp.offsets.indexToPosition(haystack, index, test_offset_encoding);
+}
+
+fn expectHoverContains(
+    server: *Server,
+    arena: std.mem.Allocator,
+    uri: []const u8,
+    position: types.Position,
+    expected: []const u8,
+) !void {
+    const hover = (try server.@"textDocument/hover"(arena, .{
+        .textDocument = .{ .uri = uri },
+        .position = position,
+    })) orelse return error.UnexpectedHoverContents;
+    switch (hover.contents) {
+        .markup_content => |content| try expect(std.mem.indexOf(u8, content.value, expected) != null),
+        else => return error.UnexpectedHoverContents,
+    }
 }
 
 fn expectInlayHintAfter(
@@ -2180,9 +2190,41 @@ test "token classes behave as named multiterminals across grammar features" {
         .position = first_reference,
     })) orelse return error.UnexpectedHoverContents;
     switch (hover.contents) {
-        .markup_content => |content| try expect(std.mem.indexOf(u8, content.value, "token class reference `additive`") != null),
+        .markup_content => |content| {
+            try expect(std.mem.indexOf(u8, content.value, "```zitron\n%token_class additive PLUS|MINUS .\n```") != null);
+            try expect(std.mem.indexOf(u8, content.value, "capture") == null);
+        },
         else => return error.UnexpectedHoverContents,
     }
+
+    try expectHoverContains(
+        &server,
+        arena_state.allocator(),
+        uri,
+        definition_name,
+        "```zitron\n%token_class additive PLUS|MINUS .\n```",
+    );
+    try expectHoverContains(
+        &server,
+        arena_state.allocator(),
+        uri,
+        try positionOfTextAfter(sample, try byteIndexOf(sample, "start ::="), "expr"),
+        "```zitron\n%type expr Expr\n```",
+    );
+    try expectHoverContains(
+        &server,
+        arena_state.allocator(),
+        uri,
+        try positionOfText(sample, "start ::="),
+        "```zitron\n%default_type Default\n```",
+    );
+    try expectHoverContains(
+        &server,
+        arena_state.allocator(),
+        uri,
+        try positionOfTextAfter(sample, try byteIndexOf(sample, "%token_class"), "PLUS"),
+        "```zitron\n%token_type Token\n```",
+    );
 
     const definition = (try server.@"textDocument/definition"(arena_state.allocator(), .{
         .textDocument = .{ .uri = uri },
@@ -2348,7 +2390,7 @@ test "hover definition and references operate on stored live document state" {
     })).?;
     switch (hover.contents) {
         .markup_content => |content| {
-            try expect(std.mem.indexOf(u8, content.value, "rule definition `calc`") != null);
+            try expectEqualStrings("```zitron\n%default_type void\n```", content.value);
         },
         else => return error.UnexpectedHoverContents,
     }

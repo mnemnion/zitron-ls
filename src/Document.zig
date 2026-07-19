@@ -221,6 +221,52 @@ pub fn resolveAtPosition(
     return if (best) |symbol| .{ .symbol = symbol } else .no_match;
 }
 
+/// Finds the type or token-class directive to display when hovering a grammar symbol.
+pub fn hoverDirectiveForSymbol(document: Document, symbol: SemanticSymbol) ?[]const u8 {
+    switch (symbol.kind) {
+        .action_definition, .action_implementation => return null,
+        else => {},
+    }
+
+    var explicit_type_directive: ?[]const u8 = null;
+    var default_type_directive: ?[]const u8 = null;
+    var token_type_directive: ?[]const u8 = null;
+    var token_class_directive: ?[]const u8 = null;
+
+    const root = document.tree.rootNode();
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        if (!std.mem.eql(u8, directive.kind(), "directive")) continue;
+
+        if (tokenClassNameNode(directive)) |name_node| {
+            if (std.mem.eql(u8, symbol.symbol_name, sliceForNode(document.source, name_node))) {
+                token_class_directive = sliceForNode(document.source, directive);
+            }
+        }
+
+        const directive_kind = directiveTypeKind(document.source, directive) orelse continue;
+        _ = directiveTypePayloadNode(directive) orelse continue;
+        const directive_text = sliceForNode(document.source, directive);
+        switch (directive_kind) {
+            .symbol_type => {
+                const target = directiveNonterminalTypeTarget(document.source, directive) orelse continue;
+                if (std.mem.eql(u8, symbol.symbol_name, target)) explicit_type_directive = directive_text;
+            },
+            .default_type => default_type_directive = directive_text,
+            .token_type => token_type_directive = directive_text,
+        }
+    }
+
+    return switch (symbol.kind) {
+        .rule_definition, .rule_reference => explicit_type_directive orelse default_type_directive,
+        .token_class_definition, .token_class_reference => token_class_directive,
+        .terminal_reference => token_type_directive,
+        .action_definition, .action_implementation => unreachable,
+    };
+}
+
 /// Resolves the best renameable grammar-side symbol at the requested position.
 pub fn renameSymbolAtPosition(
     document: Document,
@@ -826,7 +872,7 @@ const TypeTable = struct {
     const empty: TypeTable = .{
         .symbol_types = .empty,
         .token_type = null,
-        .default_type = null,
+        .default_type = "void",
     };
 
     symbol_types: std.StringHashMapUnmanaged(?[]const u8),
@@ -2368,6 +2414,23 @@ test "inlay hints type grammar aliases from type directives" {
     try expectInlayHintAfter(sample, hints, expr_rule, "E", ": i64");
     const number_alias = try byteIndexOf(sample, "NUMBER(N)");
     try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": Token");
+}
+
+test "inlay hints use the implicit void default type" {
+    const sample = "start ::= fallback(F).";
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const hints = try document.inlayHints(arena_state.allocator(), .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 1, .character = 0 },
+    }, .@"utf-8");
+
+    try expectEqual(@as(usize, 1), hints.len);
+    try expectInlayHintAfter(sample, hints, 0, "F", ": void");
 }
 
 test "inlay hints type named action and impl aliases by name and position" {

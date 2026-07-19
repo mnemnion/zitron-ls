@@ -160,7 +160,11 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("textDocument/hover"),
         .{
             .textDocument = .{ .uri = fixture_uri },
-            .position = try positionOfText(fixture_text, "document ::= statement_list"),
+            .position = try positionOfTextAfter(
+                fixture_text,
+                try byteIndexOf(fixture_text, "document ::= statement_list"),
+                "statement_list",
+            ),
         },
         .{ .emit_null_optional_fields = false },
     );
@@ -625,8 +629,10 @@ fn expectHoverResponse(
 
     switch (hover.value.contents) {
         .markup_content => |content| {
-            try expect(std.mem.indexOf(u8, content.value, "rule definition `document`") != null);
-            try expect(std.mem.indexOf(u8, content.value, "definition.class") != null);
+            try expectEqualStrings(
+                "```zitron\n%type statement_list {?*PList}\n```",
+                content.value,
+            );
         },
         else => return error_set.UnexpectedResponse,
     }
