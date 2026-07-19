@@ -1,10 +1,15 @@
 # LSP Burndown
 
+Reconciled against the advertised capabilities, request handlers, and smoke-test
+surface on 2026-07-19.
+
 Legend:
 
 - ✅ implemented
 - ⚡️ reaches through generated Zig/ZLS middleware where that makes sense
 - `(no ⚡️)` implemented only for the Zitron grammar/source half
+- ❌ not applicable to Zitron or the project's intended scope
+- `resolve` is an optional follow-up request that fills in expensive item details
 
 ## Core Protocol
 
@@ -14,63 +19,63 @@ Legend:
 - [✅] Position encoding negotiation
 - [✅] Open/close document sync
 - [✅] Incremental document change sync
-- [ ] Full document change sync
-- [ ] Save notifications
-- [ ] Will-save notifications
-- [ ] Will-save-wait-until edits
+- [✅] Full document change sync
+- [❌] Save notifications
+- [❌] Will-save notifications
+- [❌] Will-save-wait-until edits
 - [ ] Dynamic capability registration
-- [ ] Client capability probing beyond current needs
+- [❌] Client capability probing beyond current needs
 - [ ] Request cancellation
-- [ ] Progress reporting
+- [✅] Progress reporting
 - [ ] Partial result streaming
-- [ ] Server logging
-- [ ] Telemetry events
+- [ ] `window/logMessage` notifications
+- [❌] Telemetry events
 
 ## Text Document Features
 
-- [✅] Completion
+- [✅ ⚡️] Completion
 - [ ] Completion item resolve
-- [✅] Hover
-- [ ] Signature help
-- [ ] Declaration
-- [✅] Definition
+- [✅ ⚡️] Hover
+- [✅ ⚡️] Signature help
+- [✅ ⚡️] Declaration
+- [✅ ⚡️] Definition
 - [ ] Type definition
 - [ ] Implementation
-- [✅] References
-- [ ] Document highlights
-- [✅] Document symbols
+- [✅ ⚡️] References
+- [✅ ⚡️] Document highlights
+- [✅ ⚡️] Document symbols
 - [ ] Code actions
 - [ ] Code action resolve
 - [ ] Code lens
 - [ ] Code lens resolve
 - [ ] Document links
 - [ ] Document link resolve
-- [ ] Document colors
-- [ ] Color presentations
+- [❌] Document colors
+- [❌] Color presentations
 - [ ] Document formatting
 - [ ] Range formatting
 - [ ] Ranges formatting
 - [ ] On-type formatting
-- [✅] Rename (no ⚡️)
+- [✅ ⚡️] Rename
 - [ ] Prepare rename
 - [ ] Folding ranges
 - [ ] Selection ranges
-- [ ] Semantic tokens, full
-- [ ] Semantic tokens, range
-- [ ] Semantic tokens, delta
-- [ ] Monikers
-- [ ] Linked editing ranges
+- [✅ ⚡️] Semantic tokens, full
+- [✅ ⚡️] Semantic tokens, range
+- [✅ ⚡️] Semantic tokens, delta
+- [❌] Monikers
+- [❌] Linked editing ranges
 - [ ] Call hierarchy prepare
 - [ ] Call hierarchy incoming calls
 - [ ] Call hierarchy outgoing calls
-- [ ] Type hierarchy prepare
-- [ ] Type hierarchy supertypes
-- [ ] Type hierarchy subtypes
+- [❌] Type hierarchy prepare
+- [❌] Type hierarchy supertypes
+- [❌] Type hierarchy subtypes
 - [ ] Inline values
-- [ ] Inlay hints
+- [✅ ⚡️] Inlay hints
 - [ ] Inlay hint resolve
 - [ ] Pull diagnostics
-- [ ] Push diagnostics
+- [✅ ⚡️] Push diagnostics
 - [ ] Inline completions
 - [ ] Document drop edits
 - [ ] Paste edits
@@ -93,10 +98,10 @@ Legend:
 
 ## Notebook Features
 
-- [ ] Notebook document sync
-- [ ] Notebook cell text-document mapping
-- [ ] Notebook-aware diagnostics
-- [ ] Notebook-aware semantic tokens
+- [❌] Notebook document sync
+- [❌] Notebook cell text-document mapping
+- [❌] Notebook-aware diagnostics
+- [❌] Notebook-aware semantic tokens
 
 ## Zitron-Aware Affordances
 
@@ -110,15 +115,16 @@ Legend:
 - [✅] Generated Zig go-to-definition passthrough
 - [✅] Same-document grammar references (no ⚡️)
 - [✅] Generated Zig references passthrough
+- [✅] Grammar terminal/generated token-enum references
 - [✅] Grammar document symbols (no ⚡️)
 - [✅] Generated Zig document symbols passthrough
-- [ ] Grammar parse diagnostics
+- [✅] Zitron generator diagnostics (no ⚡️)
 - [ ] Duplicate rule/action diagnostics
 - [ ] Undefined rule/action diagnostics
 - [ ] Unused rule/action diagnostics
 - [ ] Precedence and associativity diagnostics
-- [ ] Generated Zig compile diagnostics mapped back to `.zy`
-- [ ] Action-body Zig diagnostics mapped back to `.zy`
+- [✅] Generated Zig compile diagnostics mapped back to `.zy`
+- [✅] Action-body Zig diagnostics mapped back to `.zy`
 - [ ] Cross-document grammar references
 - [ ] Cross-document grammar symbols
 - [ ] Include/import graph awareness
@@ -130,11 +136,12 @@ Legend:
 - [ ] Grammar folding ranges
 - [ ] Grammar semantic tokens
 - [ ] Grammar selection ranges
-- [ ] Grammar document highlights
-- [ ] Grammar inlay hints
+- [✅] Grammar document highlights (no ⚡️)
+- [✅] Grammar inlay hints (no ⚡️)
 - [ ] Grammar signature help for directives
+- [✅] Grammar signature help for named actions (no ⚡️)
 - [ ] Rule call hierarchy
-- [ ] Token/type hierarchy
+- [❌] Token/type hierarchy
 - [ ] Parser conflict explanations
 - [ ] Parser conflict navigation
 - [ ] Railroad diagram document links
