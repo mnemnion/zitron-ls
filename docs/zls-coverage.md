@@ -93,8 +93,8 @@ Legend:
     response.
 - [✅] `workspace/semanticTokens/refresh`
   - `lsp_zitron` emits the refresh request itself after source changes
-    when the client advertises support.  It does not forward a captured
-    ZLS refresh.
+    when the client advertises support.  It also forwards ZLS refreshes
+    emitted after a successful `build.zig` configuration reload.
 
 
 ## Diagnostics
@@ -133,16 +133,31 @@ Legend:
     still needed.
 - [ ] Workspace folders and folder-change notifications
 - [ ] Workspace configuration
-- [❌] Watched Zig/ZON files
-- [ ] Dynamic registration for configuration and watched files
+- [✅] Watched `build.zig` files
+  - When the client supports watched-file dynamic registration,
+    `lsp_zitron` registers `**/build.zig` for change events only.  Matching
+    filesystem notifications call the in-process ZLS document store's
+    build-file invalidator directly.  ZLS's language-server watched-file
+    handler requires files to be present in its document cache, while a
+    lazily discovered `build.zig` may exist only in its build-file table;
+    moreover, ZLS `0.16.0`'s non-delete refresh path rejects file-scheme
+    URIs.  Using the library API covers both cases.  Create/delete events,
+    other Zig files, and editor change notifications are not forwarded.
+- [🧭] Dynamic registration for configuration and watched files
+  - `lsp_zitron` dynamically registers the narrow `build.zig` watcher it
+    needs.  ZLS configuration registration and its broader Zig/ZON watcher
+    are intentionally not exposed.
 - [ ] `workspace/applyEdit` requests
   - ZLS uses this for one autofix-on-save mode.  The embedded adapter
     does not tell ZLS that apply-edit is supported, and captured ZLS
     requests are not relayed to the client.
-- [ ] `workspace/inlayHint/refresh`
-  - The embedded adapter does not advertise refresh support to ZLS.
-    Captured ZLS notifications other than diagnostics are currently
-    ignored.
+- [✅] `workspace/inlayHint/refresh`
+  - The embedded adapter advertises refresh support to ZLS.  After a
+    successful `build.zig` configuration reload, captured refresh requests
+    are re-originated toward clients which advertised support.  This is a
+    global invalidation signal, so no grammar-range translation is needed;
+    the client's follow-up inlay-hint requests recompute the normal merged
+    Zitron and ZLS results.
 
 
 ## ZLS Lifecycle and Capability Adaptation

@@ -177,6 +177,21 @@ pub fn closeDocument(adapter: *Adapter, arena: std.mem.Allocator, uri: []const u
     });
 }
 
+pub fn didChangeWatchedFiles(
+    adapter: *Adapter,
+    arena: std.mem.Allocator,
+    params: types.DidChangeWatchedFilesParams,
+) Error!void {
+    for (params.changes) |change| {
+        if (change.type != .Changed or !std.mem.endsWith(u8, change.uri, "/build.zig")) continue;
+        const uri = upstream.Uri.parse(arena, change.uri) catch return error.Unexpected;
+        // A discovered build file may exist only in the build-file table.  The
+        // ZLS 0.16.0 watched-file route requires a document handle and rejects
+        // changed file-scheme URIs, so use the library invalidator directly.
+        adapter.server.document_store.invalidateBuildFile(uri);
+    }
+}
+
 pub fn request(
     adapter: *Adapter,
     arena: std.mem.Allocator,
@@ -238,6 +253,10 @@ fn initializeParams() types.InitializeParams {
                     .serverCancelSupport = false,
                     .augmentsSyntaxTokens = false,
                 },
+            },
+            .workspace = .{
+                .semanticTokens = .{ .refreshSupport = true },
+                .inlayHint = .{ .refreshSupport = true },
             },
         },
     };

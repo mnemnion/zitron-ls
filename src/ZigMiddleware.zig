@@ -29,6 +29,13 @@ const Mode = union(enum) {
 
 const DiagnosticsPublisher = *const fn (context: *anyopaque, zy_uri: []const u8, version: i32) void;
 
+pub const RefreshKind = enum {
+    semantic_tokens,
+    inlay_hints,
+};
+
+const RefreshPublisher = *const fn (context: *anyopaque, kind: RefreshKind) void;
+
 const SemanticDirtyRange = struct {
     previous: types.Range,
     current: types.Range,
@@ -41,6 +48,8 @@ const Middleware = struct {
     io: std.Io,
     diagnostics_context: ?*anyopaque,
     diagnostics_publisher: ?DiagnosticsPublisher,
+    refresh_context: ?*anyopaque = null,
+    refresh_publisher: ?RefreshPublisher = null,
     documents_mutex: std.Io.Mutex,
     documents: std.StringHashMapUnmanaged(DocumentState),
     zls_mutex: std.Io.Mutex,
@@ -248,6 +257,20 @@ const Middleware = struct {
             publish_ns,
             elapsedNs(middleware.io, start),
         });
+    }
+
+    fn didChangeWatchedFiles(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        params: types.DidChangeWatchedFilesParams,
+    ) Error!void {
+        try middleware.drainPendingZlsUpdates();
+        middleware.zls_mutex.lockUncancelable(middleware.io);
+        defer middleware.zls_mutex.unlock(middleware.io);
+
+        log.debug("ZLS library <- workspace/didChangeWatchedFiles changes={}", .{params.changes.len});
+        try middleware.zls_library.didChangeWatchedFiles(arena, params);
+        try middleware.processCapturedZlsMessages();
     }
 
     fn takeCodeMapSpare(middleware: *Middleware, uri: []const u8, version: i32) CodeMap {
@@ -1919,7 +1942,24 @@ const Middleware = struct {
                 return false;
             },
             .request => |zls_request| {
-                log.debug("ZLS ignored request method={s}", .{zls_request.method});
+                const refresh_kind: ?RefreshKind = if (std.mem.eql(
+                    u8,
+                    zls_request.method,
+                    "workspace/semanticTokens/refresh",
+                ))
+                    .semantic_tokens
+                else if (std.mem.eql(u8, zls_request.method, "workspace/inlayHint/refresh"))
+                    .inlay_hints
+                else
+                    null;
+                if (refresh_kind) |kind| {
+                    log.debug("ZLS refresh request method={s}", .{zls_request.method});
+                    if (middleware.refresh_context) |context| {
+                        if (middleware.refresh_publisher) |publisher| publisher(context, kind);
+                    }
+                } else {
+                    log.debug("ZLS ignored request method={s}", .{zls_request.method});
+                }
                 return false;
             },
             .notification => |notification| {
@@ -2195,6 +2235,17 @@ pub fn closeDocument(middleware: *ZigMiddleware, uri: []const u8) void {
     }
 }
 
+pub fn didChangeWatchedFiles(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    params: types.DidChangeWatchedFilesParams,
+) Error!void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |mware| try mware.didChangeWatchedFiles(arena, params),
+    }
+}
+
 pub fn appendDiagnostics(
     middleware: *ZigMiddleware,
     allocator: std.mem.Allocator,
@@ -2226,6 +2277,20 @@ pub fn setDiagnosticsPublisher(
         .enabled => |mware| {
             mware.diagnostics_context = context;
             mware.diagnostics_publisher = publisher;
+        },
+    }
+}
+
+pub fn setRefreshPublisher(
+    middleware: *ZigMiddleware,
+    context: *anyopaque,
+    publisher: RefreshPublisher,
+) void {
+    switch (middleware.mode) {
+        .disabled => {},
+        .enabled => |mware| {
+            mware.refresh_context = context;
+            mware.refresh_publisher = publisher;
         },
     }
 }
@@ -8398,6 +8463,52 @@ test "semantic dirty range comes from snapshot diff for line move" {
     try expectEqual(@as(u32, 0), dirty.current.start.character);
     try expectEqual(@as(u32, 3), dirty.current.end.line);
     try expectEqual(@as(u32, 0), dirty.current.end.character);
+}
+
+test "captured ZLS workspace refresh requests are published" {
+    const Recorder = struct {
+        semantic_tokens: bool = false,
+        inlay_hints: bool = false,
+
+        fn publish(context: *anyopaque, kind: RefreshKind) void {
+            const recorder: *@This() = @ptrCast(@alignCast(context));
+            switch (kind) {
+                .semantic_tokens => recorder.semantic_tokens = true,
+                .inlay_hints => recorder.inlay_hints = true,
+            }
+        }
+    };
+
+    var recorder: Recorder = .{};
+    var middleware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .diagnostics_context = null,
+        .diagnostics_publisher = null,
+        .refresh_context = &recorder,
+        .refresh_publisher = Recorder.publish,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_mutex = .init,
+        .zls_library = undefined,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 1,
+    };
+
+    const semantic_message = try testing_allocator.dupe(u8,
+        \\{"jsonrpc":"2.0","id":"semantic","method":"workspace/semanticTokens/refresh"}
+    );
+    defer testing_allocator.free(semantic_message);
+    try std.testing.expect(!try middleware.handleZlsMessage(semantic_message));
+
+    const inlay_message = try testing_allocator.dupe(u8,
+        \\{"jsonrpc":"2.0","id":"inlay","method":"workspace/inlayHint/refresh"}
+    );
+    defer testing_allocator.free(inlay_message);
+    try std.testing.expect(!try middleware.handleZlsMessage(inlay_message));
+
+    try std.testing.expect(recorder.semantic_tokens);
+    try std.testing.expect(recorder.inlay_hints);
 }
 
 test "semantic token requests serve fresh current collection without zls" {

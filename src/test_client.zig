@@ -6,6 +6,7 @@ const error_set = error{
     ChildProcessFailed,
     MissingWorkDoneProgress,
     MissingSemanticTokensRefresh,
+    MissingBuildFileWatcherRegistration,
 };
 const Error = error_set ||
     zitron.FixtureError ||
@@ -28,6 +29,8 @@ var saw_work_done_progress_create = false;
 var saw_progress_begin = false;
 var saw_progress_end = false;
 var saw_semantic_tokens_refresh = false;
+var saw_inlay_hints_refresh = false;
+var saw_build_file_watcher_registration = false;
 
 /// Runs the end-to-end stdio smoke client against the built server binary.
 pub fn main(init: std.process.Init) Error!void {
@@ -71,7 +74,9 @@ pub fn main(init: std.process.Init) Error!void {
                     .positionEncodings = &.{ .@"utf-8", .@"utf-16" },
                 },
                 .workspace = .{
+                    .didChangeWatchedFiles = .{ .dynamicRegistration = true },
                     .semanticTokens = .{ .refreshSupport = true },
+                    .inlayHint = .{ .refreshSupport = true },
                 },
                 .window = .{
                     .workDoneProgress = true,
@@ -199,6 +204,20 @@ pub fn main(init: std.process.Init) Error!void {
         .{ .emit_null_optional_fields = false },
     );
     try expectAnyResponse(init.io, allocator, &transport.transport, 5);
+
+    const build_uri = try buildUriAlloc(allocator, fixture_uri);
+    defer allocator.free(build_uri);
+    try transport.transport.writeNotification(
+        init.io,
+        allocator,
+        "workspace/didChangeWatchedFiles",
+        lsp.ParamsType("workspace/didChangeWatchedFiles"),
+        .{ .changes = &.{.{
+            .uri = build_uri,
+            .type = .Changed,
+        }} },
+        .{ .emit_null_optional_fields = false },
+    );
 
     try transport.transport.writeRequest(
         init.io,
@@ -510,6 +529,9 @@ pub fn main(init: std.process.Init) Error!void {
     }
     if (!saw_semantic_tokens_refresh) {
         return error_set.MissingSemanticTokensRefresh;
+    }
+    if (!saw_build_file_watcher_registration) {
+        return error_set.MissingBuildFileWatcherRegistration;
     }
 
     try transport.transport.writeNotification(
@@ -1091,6 +1113,10 @@ fn answerServerRequest(
         saw_work_done_progress_create = true;
     } else if (std.mem.eql(u8, request.method, "workspace/semanticTokens/refresh")) {
         saw_semantic_tokens_refresh = true;
+    } else if (std.mem.eql(u8, request.method, "workspace/inlayHint/refresh")) {
+        saw_inlay_hints_refresh = true;
+    } else if (std.mem.eql(u8, request.method, "client/registerCapability")) {
+        try observeBuildFileWatcherRegistration(request.params);
     } else {
         return error_set.UnexpectedResponse;
     }
@@ -1103,6 +1129,56 @@ fn answerServerRequest(
         null,
         .{ .emit_null_optional_fields = false },
     );
+}
+
+fn observeBuildFileWatcherRegistration(params: ?std.json.Value) Error!void {
+    const params_object = switch (params orelse return error_set.UnexpectedResponse) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const registrations = switch (params_object.get("registrations") orelse return error_set.UnexpectedResponse) {
+        .array => |array| array,
+        else => return error_set.UnexpectedResponse,
+    };
+    if (registrations.items.len != 1) return error_set.UnexpectedResponse;
+    const registration = switch (registrations.items[0]) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const method = switch (registration.get("method") orelse return error_set.UnexpectedResponse) {
+        .string => |string| string,
+        else => return error_set.UnexpectedResponse,
+    };
+    if (!std.mem.eql(u8, method, "workspace/didChangeWatchedFiles")) return error_set.UnexpectedResponse;
+    const options = switch (registration.get("registerOptions") orelse return error_set.UnexpectedResponse) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const watchers = switch (options.get("watchers") orelse return error_set.UnexpectedResponse) {
+        .array => |array| array,
+        else => return error_set.UnexpectedResponse,
+    };
+    if (watchers.items.len != 1) return error_set.UnexpectedResponse;
+    const watcher = switch (watchers.items[0]) {
+        .object => |object| object,
+        else => return error_set.UnexpectedResponse,
+    };
+    const pattern = switch (watcher.get("globPattern") orelse return error_set.UnexpectedResponse) {
+        .string => |string| string,
+        else => return error_set.UnexpectedResponse,
+    };
+    const kind = switch (watcher.get("kind") orelse return error_set.UnexpectedResponse) {
+        .integer => |integer| integer,
+        else => return error_set.UnexpectedResponse,
+    };
+    if (!std.mem.eql(u8, pattern, "**/build.zig") or kind != 2) return error_set.UnexpectedResponse;
+    saw_build_file_watcher_registration = true;
+}
+
+fn buildUriAlloc(allocator: std.mem.Allocator, fixture_uri: []const u8) Error![]u8 {
+    const marker = "/samples/";
+    const index = std.mem.lastIndexOf(u8, fixture_uri, marker) orelse return error.NeedleNotFound;
+    return try std.mem.concat(allocator, u8, &.{ fixture_uri[0..index], "/build.zig" });
 }
 
 fn byteIndexOf(haystack: []const u8, needle: []const u8) error{NeedleNotFound}!usize {

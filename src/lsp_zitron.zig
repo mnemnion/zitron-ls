@@ -116,6 +116,8 @@ pub const Server = struct {
     io: ?std.Io,
     client_supports_work_done_progress: bool,
     client_supports_semantic_tokens_refresh: bool,
+    client_supports_inlay_hints_refresh: bool,
+    client_supports_watched_files_dynamic_registration: bool,
     next_server_request_id: i64,
 
     /// Creates a server instance and compiles the grammar tag query.
@@ -140,6 +142,8 @@ pub const Server = struct {
             .io = null,
             .client_supports_work_done_progress = false,
             .client_supports_semantic_tokens_refresh = false,
+            .client_supports_inlay_hints_refresh = false,
+            .client_supports_watched_files_dynamic_registration = false,
             .next_server_request_id = first_server_request_id,
         };
     }
@@ -160,6 +164,7 @@ pub const Server = struct {
     pub fn setClientTransport(server: *Server, transport: *lsp.Transport) void {
         server.client_transport = transport;
         server.zig_middleware.setDiagnosticsPublisher(server, publishZlsDiagnostics);
+        server.zig_middleware.setRefreshPublisher(server, publishZlsRefresh);
     }
 
     /// Releases all document state and query resources owned by the server.
@@ -202,6 +207,17 @@ pub const Server = struct {
         const server: *Server = @ptrCast(@alignCast(context));
         server.publishMergedDiagnostics(source_uri, version) catch |err| {
             log.warn("LSP publish diagnostics failed for uri={s}: {}", .{ source_uri, err });
+        };
+    }
+
+    fn publishZlsRefresh(context: *anyopaque, kind: ZigMiddleware.RefreshKind) void {
+        const server: *Server = @ptrCast(@alignCast(context));
+        const result = switch (kind) {
+            .semantic_tokens => server.refreshSemanticTokens(),
+            .inlay_hints => server.refreshInlayHints(),
+        };
+        result catch |err| {
+            log.warn("LSP ZLS refresh forwarding failed kind={t}: {}", .{ kind, err });
         };
     }
 
@@ -339,8 +355,15 @@ pub const Server = struct {
             server.client_supports_work_done_progress = window.workDoneProgress orelse false;
         }
         if (params.capabilities.workspace) |workspace| {
+            if (workspace.didChangeWatchedFiles) |watched_files| {
+                server.client_supports_watched_files_dynamic_registration =
+                    watched_files.dynamicRegistration orelse false;
+            }
             if (workspace.semanticTokens) |semantic_tokens| {
                 server.client_supports_semantic_tokens_refresh = semantic_tokens.refreshSupport orelse false;
+            }
+            if (workspace.inlayHint) |inlay_hints| {
+                server.client_supports_inlay_hints_refresh = inlay_hints.refreshSupport orelse false;
             }
         }
 
@@ -363,8 +386,9 @@ pub const Server = struct {
     }
 
     /// LSP `initialized` handler required by `lsp-kit`.
-    pub fn initialized(_: *Server, _: std.mem.Allocator, _: types.InitializedParams) void {
+    pub fn initialized(server: *Server, _: std.mem.Allocator, _: types.InitializedParams) Error!void {
         log.debug("LSP <- initialized", .{});
+        try server.registerBuildFileWatcher();
         log.debug("LSP -> initialized", .{});
     }
 
@@ -456,6 +480,24 @@ pub const Server = struct {
             params.textDocument.uri,
             server.logElapsedNs(start),
         });
+    }
+
+    /// Forwards changed `build.zig` filesystem events into the embedded ZLS store.
+    pub fn @"workspace/didChangeWatchedFiles"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DidChangeWatchedFilesParams,
+    ) Error!void {
+        var changes: std.ArrayList(types.FileEvent) = .empty;
+        for (params.changes) |change| {
+            if (change.type != .Changed or !std.mem.endsWith(u8, change.uri, "/build.zig")) continue;
+            try changes.append(arena, change);
+        }
+        if (changes.items.len == 0) return;
+
+        log.debug("LSP <- workspace/didChangeWatchedFiles build.zig changes={}", .{changes.items.len});
+        try server.zig_middleware.didChangeWatchedFiles(arena, .{ .changes = changes.items });
+        log.debug("LSP -> workspace/didChangeWatchedFiles", .{});
     }
 
     /// LSP `textDocument/completion` handler for directive completions.
@@ -1128,7 +1170,7 @@ pub const Server = struct {
         log.debug("LSP -> exit elapsed_ns={}", .{server.logElapsedNs(start)});
     }
 
-    /// LSP response hook; ignored because this server does not initiate requests yet.
+    /// LSP response hook; server-initiated requests have no result-bearing follow-up.
     pub fn onResponse(server: *Server, _: std.mem.Allocator, response: lsp.JsonRPCMessage.Response) void {
         const start = server.logStart();
         log.debug("LSP <- response id_present={}", .{response.id != null});
@@ -1280,6 +1322,59 @@ pub const Server = struct {
             "workspace/semanticTokens/refresh",
             ?void,
             null,
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+
+    fn refreshInlayHints(server: *Server) Error!void {
+        if (!server.client_supports_inlay_hints_refresh) return;
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+
+        try transport.writeRequest(
+            io,
+            server.allocator,
+            server.nextRequestId(),
+            "workspace/inlayHint/refresh",
+            ?void,
+            null,
+            .{ .emit_null_optional_fields = false },
+        );
+    }
+
+    fn registerBuildFileWatcher(server: *Server) Error!void {
+        if (!server.client_supports_watched_files_dynamic_registration) return;
+        const transport = server.client_transport orelse return;
+        const io = server.io orelse return;
+
+        const Watcher = struct {
+            globPattern: []const u8,
+            kind: u32,
+        };
+        const Registration = struct {
+            id: []const u8,
+            method: []const u8,
+            registerOptions: struct {
+                watchers: []const Watcher,
+            },
+        };
+        const watchers = [_]Watcher{.{
+            .globPattern = "**/build.zig",
+            .kind = @intFromEnum(types.WatchKind.Change),
+        }};
+        const registrations = [_]Registration{.{
+            .id = "lsp_zitron-build-zig-change",
+            .method = "workspace/didChangeWatchedFiles",
+            .registerOptions = .{ .watchers = &watchers },
+        }};
+
+        try transport.writeRequest(
+            io,
+            server.allocator,
+            server.nextRequestId(),
+            "client/registerCapability",
+            struct { registrations: []const Registration },
+            .{ .registrations = &registrations },
             .{ .emit_null_optional_fields = false },
         );
     }
