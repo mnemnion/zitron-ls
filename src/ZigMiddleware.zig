@@ -680,6 +680,25 @@ const Middleware = struct {
         );
     }
 
+    fn forwardTypeDefinition(
+        middleware: *Middleware,
+        arena: std.mem.Allocator,
+        zy_uri: []const u8,
+        params: types.TypeDefinitionParams,
+    ) Error!lsp.ResultType("textDocument/typeDefinition") {
+        return try forwardDefinitionLike(
+            "textDocument/typeDefinition",
+            "type definition",
+            middleware,
+            arena,
+            zy_uri,
+            params.textDocument,
+            params.position,
+            params.workDoneToken,
+            params.partialResultToken,
+        );
+    }
+
     fn forwardDefinitionLike(
         comptime method: []const u8,
         comptime label: []const u8,
@@ -2236,6 +2255,21 @@ pub fn forwardDefinition(
         .disabled => null,
         .enabled => |mware| mware.forwardDefinition(arena, zy_uri, params) catch |err| {
             try suppressForwardRequestFailure("definition", zy_uri, err);
+            return null;
+        },
+    };
+}
+
+pub fn forwardTypeDefinition(
+    middleware: *ZigMiddleware,
+    arena: std.mem.Allocator,
+    zy_uri: []const u8,
+    params: types.TypeDefinitionParams,
+) Error!lsp.ResultType("textDocument/typeDefinition") {
+    return switch (middleware.mode) {
+        .disabled => null,
+        .enabled => |mware| mware.forwardTypeDefinition(arena, zy_uri, params) catch |err| {
+            try suppressForwardRequestFailure("type definition", zy_uri, err);
             return null;
         },
     };

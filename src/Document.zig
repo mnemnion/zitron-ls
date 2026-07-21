@@ -20,6 +20,8 @@ pub const ParseSummary = struct {
 pub const SemanticKind = enum {
     rule_definition,
     rule_reference,
+    token_class_definition,
+    token_class_reference,
     terminal_reference,
     action_definition,
     action_implementation,
@@ -40,6 +42,7 @@ pub const RenameKind = enum {
     action,
     alias,
     nonterminal,
+    token_class,
     terminal,
 };
 
@@ -55,6 +58,13 @@ pub const Resolution = union(enum) {
     no_match,
     unsupported_zig_code,
     symbol: SemanticSymbol,
+};
+
+/// Result of resolving the semantic type assigned to a grammar particle.
+pub const TypeDefinitionResolution = union(enum) {
+    no_match,
+    unsupported_zig_code,
+    target: ts.Node,
 };
 
 /// Errors that can occur while parsing or updating a document.
@@ -178,21 +188,90 @@ pub fn resolveAtPosition(
     defer cursor.destroy();
     cursor.exec(tags_query, root);
 
+    const selected_nonterminal_name = if (grammarParticleContainingIndex(node, source_index)) |particle|
+        if (grammarParticleKind(particle) == .nonterminal)
+            normalizeSymbolName(sliceForNode(document.source, particle))
+        else
+            null
+    else
+        null;
+    var selected_name_is_token_class = false;
     var best: ?SemanticSymbol = null;
     while (cursor.nextMatch()) |match| {
-        const candidate = semanticSymbolForMatch(tags_query, document.source, source_index, match) orelse continue;
+        const candidate = semanticSymbolForMatch(tags_query, document.source, match) orelse continue;
+        if (candidate.kind == .token_class_definition) {
+            if (selected_nonterminal_name) |selected_name| {
+                if (std.mem.eql(u8, candidate.symbol_name, selected_name)) {
+                    selected_name_is_token_class = true;
+                }
+            }
+        }
+        if (!nodeContainsIndex(candidate.name_node, source_index)) continue;
         if (best == null or isBetterMatch(candidate, best.?, source_index)) {
             best = candidate;
+        }
+    }
+
+    if (best) |*symbol| {
+        if (symbol.kind == .rule_reference and selected_name_is_token_class) {
+            symbol.kind = .token_class_reference;
         }
     }
 
     return if (best) |symbol| .{ .symbol = symbol } else .no_match;
 }
 
+/// Finds the type or token-class directive to display when hovering a grammar symbol.
+pub fn hoverDirectiveForSymbol(document: Document, symbol: SemanticSymbol) ?[]const u8 {
+    switch (symbol.kind) {
+        .action_definition, .action_implementation => return null,
+        else => {},
+    }
+
+    var explicit_type_directive: ?[]const u8 = null;
+    var default_type_directive: ?[]const u8 = null;
+    var token_type_directive: ?[]const u8 = null;
+    var token_class_directive: ?[]const u8 = null;
+
+    const root = document.tree.rootNode();
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        if (!std.mem.eql(u8, directive.kind(), "directive")) continue;
+
+        if (tokenClassNameNode(directive)) |name_node| {
+            if (std.mem.eql(u8, symbol.symbol_name, sliceForNode(document.source, name_node))) {
+                token_class_directive = sliceForNode(document.source, directive);
+            }
+        }
+
+        const directive_kind = directiveTypeKind(document.source, directive) orelse continue;
+        _ = directiveTypePayloadNode(directive) orelse continue;
+        const directive_text = sliceForNode(document.source, directive);
+        switch (directive_kind) {
+            .symbol_type => {
+                const target = directiveNonterminalTypeTarget(document.source, directive) orelse continue;
+                if (std.mem.eql(u8, symbol.symbol_name, target)) explicit_type_directive = directive_text;
+            },
+            .default_type => default_type_directive = directive_text,
+            .token_type => token_type_directive = directive_text,
+        }
+    }
+
+    return switch (symbol.kind) {
+        .rule_definition, .rule_reference => explicit_type_directive orelse default_type_directive,
+        .token_class_definition, .token_class_reference => token_class_directive,
+        .terminal_reference => token_type_directive,
+        .action_definition, .action_implementation => unreachable,
+    };
+}
+
 /// Resolves the best renameable grammar-side symbol at the requested position.
 pub fn renameSymbolAtPosition(
     document: Document,
     rename_query: *const ts.Query,
+    tags_query: *const ts.Query,
     offset_encoding: lsp.offsets.Encoding,
     position: types.Position,
 ) ?RenameSymbol {
@@ -206,9 +285,14 @@ pub fn renameSymbolAtPosition(
     if (containsUnsupportedCode(node)) return null;
 
     const name_node = renameNodeContainingIndex(node, source_index) orelse return null;
+    var kind = renameKindForNode(name_node) orelse return null;
+    const symbol_name = normalizeSymbolName(sliceForNode(document.source, name_node));
+    if (kind == .nonterminal and document.findTokenClassDefinition(tags_query, symbol_name) != null) {
+        kind = .token_class;
+    }
     return .{
-        .kind = renameKindForNode(name_node) orelse return null,
-        .symbol_name = normalizeSymbolName(sliceForNode(document.source, name_node)),
+        .kind = kind,
+        .symbol_name = symbol_name,
         .name_node = name_node,
     };
 }
@@ -226,6 +310,68 @@ pub fn containsZigCodeAtPosition(
     if (containsUnsupportedCode(raw_node)) return true;
     const node = root.namedDescendantForPointRange(point, point) orelse return false;
     return containsUnsupportedCode(node);
+}
+
+/// Finds the directive that assigns the semantic type of the grammar particle at a position.
+pub fn typeDefinitionAtPosition(
+    document: Document,
+    offset_encoding: lsp.offsets.Encoding,
+    position: types.Position,
+) TypeDefinitionResolution {
+    const source_index = lsp.offsets.positionToIndex(document.source, position, offset_encoding);
+    const point = tsPointFromIndex(document.source, source_index);
+    const root = document.tree.rootNode();
+    const raw_node = root.descendantForPointRange(point, point) orelse return .no_match;
+    if (containsUnsupportedCode(raw_node)) return .unsupported_zig_code;
+    const node = root.namedDescendantForPointRange(point, point) orelse return .no_match;
+    if (containsUnsupportedCode(node)) return .unsupported_zig_code;
+
+    const particle = grammarParticleContainingIndex(node, source_index) orelse return .no_match;
+    const particle_kind = grammarParticleKind(particle).?;
+    const particle_name = sliceForNode(document.source, particle);
+    var token_class = false;
+    var explicit_type: ?ts.Node = null;
+    var default_type: ?ts.Node = null;
+    var token_type: ?ts.Node = null;
+
+    const child_count = root.namedChildCount();
+    var index: u32 = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        if (!std.mem.eql(u8, directive.kind(), "directive")) continue;
+
+        if (particle_kind == .nonterminal) {
+            if (tokenClassNameNode(directive)) |name_node| {
+                if (std.mem.eql(u8, particle_name, sliceForNode(document.source, name_node))) {
+                    token_class = true;
+                }
+            }
+        }
+
+        const payload = directiveTypePayloadNode(directive) orelse continue;
+
+        switch (directiveTypeKind(document.source, directive) orelse continue) {
+            .symbol_type => if (particle_kind == .nonterminal and !token_class) {
+                const target = directiveNonterminalTypeTargetNode(directive) orelse continue;
+                if (std.mem.eql(u8, particle_name, sliceForNode(document.source, target))) {
+                    explicit_type = target;
+                }
+            },
+            .default_type => default_type = payload,
+            .token_type => token_type = payload,
+        }
+    }
+
+    return switch (particle_kind) {
+        .nonterminal => if (if (token_class) token_type else explicit_type orelse default_type) |directive|
+            .{ .target = directive }
+        else
+            .no_match,
+        .terminal, .multiterminal => if (token_type) |directive|
+            .{ .target = directive }
+        else
+            .no_match,
+    };
 }
 
 /// Builds grammar-side inlay hints for aliases with known Zitron value types.
@@ -261,6 +407,11 @@ pub fn inlayHints(
 /// Finds the definition symbol for a named rule in this document.
 pub fn findRuleDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
     return document.findDefinition(tags_query, symbol_name, .rule_definition);
+}
+
+/// Finds the defining `%token_class` directive name for a token class.
+pub fn findTokenClassDefinition(document: Document, tags_query: *const ts.Query, symbol_name: []const u8) ?SemanticSymbol {
+    return document.findDefinition(tags_query, symbol_name, .token_class_definition);
 }
 
 /// Finds the definition symbol for a named action in this document.
@@ -334,7 +485,7 @@ pub fn renameEdits(
 
     while (cursor.nextMatch()) |match| {
         const candidate = renameSymbolForMatch(rename_query, document.source, null, match) orelse continue;
-        if (candidate.kind != symbol.kind) continue;
+        if (!renameKindsMatch(symbol.kind, candidate.kind)) continue;
         if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
 
         const start = candidate.name_node.startByte();
@@ -487,7 +638,7 @@ fn findReferencesForSymbol(
     cursor.exec(tags_query, document.tree.rootNode());
 
     while (cursor.nextMatch()) |match| {
-        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
+        const candidate = semanticSymbolForMatch(tags_query, document.source, match) orelse continue;
         if (!std.mem.eql(u8, candidate.symbol_name, symbol_name)) continue;
 
         switch (symbol_kind) {
@@ -502,6 +653,24 @@ fn findReferencesForSymbol(
                 }
 
                 if (include_declaration and candidate.kind == .rule_definition) {
+                    try references.append(arena, document.locationForNode(
+                        uri,
+                        candidate.name_node,
+                        offset_encoding,
+                    ));
+                }
+            },
+            .token_class_definition, .token_class_reference => {
+                if (candidate.kind == .rule_reference) {
+                    try references.append(arena, document.locationForNode(
+                        uri,
+                        candidate.name_node,
+                        offset_encoding,
+                    ));
+                    continue;
+                }
+
+                if (include_declaration and candidate.kind == .token_class_definition) {
                     try references.append(arena, document.locationForNode(
                         uri,
                         candidate.name_node,
@@ -571,8 +740,8 @@ pub fn documentSymbols(
     cursor.exec(tags_query, document.tree.rootNode());
 
     while (cursor.nextMatch()) |match| {
-        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
-        if (candidate.kind == .rule_reference or candidate.kind == .terminal_reference) continue;
+        const candidate = semanticSymbolForMatch(tags_query, document.source, match) orelse continue;
+        if (candidate.kind == .rule_reference or candidate.kind == .token_class_reference or candidate.kind == .terminal_reference) continue;
 
         try symbols.append(arena, .{
             .name = candidate.symbol_name,
@@ -626,7 +795,7 @@ fn symbolHighlights(
     cursor.exec(tags_query, document.tree.rootNode());
 
     while (cursor.nextMatch()) |match| {
-        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
+        const candidate = semanticSymbolForMatch(tags_query, document.source, match) orelse continue;
         if (!std.mem.eql(u8, candidate.symbol_name, symbol.symbol_name)) continue;
         if (!highlightKindsMatch(symbol.kind, candidate.kind)) continue;
 
@@ -667,7 +836,7 @@ fn findDefinition(
     cursor.exec(tags_query, document.tree.rootNode());
 
     while (cursor.nextMatch()) |match| {
-        const candidate = semanticSymbolForMatch(tags_query, document.source, null, match) orelse continue;
+        const candidate = semanticSymbolForMatch(tags_query, document.source, match) orelse continue;
         if (candidate.kind != kind) continue;
         if (std.mem.eql(u8, candidate.symbol_name, symbol_name)) return candidate;
     }
@@ -679,6 +848,8 @@ fn documentSymbolKind(kind: SemanticKind) types.SymbolKind {
     return switch (kind) {
         .rule_definition => .Class,
         .rule_reference => .Class,
+        .token_class_definition => .Constant,
+        .token_class_reference => .Constant,
         .terminal_reference => .EnumMember,
         .action_definition => .Interface,
         .action_implementation => .Function,
@@ -689,6 +860,8 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
     return switch (kind) {
         .rule_definition => "rule",
         .rule_reference => "rule reference",
+        .token_class_definition => "token class",
+        .token_class_reference => "token class reference",
         .terminal_reference => "terminal reference",
         .action_definition => "named action",
         .action_implementation => "named action implementation",
@@ -699,10 +872,10 @@ const TypeTable = struct {
     const empty: TypeTable = .{
         .symbol_types = .empty,
         .token_type = null,
-        .default_type = null,
+        .default_type = "void",
     };
 
-    symbol_types: std.StringHashMapUnmanaged([]const u8),
+    symbol_types: std.StringHashMapUnmanaged(?[]const u8),
     token_type: ?[]const u8,
     default_type: ?[]const u8,
 
@@ -710,7 +883,7 @@ const TypeTable = struct {
         table.symbol_types.deinit(allocator);
     }
 
-    fn putSymbolType(table: *TypeTable, allocator: std.mem.Allocator, symbol: []const u8, type_value: []const u8) OOM!void {
+    fn putSymbolType(table: *TypeTable, allocator: std.mem.Allocator, symbol: []const u8, type_value: ?[]const u8) OOM!void {
         try table.symbol_types.put(allocator, symbol, type_value);
     }
 
@@ -807,12 +980,19 @@ fn collectTypeFacts(
         const type_value = directiveTypePayload(source, directive) orelse continue;
         switch (directive_kind) {
             .symbol_type => {
-                const symbol = directiveSymbolTypeTarget(source, directive) orelse continue;
+                const symbol = directiveNonterminalTypeTarget(source, directive) orelse continue;
                 try type_table.putSymbolType(allocator, symbol, type_value);
             },
             .token_type => type_table.token_type = type_value,
             .default_type => type_table.default_type = type_value,
         }
+    }
+
+    index = 0;
+    while (index < child_count) : (index += 1) {
+        const directive = root.namedChild(index).?;
+        const name_node = tokenClassNameNode(directive) orelse continue;
+        try type_table.putSymbolType(allocator, sliceForNode(source, name_node), type_table.token_type);
     }
 }
 
@@ -1023,7 +1203,11 @@ fn directiveTypeKind(source: []const u8, directive: ts.Node) ?DirectiveTypeKind 
     return null;
 }
 
-fn directiveSymbolTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8 {
+fn directiveNonterminalTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8 {
+    return sliceForNode(source, directiveNonterminalTypeTargetNode(directive) orelse return null);
+}
+
+fn directiveNonterminalTypeTargetNode(directive: ts.Node) ?ts.Node {
     const child_count = directive.namedChildCount();
     var seen_name = false;
     var index: u32 = 0;
@@ -1033,12 +1217,30 @@ fn directiveSymbolTypeTarget(source: []const u8, directive: ts.Node) ?[]const u8
             if (isDirectiveNameNode(child)) seen_name = true;
             continue;
         }
-        if (grammarParticleKind(child) != null) return sliceForNode(source, child);
+        if (grammarParticleKind(child) == .nonterminal) return child;
     }
     return null;
 }
 
+fn tokenClassNameNode(directive: ts.Node) ?ts.Node {
+    if (!std.mem.eql(u8, directive.kind(), "directive")) return null;
+    _ = firstNamedChildOfKind(directive, "arg_directive_name") orelse return null;
+    _ = firstNamedChildOfKind(directive, "multiterminal") orelse return null;
+    return firstNamedChildOfKind(directive, "nonterminal");
+}
+
 fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
+    const leaf = directiveTypePayloadNode(directive) orelse return null;
+    const value = sliceForNode(source, leaf);
+    if (std.mem.eql(u8, leaf.kind(), "string")) {
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            return value[1 .. value.len - 1];
+        }
+    }
+    return value;
+}
+
+fn directiveTypePayloadNode(directive: ts.Node) ?ts.Node {
     var maybe_payload: ?ts.Node = null;
     const child_count = directive.namedChildCount();
     var index: u32 = 0;
@@ -1052,17 +1254,11 @@ fn directiveTypePayload(source: []const u8, directive: ts.Node) ?[]const u8 {
     else
         payload;
 
-    const value = sliceForNode(source, leaf);
-    if (std.mem.eql(u8, leaf.kind(), "string")) {
-        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
-            return value[1 .. value.len - 1];
-        }
-    }
     if (std.mem.eql(u8, leaf.kind(), "zig_code") or
         std.mem.eql(u8, leaf.kind(), "identifier") or
         std.mem.eql(u8, leaf.kind(), "string"))
     {
-        return value;
+        return leaf;
     }
     return null;
 }
@@ -1081,6 +1277,16 @@ fn grammarParticleKind(node: ts.Node) ?GrammarParticleKind {
     if (std.mem.eql(u8, kind, "terminal")) return .terminal;
     if (std.mem.eql(u8, kind, "multiterminal")) return .multiterminal;
     return null;
+}
+
+fn grammarParticleContainingIndex(node: ts.Node, source_index: usize) ?ts.Node {
+    var cursor = node;
+    while (true) {
+        if (nodeContainsIndex(cursor, source_index) and grammarParticleKind(cursor) != null) {
+            return cursor;
+        }
+        cursor = cursor.parent() orelse return null;
+    }
 }
 
 fn positionInRange(position: types.Position, range: types.Range) bool {
@@ -1111,7 +1317,6 @@ fn parseDocumentIncremental(parser: *ts.Parser, source: []const u8, old_tree: ?*
 fn semanticSymbolForMatch(
     query: *const ts.Query,
     source: []const u8,
-    source_index: ?usize,
     match: ts.Query.Match,
 ) ?SemanticSymbol {
     var semantic_capture_name: ?[]const u8 = null;
@@ -1121,13 +1326,7 @@ fn semanticSymbolForMatch(
     for (match.captures) |capture| {
         const capture_name = query.captureNameForId(capture.index) orelse continue;
         if (std.mem.eql(u8, capture_name, "name")) {
-            if (source_index) |index| {
-                if (nodeContainsIndex(capture.node, index)) {
-                    name_node = capture.node;
-                }
-            } else if (name_node == null) {
-                name_node = capture.node;
-            }
+            if (name_node == null) name_node = capture.node;
             continue;
         }
 
@@ -1175,6 +1374,7 @@ fn renameSymbolForMatch(
 
 fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
     if (std.mem.eql(u8, capture_name, "definition.class")) return .rule_definition;
+    if (std.mem.eql(u8, capture_name, "definition.constant")) return .token_class_definition;
     if (std.mem.eql(u8, capture_name, "reference.class")) return .rule_reference;
     if (std.mem.eql(u8, capture_name, "reference.enum")) return .terminal_reference;
     if (std.mem.eql(u8, capture_name, "definition.interface")) return .action_definition;
@@ -1185,6 +1385,7 @@ fn semanticKindForCaptureName(capture_name: []const u8) ?SemanticKind {
 fn highlightKindsMatch(selected: SemanticKind, candidate: SemanticKind) bool {
     return switch (selected) {
         .rule_definition, .rule_reference => candidate == .rule_definition or candidate == .rule_reference,
+        .token_class_definition, .token_class_reference => candidate == .token_class_definition or candidate == .rule_reference,
         .terminal_reference => candidate == .terminal_reference,
         .action_definition, .action_implementation => candidate == .action_definition or candidate == .action_implementation,
     };
@@ -1194,6 +1395,8 @@ fn highlightKindForSemanticKind(kind: SemanticKind) ?types.DocumentHighlight.Kin
     return switch (kind) {
         .rule_definition => .Write,
         .rule_reference => .Read,
+        .token_class_definition => .Write,
+        .token_class_reference => .Read,
         .terminal_reference, .action_definition, .action_implementation => null,
     };
 }
@@ -1205,6 +1408,11 @@ fn renameKindForNode(node: ts.Node) ?RenameKind {
     if (std.mem.eql(u8, kind, "nonterminal")) return .nonterminal;
     if (std.mem.eql(u8, kind, "terminal")) return .terminal;
     return null;
+}
+
+fn renameKindsMatch(selected: RenameKind, candidate: RenameKind) bool {
+    return selected == candidate or
+        (selected == .token_class and candidate == .nonterminal);
 }
 
 fn renameNodeContainingIndex(node: ts.Node, source_index: usize) ?ts.Node {
@@ -2182,7 +2390,6 @@ test "inlay hints type grammar aliases from type directives" {
         \\%default_type {*Default}
         \\%type expr f64
         \\%type expr i64
-        \\%type NUMBER {f64}
         \\start ::= expr(A) PLUS|MINUS(O) fallback(F).
         \\expr(E) ::= NUMBER(N).
         \\fallback(D) ::= .
@@ -2206,13 +2413,30 @@ test "inlay hints type grammar aliases from type directives" {
     const expr_rule = try byteIndexOf(sample, "expr(E)");
     try expectInlayHintAfter(sample, hints, expr_rule, "E", ": i64");
     const number_alias = try byteIndexOf(sample, "NUMBER(N)");
-    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": f64");
+    try expectInlayHintAfter(sample, hints, number_alias + "NUMBER(".len, "N", ": Token");
+}
+
+test "inlay hints use the implicit void default type" {
+    const sample = "start ::= fallback(F).";
+    var document = try Document.init(testing_allocator, 1, sample);
+    defer document.deinit(testing_allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const hints = try document.inlayHints(arena_state.allocator(), .{
+        .start = .{ .line = 0, .character = 0 },
+        .end = .{ .line = 1, .character = 0 },
+    }, .@"utf-8");
+
+    try expectEqual(@as(usize, 1), hints.len);
+    try expectInlayHintAfter(sample, hints, 0, "F", ": void");
 }
 
 test "inlay hints type named action and impl aliases by name and position" {
     const sample =
+        \\%token_type f64
         \\%type expr f64
-        \\%type NUMBER {f64}
         \\expr(A) ::= NUMBER(N). @on_expr(A; N)
         \\%impl @on_expr(A; N) { _ = .{ A, N }; }
         \\%impl @on_expr(N; A) { _ = .{ N, A }; }

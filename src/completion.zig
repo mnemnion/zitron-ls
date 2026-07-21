@@ -36,6 +36,7 @@ const ActionArgumentKind = enum {
 
 const ParticleKind = enum {
     nonterminal,
+    token_class,
     terminal,
     multiterminal,
 };
@@ -179,7 +180,7 @@ pub fn completeRuleActionAliases(
     return items;
 }
 
-/// Returns grammar-particle completions for terminal, nonterminal, and multiterminal names.
+/// Returns grammar-particle completions for terminals, nonterminals, token classes, and multiterminals.
 pub fn completeGrammarParticles(
     allocator: Allocator,
     source: []const u8,
@@ -190,7 +191,7 @@ pub fn completeGrammarParticles(
     const context = particleContext(source, root, position, encoding) orelse return null;
 
     var particles: std.ArrayList(Particle) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var seen: std.StringHashMapUnmanaged(usize) = .empty;
     defer seen.deinit(allocator);
 
     try collectGrammarParticles(allocator, source, root, &particles, &seen);
@@ -692,14 +693,26 @@ fn collectGrammarParticles(
     source: []const u8,
     node: ts.Node,
     particles: *std.ArrayList(Particle),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *std.StringHashMapUnmanaged(usize),
 ) OOM!void {
+    if (tokenClassNameNode(node)) |name_node| {
+        try appendOrRefineParticle(
+            allocator,
+            particles,
+            seen,
+            sliceForNode(source, name_node),
+            .token_class,
+        );
+    }
+
     if (particleKindForNode(node)) |kind| {
-        const label = sliceForNode(source, node);
-        if (!seen.contains(label)) {
-            try seen.put(allocator, label, {});
-            try particles.append(allocator, .{ .label = label, .kind = kind });
-        }
+        try appendOrRefineParticle(
+            allocator,
+            particles,
+            seen,
+            sliceForNode(source, node),
+            kind,
+        );
     }
 
     const child_count = node.namedChildCount();
@@ -707,6 +720,23 @@ fn collectGrammarParticles(
     while (index < child_count) : (index += 1) {
         try collectGrammarParticles(allocator, source, node.namedChild(index).?, particles, seen);
     }
+}
+
+fn appendOrRefineParticle(
+    allocator: Allocator,
+    particles: *std.ArrayList(Particle),
+    seen: *std.StringHashMapUnmanaged(usize),
+    label: []const u8,
+    kind: ParticleKind,
+) OOM!void {
+    const entry = try seen.getOrPut(allocator, label);
+    if (entry.found_existing) {
+        if (kind == .token_class) particles.items[entry.value_ptr.*].kind = .token_class;
+        return;
+    }
+
+    entry.value_ptr.* = particles.items.len;
+    try particles.append(allocator, .{ .label = label, .kind = kind });
 }
 
 fn particleKindForNode(node: ts.Node) ?ParticleKind {
@@ -731,6 +761,7 @@ fn particleKindForNode(node: ts.Node) ?ParticleKind {
 fn completionKindForParticle(kind: ParticleKind) types.CompletionItemKind {
     return switch (kind) {
         .nonterminal => .Class,
+        .token_class => .Constant,
         .terminal => .EnumMember,
         .multiterminal => .Constant,
     };
@@ -739,6 +770,7 @@ fn completionKindForParticle(kind: ParticleKind) types.CompletionItemKind {
 fn detailForParticle(kind: ParticleKind) []const u8 {
     return switch (kind) {
         .nonterminal => "nonterminal",
+        .token_class => "token class",
         .terminal => "terminal",
         .multiterminal => "multiterminal",
     };
@@ -754,6 +786,13 @@ fn filterTextForParticle(particle: Particle, prefix: []const u8) ?[]const u8 {
     }
 
     return null;
+}
+
+fn tokenClassNameNode(directive: ts.Node) ?ts.Node {
+    if (!std.mem.eql(u8, directive.kind(), "directive")) return null;
+    _ = firstNamedChildOfKind(directive, "arg_directive_name") orelse return null;
+    _ = firstNamedChildOfKind(directive, "multiterminal") orelse return null;
+    return firstNamedChildOfKind(directive, "nonterminal");
 }
 
 fn directiveNameNode(source: []const u8, root: ts.Node, index: usize) ?ts.Node {

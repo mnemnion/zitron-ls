@@ -26,6 +26,20 @@
   (rhs rule_name: (multiterminal (terminal) @name))) @reference.enum
 
 (directive
+  (arg_directive_name)
+  (nonterminal) @name
+  (multiterminal)) @definition.constant
+
+(directive
+  (arg_directive_name)
+  (nonterminal) @name
+  [(code_block)
+   (string)
+   (number)
+   (identifier)]) @reference.class
+
+(directive
+  (token_directive_name)
   (nonterminal) @name) @reference.class
 
 (directive

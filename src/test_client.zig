@@ -160,7 +160,11 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("textDocument/hover"),
         .{
             .textDocument = .{ .uri = fixture_uri },
-            .position = try positionOfText(fixture_text, "document ::= statement_list"),
+            .position = try positionOfTextAfter(
+                fixture_text,
+                try byteIndexOf(fixture_text, "document ::= statement_list"),
+                "statement_list",
+            ),
         },
         .{ .emit_null_optional_fields = false },
     );
@@ -454,6 +458,53 @@ pub fn main(init: std.process.Init) Error!void {
         slash_terminal_position,
     );
 
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 22 },
+        "textDocument/typeDefinition",
+        lsp.ParamsType("textDocument/typeDefinition"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = try positionOfTextAfter(fixture_text, document_rule_index + "document ::= ".len, "statement_list"),
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectTypeDefinitionResponse(
+        init.io,
+        allocator,
+        &transport.transport,
+        22,
+        fixture_uri,
+        (try positionOfText(fixture_text, "%type statement_list")).line,
+    );
+
+    const pik_parameter_position = try positionOfTextAfter(
+        fixture_text,
+        try byteIndexOf(fixture_text, "fn pik_error_context(p: *Pik"),
+        "p: *Pik",
+    );
+    try transport.transport.writeRequest(
+        init.io,
+        allocator,
+        .{ .number = 23 },
+        "textDocument/typeDefinition",
+        lsp.ParamsType("textDocument/typeDefinition"),
+        .{
+            .textDocument = .{ .uri = fixture_uri },
+            .position = pik_parameter_position,
+        },
+        .{ .emit_null_optional_fields = false },
+    );
+    try expectTypeDefinitionResponse(
+        init.io,
+        allocator,
+        &transport.transport,
+        23,
+        fixture_uri,
+        (try positionOfText(fixture_text, "pub const Pik = struct")).line,
+    );
+
     if (!saw_work_done_progress_create or !saw_progress_begin or !saw_progress_end) {
         return error_set.MissingWorkDoneProgress;
     }
@@ -578,8 +629,10 @@ fn expectHoverResponse(
 
     switch (hover.value.contents) {
         .markup_content => |content| {
-            try expect(std.mem.indexOf(u8, content.value, "rule definition `document`") != null);
-            try expect(std.mem.indexOf(u8, content.value, "definition.class") != null);
+            try expectEqualStrings(
+                "```zitron\n%type statement_list {?*PList}\n```",
+                content.value,
+            );
         },
         else => return error_set.UnexpectedResponse,
     }
@@ -626,6 +679,56 @@ fn expectDefinitionResponse(
             .location => |location| {
                 try expectEqualStrings(fixture_uri, location.uri);
                 try expect(location.range.start.line > 0);
+            },
+            else => return error_set.UnexpectedResponse,
+        },
+        else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn expectTypeDefinitionResponse(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    id: i64,
+    fixture_uri: []const u8,
+    expected_line: u32,
+) Error!void {
+    const json_message = try readResponseJsonMessage(io, allocator, transport, id);
+    defer allocator.free(json_message);
+
+    const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const definition_value = switch (parsed.value) {
+        .response => |response| blk: {
+            if (response.id == null or !response.id.?.eql(.{ .number = id })) {
+                return error_set.UnexpectedResponse;
+            }
+            switch (response.result_or_error) {
+                .result => |maybe_result| break :blk maybe_result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            }
+        },
+        else => return error_set.UnexpectedResponse,
+    };
+
+    const definition = try std.json.parseFromValue(
+        lsp.ResultType("textDocument/typeDefinition"),
+        allocator,
+        definition_value,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer definition.deinit();
+
+    const resolved = definition.value orelse return error_set.UnexpectedResponse;
+    switch (resolved) {
+        .definition => |target| switch (target) {
+            .location => |location| {
+                try expectEqualStrings(fixture_uri, location.uri);
+                try expectEqual(expected_line, location.range.start.line);
             },
             else => return error_set.UnexpectedResponse,
         },

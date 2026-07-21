@@ -69,9 +69,6 @@ term(A) ::= factor(B). {
     // A-overwrites-B
 }
 
-
-%type NUMBER {f64}
-
 factor(A) ::= NUMBER(N). { A = N.val.?; }
 factor(A) ::= LPAREN expr(E) RPAREN. { A = E; }
 
