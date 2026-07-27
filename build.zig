@@ -16,10 +16,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("zls");
-    const woodward_dep = b.dependency("woodward", .{
-        .target = target,
-        .optimize = optimize,
-    });
     const tree_sitter_dep = b.dependency("tree-sitter", .{
         .target = target,
         .optimize = optimize,
@@ -44,7 +40,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    tree_sitter_mod.addImport("woodward", woodward_dep.module("woodward"));
     tree_sitter_mod.linkLibrary(tree_sitter_dep.artifact("tree-sitter"));
 
     lsp_zitron_mod.addImport("lsp", lsp_module);

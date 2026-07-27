@@ -1,7 +1,5 @@
 const std = @import("std");
 
-pub const Zig = @import("woodward").adapter("zig");
-
 pub const Point = extern struct {
     row: u32,
     column: u32,

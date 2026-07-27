@@ -3390,9 +3390,9 @@ const SpanTranslator = struct {
         try translator.replaceText(allocator, &translator.zy_text, translator.currentZySlice(zy_doc));
         try translator.replaceText(allocator, &translator.zig_text, current_zig);
 
-        var difference = Diff.init(.default);
+        var differ: Differ = .default;
+        var difference = try differ.diff(allocator, translator.zy_text, translator.zig_text);
         errdefer difference.deinit(allocator);
-        _ = try difference.diff(allocator, translator.zy_text, translator.zig_text);
         translator.difference = difference;
         translator.document_version = current_version;
         translator.resetCursors();
@@ -4114,9 +4114,9 @@ fn semanticDirtyRangeFromDiff(
     previous_zy_text: []const u8,
     current_zy_text: []const u8,
 ) OOM!?SemanticDirtyRange {
-    var difference = Diff.init(.default);
+    var differ: Differ = .default;
+    var difference = try differ.diff(allocator, previous_zy_text, current_zy_text);
     defer difference.deinit(allocator);
-    _ = try difference.diff(allocator, previous_zy_text, current_zy_text);
 
     var previous_cursor: types.Position = .{ .line = 0, .character = 0 };
     var current_cursor: types.Position = .{ .line = 0, .character = 0 };
@@ -7130,13 +7130,13 @@ test "alias code block rename edits come from zy-side deletes" {
 
     const zy_range = map.zy_range.items[0];
     const zig_range = map.zig_span.items[0].zig_range;
-    var difference = Diff.init(.default);
-    defer difference.deinit(testing_allocator);
-    _ = try difference.diff(
+    var differ: Differ = .default;
+    var difference = try differ.diff(
         testing_allocator,
         zy[zy_range.start_byte..zy_range.end_byte],
         zig[zig_range.start..zig_range.end],
     );
+    defer difference.deinit(testing_allocator);
 
     var edits: std.ArrayList(types.TextEdit) = .empty;
     defer edits.deinit(arena);
@@ -7178,13 +7178,13 @@ test "alias code block rename catches lhs aliases matched inside zig types" {
 
     const zy_range = map.zy_range.items[0];
     const zig_range = map.zig_span.items[0].zig_range;
-    var difference = Diff.init(.default);
-    defer difference.deinit(testing_allocator);
-    _ = try difference.diff(
+    var differ: Differ = .default;
+    var difference = try differ.diff(
         testing_allocator,
         zy[zy_range.start_byte..zy_range.end_byte],
         zig[zig_range.start..zig_range.end],
     );
+    defer difference.deinit(testing_allocator);
 
     var edits: std.ArrayList(types.TextEdit) = .empty;
     defer edits.deinit(arena);
@@ -9402,6 +9402,7 @@ const types = lsp.types.flat;
 const ts = @import("tree-sitter");
 const ZlsAdapter = @import("zls.zig");
 const zitron_grammar = @import("tree_sitter_zitron");
+const Differ = dmp.Differ;
 const Diff = dmp.Diff;
 const Edit = dmp.Edit;
 const JsonParseError = std.json.ParseFromValueError || error{
