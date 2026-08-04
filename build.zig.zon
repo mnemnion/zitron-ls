@@ -17,17 +17,17 @@
             .url = "https://github.com/neurocyte/tree-sitter/releases/download/master-70dbb6fa9d998bcf599c3aaeecac7479e9ee3f0c/source.tar.gz",
             .hash = "tree_sitter-0.26.7-z0LhyGSQZzENNbCzqsMPu63xwpZI1WTHcf62imt-H6YL",
         },
-        .tree_sitter_zitron = .{
-            .path = "../../g/tree-sitter-zitron",
-        },
-        .muad_diff = .{
-            // .url = "https://api.github.com/repos/mnemnion/muad-diff/tarball/refs/tags/ohsnap-prerelease-02",
-            // .hash = "muad_diff-0.0.1-p0-XoRGIAwBmN7XLmC4Z6Sj7mqeiUaZvwoisN1hXF81b",
-            .path = "../muad-diff/",
-        },
         .zls = .{
             .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",
             .hash = "zls-0.16.0-rmm5fs_JJgBG3dk5HwYK1FylE2_LMN0BYpX57tPzT-Xc",
+        },
+        .tree_sitter_zitron = .{
+            .url = "https://github.com/mnemnion/tree-sitter-zitron/archive/refs/tags/v0.1.8.tar.gz",
+            .hash = "tree_sitter_zitron-0.1.8-EA3PTIdCAwAQCeApomCzW0oHyIhmm1ZpF-VMm7wGtRoF",
+        },
+        .muad_diff = .{
+            .url = "https://github.com/mnemnion/muad-diff/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "muad_diff-0.1.0-p0-Xof2CUwKRE7QBSJk82_QOnbu-Q1Kv59I2e4Es4l_e",
         },
     },
 
