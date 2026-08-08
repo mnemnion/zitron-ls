@@ -1,5 +1,5 @@
 #!/Users/atman/Dropbox/deck/m/skills/.venv/bin/python
-"""Extract a replayable action stream from the latest lsp_zitron log session."""
+"""Extract a replayable action stream from the latest zitron-ls log session."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 
-DEFAULT_LOG = Path.home() / "Library/Caches/lsp_zitron/lsp_zitron.log"
+DEFAULT_LOG = Path.home() / "Library/Caches/zitron-ls/zitron-ls.log"
 
 
 def main() -> int:
@@ -55,7 +55,7 @@ def latest_real_session_range(lines: list[str], include_replay_sessions: bool) -
     if include_replay_sessions:
         return ranges[-1]
     for start, end in reversed(ranges):
-        if not any("lsp_zitron_replay_client" in line for line in lines[start:end]):
+        if not any("zitron-ls-replay-client" in line for line in lines[start:end]):
             return start, end
     return ranges[-1]
 
@@ -182,7 +182,7 @@ def initialize_action(request_id: int) -> dict:
         "method": "initialize",
         "params": {
             "processId": None,
-            "clientInfo": {"name": "lsp_zitron_replay_client"},
+            "clientInfo": {"name": "zitron-ls-replay-client"},
             "capabilities": {
                 "general": {"positionEncodings": ["utf-8", "utf-16"]},
                 "workspace": {"semanticTokens": {"refreshSupport": True}},

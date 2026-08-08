@@ -1433,7 +1433,7 @@ const Middleware = struct {
 
         const zy_result_id = try std.fmt.allocPrint(
             middleware.allocator,
-            "lsp-zitron-semantic-{d}",
+            "zitron-ls-semantic-{d}",
             .{state.next_semantic_tokens_result_id},
         );
         errdefer middleware.allocator.free(zy_result_id);
@@ -5894,7 +5894,7 @@ const zls_semantic_token_formats = [_]types.TokenFormat{.relative};
 fn zlsInitializeParams() types.InitializeParams {
     return .{
         .processId = null,
-        .clientInfo = .{ .name = "lsp_zitron" },
+        .clientInfo = .{ .name = "zitron-ls" },
         .capabilities = .{
             .general = .{
                 .positionEncodings = &zls_position_encodings,
@@ -5950,11 +5950,11 @@ fn warnIfZlsSemanticTokenLegendDrift(provider: ?types.ServerCapabilities.Semanti
         .semantic_tokens_options => |options| options.legend,
         .semantic_tokens_registration_options => |options| options.legend,
     } else {
-        log.warn("ZLS did not advertise semantic tokens; lsp_zitron static semantic token legend may be stale", .{});
+        log.warn("ZLS did not advertise semantic tokens; zitron-ls static semantic token legend may be stale", .{});
         return;
     };
     if (!semanticTokenLegendMatches(legend)) {
-        log.warn("ZLS semantic token legend differs from lsp_zitron static legend; token indices may need updating", .{});
+        log.warn("ZLS semantic token legend differs from zitron-ls static legend; token indices may need updating", .{});
     }
 }
 
@@ -8556,7 +8556,7 @@ test "semantic token requests serve fresh current collection without zls" {
     const full = (try middleware.forwardSemanticTokensFull(arena, uri, .{
         .textDocument = .{ .uri = uri },
     })) orelse return error.UnexpectedResponse;
-    try expectEqualStrings("lsp-zitron-semantic-1", full.resultId.?);
+    try expectEqualStrings("zitron-ls-semantic-1", full.resultId.?);
     try expectEqualSlices(u32, &current_data, full.data);
     const baseline_result_id = try testing_allocator.dupe(u8, full.resultId.?);
     defer testing_allocator.free(baseline_result_id);
@@ -8579,7 +8579,7 @@ test "semantic token requests serve fresh current collection without zls" {
         .semantic_tokens_delta => |value| value,
         .semantic_tokens => return error.UnexpectedResponse,
     };
-    try expectEqualStrings("lsp-zitron-semantic-2", delta_result.resultId.?);
+    try expectEqualStrings("zitron-ls-semantic-2", delta_result.resultId.?);
     try expectEqual(@as(usize, 0), delta_result.edits.len);
 
     for (0..max_semantic_token_snapshots + 2) |_| {
@@ -8602,7 +8602,7 @@ test "semantic token requests serve fresh current collection without zls" {
         .semantic_tokens => |value| value,
         .semantic_tokens_delta => return error.UnexpectedResponse,
     };
-    try expectEqualStrings("lsp-zitron-semantic-13", unknown_full.resultId.?);
+    try expectEqualStrings("zitron-ls-semantic-13", unknown_full.resultId.?);
     try expectEqualSlices(u32, &current_data, unknown_full.data);
 }
 

@@ -1,12 +1,12 @@
-// Zig package metadata for lsp_zitron
+// Zig package metadata for zitron-ls
 .{
-    .name = .lsp_zitron,
+    .name = .zitron_ls,
 
-    .version = "0.0.1",
+    .version = "0.1.0",
 
     .minimum_zig_version = "0.16.0",
 
-    .fingerprint = 0x5d6ef00f25fd9fe1,
+    .fingerprint = 0xb5d2b38b08ab804a,
 
     .dependencies = .{
         .lsp_kit = .{

@@ -4,8 +4,8 @@
 This is an [LSP] server for the [Zitron] grammar language.
 
 Working with the [YACC] family can feel like a trip back in time, when
-the warm glow of a hardward TTY came in one (1) color.  Not with Zitron.
-We have [syntax highlighting][ts-zitron] through tree- sitter, for both
+the warm glow of a hardware TTY came in one (1) color.  Not with Zitron.
+We have [syntax highlighting][ts-zitron] through tree-sitter, for both
 the grammar and the Zig code it quotes.  Already a step in the right
 direction!
 
@@ -22,9 +22,9 @@ for in a sophisticated grammar DSL:
 - [⚡️] Diagnostics
 
 Oh, and they work for the grammar, and the Zig code as well.
-`lsp_zitron` embeds the entirety of ZLS, and does a lot of [diffing].
+`zitron-ls` embeds the entirety of ZLS, and does a lot of [diffing].
 
-Nice right?
+Nice right?  We deserve nice things.
 
 [diffing]: https://github.com/mnemnion/muad-diff
 
@@ -32,7 +32,7 @@ Nice right?
 ## Installation
 
 This is early days: a certain amount of manual labor is involved in
-getting `lsp_zitron` stood up.
+getting `zitron-ls` stood up.
 
 
 ### Prerequisites
@@ -66,18 +66,19 @@ the record.
 
 #### Neovim
 
-Drop this into the `lsp-mason` section of your `init.lua`:
+Drop this (with the obvious alterations) into the `lsp-mason` section of
+your `init.lua`:
 
 ```lua
       {
         'williamboman/mason.nvim',
         init = function()
-          vim.opt.rtp:append '/path/to/lsp_zitron/registry'
+          vim.opt.rtp:append '/path/to/zitron-ls/registry'
         end,
         opts = {
           PATH = 'append',
           registries = {
-            'file:/path/to/lsp_zitron/registry/',
+            'file:/path/to/zitron-ls/registry/',
             'github:mason-org/mason-registry',
           },
         },
@@ -90,7 +91,7 @@ With this block inside the `config` function of `neovim/nvim-lspconfig`:
       if not configs.lsp_zitron then
         configs.lsp_zitron = {
           default_config = {
-            cmd = { '/path/to/lsp_zitron/zig-out/bin/lsp_zitron' },
+            cmd = { '/path/to/zitron-ls/zig-out/bin/zitron-ls' },
             filetypes = { 'zitron' },
             root_dir = function(fname)
               return util.root_pattern('build.zig', '.git')(fname) or vim.fs.dirname(fname)
@@ -101,7 +102,7 @@ With this block inside the `config` function of `neovim/nvim-lspconfig`:
       end
 ```
 
-Reminder: typing `zitron -h` should do useful things: `lsp_zitron` is
+Reminder: typing `zitron -h` should do useful things: `zitron-ls` is
 not expected to crash out if this doesn't work, but nor will it do many
 cool things it otherwise would.
 
@@ -114,7 +115,7 @@ supplement the tree-sitter rather than to replace it.
 
 #### Any Editor Not Truly Esoteric
 
-Realistically you can ask a clanker to hook you up, and it will.
+Realistically: you can ask a clanker to hook you up, and it will.
 
 #### Any Editor Truly Esoteric
 
@@ -130,6 +131,9 @@ shows that, in fact, `zls` can find references and imports in your Zig
 code, assuming your build file colors within the lines as described in
 the Zitron docs.
 
+There's also [pikchresque], a port of [Pikchr] with a few bells and
+whistles.  This is the whetstone against which the blade of this
+language server was sharpened.
 
 ## Bugs
 
@@ -144,3 +148,5 @@ figured out what that is yet.
 [lazy]: https://github.com/folke/lazy.nvim
 [zls]: https://github.com/zigtools/zls
 [zitron-examples]: https://github.com/mnemnion/zitron-examples/
+[pikchresque]: https://github.com/mnemnion/pikchresque
+[Pikchr]: https://pikchr.org/home/doc/trunk/homepage.md

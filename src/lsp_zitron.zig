@@ -4,7 +4,7 @@
 //! generator based on a port of D. Richard Hipp's Lemon.
 
 /// The language-server name reported during LSP initialization.
-pub const server_name = "lsp_zitron";
+pub const server_name = "zitron-ls";
 
 const server_version = "0.0.1";
 const zitron_completion_triggers = [_][]const u8{ "%", "(" };
@@ -1363,7 +1363,7 @@ pub const Server = struct {
             .kind = @intFromEnum(types.WatchKind.Change),
         }};
         const registrations = [_]Registration{.{
-            .id = "lsp_zitron-build-zig-change",
+            .id = "zitron-ls-build-zig-change",
             .method = "workspace/didChangeWatchedFiles",
             .registerOptions = .{ .watchers = &watchers },
         }};
@@ -3084,7 +3084,7 @@ const rename_query_source = @embedFile("zitron-rename-query");
 const token_enum_query_source = @embedFile("zitron-token-enum-query");
 const zitron_grammar = @import("tree_sitter_zitron");
 const test_offset_encoding: lsp.offsets.Encoding = .@"utf-8";
-const log = std.log.scoped(.lsp_zitron);
+const log = std.log.scoped(.@"zitron-ls");
 
 comptime {
     std.testing.refAllDecls(Document);

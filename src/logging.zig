@@ -1,7 +1,7 @@
-//! Runtime logging setup for the lsp_zitron executable.
+//! Runtime logging setup for the zitron-ls executable.
 
-const log_file_name = "lsp_zitron.log";
-const app_dir_name = "lsp_zitron";
+const log_file_name = "zitron-ls.log";
+const app_dir_name = "zitron-ls";
 
 pub const Options = struct {
     pub const init: Options = .{
@@ -240,7 +240,7 @@ test "default log path uses macOS cache directory" {
     const path = try defaultLogFilePath(testing_allocator, env);
     defer if (path) |owned| testing_allocator.free(owned);
 
-    try expectEqualStrings("/Users/em/Library/Caches/lsp_zitron/lsp_zitron.log", path.?);
+    try expectEqualStrings("/Users/em/Library/Caches/zitron-ls/zitron-ls.log", path.?);
 }
 
 test "XDG_CACHE_HOME overrides default cache directory" {
@@ -252,7 +252,7 @@ test "XDG_CACHE_HOME overrides default cache directory" {
     const path = try defaultLogFilePath(testing_allocator, env);
     defer if (path) |owned| testing_allocator.free(owned);
 
-    try expectEqualStrings("/tmp/cache/lsp_zitron/lsp_zitron.log", path.?);
+    try expectEqualStrings("/tmp/cache/zitron-ls/zitron-ls.log", path.?);
 }
 
 test "log level names parse like ZLS flags" {

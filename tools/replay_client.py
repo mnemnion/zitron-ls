@@ -1,5 +1,5 @@
 #!/Users/atman/Dropbox/deck/m/skills/.venv/bin/python
-"""Replay extracted JSON-RPC client actions against lsp_zitron."""
+"""Replay extracted JSON-RPC client actions against zitron-ls."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-DEFAULT_LOG = Path.home() / "Library/Caches/lsp_zitron/lsp_zitron.log"
+DEFAULT_LOG = Path.home() / "Library/Caches/zitron-ls/zitron-ls.log"
 
 
 class RpcReader(threading.Thread):
@@ -90,7 +90,7 @@ class RpcReader(threading.Thread):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--actions", type=Path, default=Path("zig-out/replay/latest.jsonl"))
-    parser.add_argument("--server", default="zig-out/bin/lsp_zitron")
+    parser.add_argument("--server", default="zig-out/bin/zitron-ls")
     parser.add_argument("--log", type=Path, default=DEFAULT_LOG)
     parser.add_argument("--delay-ms", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -349,7 +349,7 @@ def run_semantic_update_probe(
 
 
 def semantic_probe_text(text: str) -> str:
-    probe = "\nconst __lsp_zitron_replay_semantic_probe = 0;\n"
+    probe = "\nconst __zitron_ls_replay_semantic_probe = 0;\n"
     start = text.find("%include {")
     if start == -1:
         return text

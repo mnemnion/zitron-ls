@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) Error!void {
     defer args.deinit();
 
     _ = args.skip();
-    const server_path = args.next() orelse "zig-out/bin/lsp_zitron";
+    const server_path = args.next() orelse "zig-out/bin/zitron-ls";
     const fixture_text = try zitron.loadSmokeFixtureAlloc(init.io, allocator);
     defer allocator.free(fixture_text);
     const fixture_uri = try fixtureUriAlloc(init.io, allocator);
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) Error!void {
         lsp.ParamsType("initialize"),
         .{
             .processId = null,
-            .clientInfo = .{ .name = "lsp_zitron_test_client" },
+            .clientInfo = .{ .name = "zitron-ls-test-client" },
             .capabilities = .{
                 .general = .{
                     .positionEncodings = &.{ .@"utf-8", .@"utf-16" },
@@ -1244,5 +1244,5 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 const lsp = @import("lsp");
-const zitron = @import("lsp_zitron");
+const zitron = @import("zitron-ls");
 const offset_encoding: lsp.offsets.Encoding = .@"utf-8";

@@ -2,7 +2,7 @@
 
 
 Reconciled against the ZLS `0.16.0` capabilities and typed
-request/notification handlers, and against `lsp_zitron`'s advertised
+request/notification handlers, and against `zitron-ls`'s advertised
 capabilities and forwarding middleware, on 2026-07-20.  `build.zig.zon`
 pins ZLS `0.16.0`; this list does not describe later ZLS `master`
 behavior.
@@ -12,7 +12,7 @@ Legend:
 - ✅ exposed to `.zy` clients
 - 🧭 translated or otherwise adapted between generated Zig and Zitron
   source
-- ❌ offered by ZLS but deliberately not exposed by `lsp_zitron`
+- ❌ offered by ZLS but deliberately not exposed by `zitron-ls`
 - ⚪ implemented in ZLS but not advertised by ZLS
 - `forwarded` below means routed through the in-process ZLS library,
   not a ZLS subprocess or a transparent JSON proxy
@@ -32,7 +32,7 @@ Legend:
 - [✅ 🧭] Type definition
 - [⚪] Implementation
   - ZLS has a handler, implemented with the same behavior as definition,
-    but advertises `implementationProvider: false`.  `lsp_zitron` does
+    but advertises `implementationProvider: false`.  `zitron-ls` does
     not expose it.
 - [✅ 🧭] References
   - Ordinary generated-Zig references are translated back to `.zy`.
@@ -71,7 +71,7 @@ Legend:
 - [✅ 🧭] Full semantic tokens
   - ZLS tokens are filtered to mappable generated spans, translated
     to `.zy`, reordered into source order, and published with an
-    `lsp_zitron` result ID.
+    `zitron-ls` result ID.
 - [✅ 🧭] Ranged semantic tokens
   - Client range requests are served by slicing the current translated
     source-side token collection.  On document changes, the middleware
@@ -86,13 +86,13 @@ Legend:
     the dirty `.zy` region or leak generated-only tokens into the source
     result.
 - [✅ 🧭] Full semantic-token delta
-  - This is supplied by `lsp_zitron`, not ZLS `0.16.0`.  ZLS exposes
-    full and range requests but no delta handler.  `lsp_zitron` retains
+  - This is supplied by `zitron-ls`, not ZLS `0.16.0`.  ZLS exposes
+    full and range requests but no delta handler.  `zitron-ls` retains
     translated source-side snapshots and computes deltas between them;
     an unknown previous result ID correctly falls back to a full
     response.
 - [✅] `workspace/semanticTokens/refresh`
-  - `lsp_zitron` emits the refresh request itself after source changes
+  - `zitron-ls` emits the refresh request itself after source changes
     when the client advertises support.  It also forwards ZLS refreshes
     emitted after a successful `build.zig` configuration reload.
 
@@ -120,7 +120,7 @@ Legend:
 - [✅ 🧭] Close document
 - [❌] Save notification
 - [❌] Will-save-wait-until edits
-  - ZLS uses this for its autofix-on-save mode.  `lsp_zitron` neither
+  - ZLS uses this for its autofix-on-save mode.  `zitron-ls` neither
     advertises save synchronization nor forwards save lifecycle events.
 
 
@@ -135,7 +135,7 @@ Legend:
 - [ ] Workspace configuration
 - [✅] Watched `build.zig` files
   - When the client supports watched-file dynamic registration,
-    `lsp_zitron` registers `**/build.zig` for change events only.  Matching
+    `zitron-ls` registers `**/build.zig` for change events only.  Matching
     filesystem notifications call the in-process ZLS document store's
     build-file invalidator directly.  ZLS's language-server watched-file
     handler requires files to be present in its document cache, while a
@@ -144,7 +144,7 @@ Legend:
     URIs.  Using the library API covers both cases.  Create/delete events,
     other Zig files, and editor change notifications are not forwarded.
 - [🧭] Dynamic registration for configuration and watched files
-  - `lsp_zitron` dynamically registers the narrow `build.zig` watcher it
+  - `zitron-ls` dynamically registers the narrow `build.zig` watcher it
     needs.  ZLS configuration registration and its broader Zig/ZON watcher
     are intentionally not exposed.
 - [ ] `workspace/applyEdit` requests
@@ -165,7 +165,7 @@ Legend:
 - [✅] In-process initialize/initialized lifecycle
   - The adapter initializes ZLS once as an internal UTF-8 client.
     The external client negotiates its own position encoding with
-    `lsp_zitron`; source/generated translation bridges that boundary.
+    `zitron-ls`; source/generated translation bridges that boundary.
 - [✅] Completion trigger discovery
   - The adapter retains ZLS's advertised trigger characters for the
     combined external capability.

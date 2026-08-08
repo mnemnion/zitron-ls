@@ -1,4 +1,4 @@
-//! Main executable of lsp_zitron.
+//! Main executable of zitron-ls.
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -64,10 +64,10 @@ const SpinMutex = struct {
 };
 
 const usage =
-    \\lsp_zitron
+    \\zitron-ls
     \\
     \\Options:
-    \\  --log-file [path]       Set path to the lsp_zitron log file
+    \\  --log-file [path]       Set path to the zitron-ls log file
     \\  --log-level [level]     err, warn, info, or debug
     \\  --enable-stderr-logs    Also write logs to stderr
     \\  -h, --help              Print this help and exit
@@ -179,4 +179,4 @@ const Error =
 const expectEqualStrings = std.testing.expectEqualStrings;
 const testing_allocator = std.testing.allocator;
 const lsp = @import("lsp");
-const zitron = @import("lsp_zitron");
+const zitron = @import("zitron-ls");

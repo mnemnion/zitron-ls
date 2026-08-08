@@ -1,5 +1,5 @@
 #!/Users/atman/Dropbox/deck/m/skills/.venv/bin/python
-"""Summarize elapsed_ns timings from lsp_zitron runtime logs."""
+"""Summarize elapsed_ns timings from zitron-ls runtime logs."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-DEFAULT_LOG = Path.home() / "Library/Caches/lsp_zitron/lsp_zitron.log"
+DEFAULT_LOG = Path.home() / "Library/Caches/zitron-ls/zitron-ls.log"
 
 
 def main() -> int:
@@ -45,7 +45,7 @@ def latest_real_session_range(lines: list[str], include_replay_sessions: bool) -
     if include_replay_sessions:
         return ranges[-1]
     for start, end in reversed(ranges):
-        if not any("lsp_zitron_replay_client" in line for line in lines[start:end]):
+        if not any("zitron-ls-replay-client" in line for line in lines[start:end]):
             return start, end
     return ranges[-1]
 

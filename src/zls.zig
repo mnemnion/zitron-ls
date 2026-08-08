@@ -214,7 +214,7 @@ pub fn discardCapturedMessages(adapter: *Adapter) void {
 
 fn initializeParams() types.InitializeParams {
     return .{
-        .clientInfo = .{ .name = "lsp_zitron" },
+        .clientInfo = .{ .name = "zitron-ls" },
         .capabilities = .{
             .general = .{
                 .positionEncodings = &position_encodings,
@@ -361,7 +361,7 @@ test "adapter initializes, syncs, requests, and closes a document" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const uri = "untitled:///lsp-zitron-adapter.zig";
+    const uri = "untitled:///zitron-ls-adapter.zig";
     try adapter.openDocument(arena, uri, 1,
         \\const Token = enum { number };
         \\

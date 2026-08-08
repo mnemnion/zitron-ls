@@ -2,7 +2,7 @@
 
 ## Context
 
-`lsp_zitron` crashed while handling rapid edits in a large `.zy` file. The fresh
+`zitron-ls` crashed while handling rapid edits in a large `.zy` file. The fresh
 macOS crash report showed the ZLS reader thread translating diagnostics through
 `SpanTranslator.generatedPositionToSource` while the main LSP thread was syncing
 the same document through `middlewareSyncDocument`.
@@ -76,7 +76,7 @@ fields while translating.
 ## `version = null` Policy
 
 ZLS diagnostics without a version are non-authoritative. That should not happen
-for the behavior `lsp_zitron` wants to rely on, but the server must handle it
+for the behavior `zitron-ls` wants to rely on, but the server must handle it
 defensively.
 
 Initial compatibility rule:

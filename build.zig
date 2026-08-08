@@ -1,4 +1,4 @@
-//! Build script for lsp_zitron.
+//! Build script for zitron-ls.
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
     });
 
-    const lsp_zitron_mod = b.addModule("lsp_zitron", .{
+    const lsp_zitron_mod = b.addModule("zitron-ls", .{
         .root_source_file = b.path("src/lsp_zitron.zig"),
         .target = target,
         .optimize = optimize,
@@ -65,10 +65,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.addImport("lsp", lsp_module);
-    exe_mod.addImport("lsp_zitron", lsp_zitron_mod);
+    exe_mod.addImport("zitron-ls", lsp_zitron_mod);
 
     const exe = b.addExecutable(.{
-        .name = "lsp_zitron",
+        .name = "zitron-ls",
         .root_module = exe_mod,
     });
 
@@ -80,10 +80,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_client_mod.addImport("lsp", lsp_module);
-    test_client_mod.addImport("lsp_zitron", lsp_zitron_mod);
+    test_client_mod.addImport("zitron-ls", lsp_zitron_mod);
 
     const test_client = b.addExecutable(.{
-        .name = "lsp_zitron_test_client",
+        .name = "zitron-ls-test-client",
         .root_module = test_client_mod,
     });
 
@@ -97,7 +97,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_lsp_zitron = b.step("run", "run the lsp_zitron binary");
+    const run_lsp_zitron = b.step("run", "run the zitron-ls binary");
     run_lsp_zitron.dependOn(&run_cmd.step);
 
     const run_client_cmd = b.addRunArtifact(test_client);
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
         run_client_cmd.addArgs(args);
     }
 
-    const run_test_client = b.step("run-client", "run the lsp_zitron test client");
+    const run_test_client = b.step("run-client", "run the zitron-ls test client");
     run_test_client.dependOn(&run_client_cmd.step);
 
     const smoke_step = b.step("smoke", "run the end-to-end stdio smoke test");
@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
     });
     replay_client_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| replay_client_cmd.addArgs(args);
-    const replay_client_step = b.step("replay-client", "replay extracted client actions against lsp_zitron");
+    const replay_client_step = b.step("replay-client", "replay extracted client actions against zitron-ls");
     replay_client_step.dependOn(&replay_client_cmd.step);
 
     const timing_report_cmd = b.addSystemCommand(&.{
