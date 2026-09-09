@@ -43,6 +43,9 @@ pub fn applyContentChangesWithEdits(
 
     var input_edits: ArrayList(ts.InputEdit) = .empty;
     errdefer input_edits.deinit(allocator);
+    if (last_full_text_index != null) {
+        try input_edits.append(allocator, inputEditForPartialChange(text, last_full_text, 0, text.len));
+    }
 
     const changes = content_changes[if (last_full_text_index) |index| index + 1 else 0..];
     for (changes) |item| {
@@ -122,6 +125,15 @@ test "apply content changes handles whole document replacement" {
     defer applied_change.deinit(testing.allocator);
 
     try expectEqualStrings("new", applied_change.text.?);
+    try expectEqual(@as(usize, 1), applied_change.input_edits.items.len);
+    try expectEqualDeep(ts.InputEdit{
+        .start_byte = 0,
+        .old_end_byte = 3,
+        .new_end_byte = 3,
+        .start_point = .{ .row = 0, .column = 0 },
+        .old_end_point = .{ .row = 0, .column = 3 },
+        .new_end_point = .{ .row = 0, .column = 3 },
+    }, applied_change.input_edits.items[0]);
 }
 
 test "apply content changes handles ordered partial edits" {
@@ -336,8 +348,17 @@ test "apply content changes with edits handles last full text and trailing parti
     }, .@"utf-8");
     defer applied_change.deinit(testing.allocator);
 
-    try expectEqual(@as(usize, 1), applied_change.input_edits.items.len);
+    try expectEqual(@as(usize, 2), applied_change.input_edits.items.len);
     try expectEqualStrings("calc ::= term", applied_change.text.?);
+    try expectEqualDeep(ts.InputEdit{
+        .start_byte = 0,
+        .old_end_byte = 7,
+        .new_end_byte = 13,
+        .start_point = .{ .row = 0, .column = 0 },
+        .old_end_point = .{ .row = 0, .column = 7 },
+        .new_end_point = .{ .row = 0, .column = 13 },
+    }, applied_change.input_edits.items[0]);
+    try expectEqual(@as(u32, 9), applied_change.input_edits.items[1].start_byte);
 }
 
 const std = @import("std");

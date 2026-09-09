@@ -42,6 +42,14 @@ pub fn build(b: *std.Build) void {
     });
     tree_sitter_mod.linkLibrary(tree_sitter_dep.artifact("tree-sitter"));
 
+    const format_mod = b.addModule("zitron-format", .{
+        .root_source_file = b.path("src/format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    format_mod.addImport("tree-sitter", tree_sitter_mod);
+    lsp_zitron_mod.addImport("zitron-format", format_mod);
+
     lsp_zitron_mod.addImport("lsp", lsp_module);
     lsp_zitron_mod.addImport("zls", zls_module);
     lsp_zitron_mod.addOptions("build_options", options);
@@ -173,6 +181,21 @@ pub fn build(b: *std.Build) void {
     const run_client_unit_tests = b.addRunArtifact(client_unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
+
+    const format_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/format_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    format_tests_mod.addImport("zitron-format", format_mod);
+    format_tests_mod.addImport("tree-sitter", tree_sitter_mod);
+    format_tests_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
+    format_tests_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
+    const format_tests = b.addTest(.{ .root_module = format_tests_mod, .filters = test_filters });
+    const run_format_tests = b.addRunArtifact(format_tests);
+    const format_test_step = b.step("test-format", "Run standalone formatter tests");
+    format_test_step.dependOn(&run_format_tests.step);
+    test_step.dependOn(&run_format_tests.step);
 
     test_step.dependOn(&run_module_unit_tests.step);
 

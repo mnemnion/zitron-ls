@@ -63,6 +63,7 @@ fn serverCapabilities(
         .documentHighlightProvider = .{ .bool = true },
         .documentSymbolProvider = .{ .bool = true },
         .renameProvider = .{ .bool = true },
+        .documentFormattingProvider = .{ .bool = true },
         .inlayHintProvider = .{ .inlay_hint_options = .{} },
         .semanticTokensProvider = .{ .semantic_tokens_options = .{
             .legend = .{
@@ -396,6 +397,31 @@ pub const Server = struct {
     //|
     //| `lsp-kit` passes in a per-message arena on requests.  Sometimes we use it,
     //| sometimes we don't.
+
+    /// Format the live source and return one complete-document replacement.
+    pub fn @"textDocument/formatting"(
+        server: *Server,
+        arena: std.mem.Allocator,
+        params: types.DocumentFormattingParams,
+    ) Error!lsp.ResultType("textDocument/formatting") {
+        const document = server.getDocument(params.textDocument.uri) orelse return null;
+        const io = server.io orelse return null;
+        const start = server.logStart();
+        const formatted = try formatter.format(io, arena, document.source, document.tree.rootNode(), .{});
+        if (std.mem.eql(u8, formatted, document.source)) return &.{};
+        const edits = try arena.alloc(types.TextEdit, 1);
+        edits[0] = .{
+            .range = .{
+                .start = .{ .line = 0, .character = 0 },
+                .end = lsp.offsets.indexToPosition(document.source, document.source.len, server.offset_encoding),
+            },
+            .newText = formatted,
+        };
+        log.debug("LSP -> textDocument/formatting source_bytes={} formatted_bytes={} elapsed_ns={}", .{
+            document.source.len, formatted.len, server.logElapsedNs(start),
+        });
+        return edits;
+    }
 
     /// LSP `textDocument/didOpen` handler that stores the full document text.
     pub fn @"textDocument/didOpen"(
@@ -3052,6 +3078,36 @@ test "initialize negotiates position encoding" {
     try expectEqual(types.PositionEncodingKind.@"utf-8", result.capabilities.positionEncoding.?);
 }
 
+test "formatting returns a whole document replacement in each position encoding" {
+    const source = "foo::= \"😀\" . // café";
+    const uri = "file:///formatting.zy";
+    inline for (.{ lsp.offsets.Encoding.@"utf-8", lsp.offsets.Encoding.@"utf-16", lsp.offsets.Encoding.@"utf-32" }) |encoding| {
+        var server = try Server.init(testing_allocator);
+        defer server.deinit();
+        server.io = std.testing.io;
+        server.offset_encoding = encoding;
+        try server.putDocument(uri, 1, source);
+        var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const params = types.DocumentFormattingParams{
+            .textDocument = .{ .uri = uri },
+            .options = .{ .tabSize = 4, .insertSpaces = true },
+        };
+        const edits = (try server.@"textDocument/formatting"(arena, params)).?;
+        try expectEqual(@as(usize, 1), edits.len);
+        try expectEqualStrings(source, lsp.offsets.rangeToSlice(source, edits[0].range, encoding));
+        try expectEqualStrings(source, server.getDocument(uri).?.source);
+        try expectEqualStrings("foo ::= \"😀\".   // café", edits[0].newText);
+        try server.getDocument(uri).?.updateIncremental(testing_allocator, 2, &.{
+            .{ .text_document_content_change_whole_document = .{ .text = edits[0].newText } },
+        }, encoding);
+        try expectEqual(edits[0].newText.len, server.getDocument(uri).?.tree.rootNode().endByte());
+        const unchanged = (try server.@"textDocument/formatting"(arena, params)).?;
+        try expectEqual(@as(usize, 0), unchanged.len);
+    }
+}
+
 fn expectRenameEdits(
     source: []const u8,
     workspace_edit: types.WorkspaceEdit,
@@ -3139,6 +3195,7 @@ const Document = @import("Document.zig");
 const ZigMiddleware = @import("ZigMiddleware.zig");
 const ZlsAdapter = @import("zls.zig");
 const completion = @import("completion.zig");
+const formatter = @import("zitron-format");
 const lsp = @import("lsp");
 const types = lsp.types.flat;
 const build_options = @import("build_options");

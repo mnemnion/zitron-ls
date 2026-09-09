@@ -534,6 +534,8 @@ pub fn main(init: std.process.Init) Error!void {
         return error_set.MissingBuildFileWatcherRegistration;
     }
 
+    try formattingRoundTrip(init.io, allocator, &transport.transport, fixture_uri, fixture_text);
+
     try transport.transport.writeNotification(
         init.io,
         allocator,
@@ -606,6 +608,7 @@ fn expectInitializeResponse(
     defer result.deinit();
 
     try expectEqual(lsp.types.flat.PositionEncodingKind.@"utf-8", result.value.capabilities.positionEncoding.?);
+    try expectEqual(true, result.value.capabilities.documentFormattingProvider.?.bool);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
@@ -840,6 +843,48 @@ fn expectSuccessfulResponse(
             }
         },
         else => return error_set.UnexpectedResponse,
+    }
+}
+
+fn formattingRoundTrip(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    uri: []const u8,
+    source: []const u8,
+) Error!void {
+    var current = try allocator.dupe(u8, source);
+    defer allocator.free(current);
+    for (0..2) |pass| {
+        try transport.writeNotification(io, allocator, "textDocument/didChange", lsp.ParamsType("textDocument/didChange"), .{
+            .textDocument = .{ .uri = uri, .version = @intCast(100 + pass) },
+            .contentChanges = &.{.{ .text_document_content_change_whole_document = .{ .text = current } }},
+        }, .{ .emit_null_optional_fields = false });
+        const id: i64 = @intCast(24 + pass);
+        try transport.writeRequest(io, allocator, .{ .number = id }, "textDocument/formatting", lsp.ParamsType("textDocument/formatting"), .{
+            .textDocument = .{ .uri = uri },
+            .options = .{ .tabSize = 4, .insertSpaces = true },
+        }, .{ .emit_null_optional_fields = false });
+        const message = try readResponseJsonMessage(io, allocator, transport, id);
+        defer allocator.free(message);
+        const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, message, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const value = switch (parsed.value) {
+            .response => |response| switch (response.result_or_error) {
+                .result => |result| result orelse return error_set.MissingResult,
+                .@"error" => return error_set.UnexpectedResponse,
+            },
+            else => return error_set.UnexpectedResponse,
+        };
+        const edits = try std.json.parseFromValue([]lsp.types.flat.TextEdit, allocator, value, .{ .ignore_unknown_fields = true });
+        defer edits.deinit();
+        if (pass == 0) {
+            try expectEqual(@as(usize, 1), edits.value.len);
+            try std.testing.expectEqualStrings(current, lsp.offsets.rangeToSlice(current, edits.value[0].range, .@"utf-8"));
+            const replacement = try allocator.dupe(u8, edits.value[0].newText);
+            allocator.free(current);
+            current = replacement;
+        } else try expectEqual(@as(usize, 0), edits.value.len);
     }
 }
 
