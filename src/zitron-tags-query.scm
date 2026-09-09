@@ -48,5 +48,8 @@
 (directive
   (multiterminal (terminal) @name)) @reference.enum
 
+(precedence_mark
+  (terminal) @name) @reference.enum
+
 (directive
   action_impl: (named_action (action_name) @name)) @reference.implementation

@@ -363,7 +363,11 @@ test "adapter initializes, syncs, requests, and closes a document" {
 
     const uri = "untitled:///zitron-ls-adapter.zig";
     try adapter.openDocument(arena, uri, 1,
-        \\const Token = enum { number };
+        \\const Token = enum { number, @"{" };
+        \\
+        \\fn brace() Token {
+        \\    return .@"{";
+        \\}
         \\
         \\fn reduce(yymsp: []Token) Token {
         \\    // #line 12 sample.zy
@@ -381,6 +385,26 @@ test "adapter initializes, syncs, requests, and closes a document" {
         .position = .{ .line = 0, .character = 6 },
     });
     try std.testing.expect(hover != null);
+    const quoted_hover = (try adapter.request(arena, "textDocument/hover", .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = 0, .character = 30 },
+    })) orelse return error.UnexpectedResponse;
+    switch (quoted_hover.contents) {
+        .markup_content => |content| try std.testing.expect(std.mem.indexOf(u8, content.value, "```zig\n@\"{\"\n```") != null),
+        else => return error.UnexpectedResponse,
+    }
+    const quoted_references = (try adapter.request(arena, "textDocument/references", .{
+        .textDocument = .{ .uri = uri },
+        .position = .{ .line = 0, .character = 30 },
+        .context = .{ .includeDeclaration = false },
+        .workDoneToken = null,
+        .partialResultToken = null,
+    })) orelse return error.UnexpectedResponse;
+    var found_quoted_use = false;
+    for (quoted_references) |reference| {
+        if (reference.range.start.line == 3) found_quoted_use = true;
+    }
+    try std.testing.expect(found_quoted_use);
 
     try adapter.replaceDocument(arena, uri, 2,
         \\const Token = enum { number };

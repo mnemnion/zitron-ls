@@ -780,7 +780,7 @@ fn filterTextForParticle(particle: Particle, prefix: []const u8) ?[]const u8 {
     if (std.mem.startsWith(u8, particle.label, prefix)) return particle.label;
     if (particle.kind != .multiterminal) return null;
 
-    var it = std.mem.tokenizeAny(u8, particle.label, "|/");
+    var it = std.mem.tokenizeScalar(u8, particle.label, '|');
     while (it.next()) |terminal| {
         if (std.mem.startsWith(u8, terminal, prefix)) return terminal;
     }
@@ -935,6 +935,17 @@ fn parseTestSource(source: []const u8) !ParsedTestSource {
 
     try parser.setLanguage(ts.Language.fromRaw(zitron_grammar.language()));
     return .{ .tree = parser.parseString(source, null) orelse return error.ParseFailed };
+}
+
+test "multiterminal filtering recognizes only pipe-separated members" {
+    try expectEqualStrings(
+        "BAR",
+        filterTextForParticle(.{ .label = "FOO|BAR", .kind = .multiterminal }, "BA").?,
+    );
+    try expect(filterTextForParticle(
+        .{ .label = "FOO/BAR", .kind = .multiterminal },
+        "BA",
+    ) == null);
 }
 
 test "directive completions match %t at the start of a directive line" {

@@ -1717,7 +1717,7 @@ test "embedded tags query compiles for the zitron grammar" {
     const query = try ts.Query.create(zitronLanguage(), tags_query_source, &error_offset);
     defer query.destroy();
 
-    try expectEqual(@as(u32, 15), query.patternCount());
+    try expectEqual(@as(u32, 16), query.patternCount());
     try expect(query.captureCount() >= 3);
 }
 
@@ -2105,6 +2105,70 @@ test "query resolution finds directive grammar symbols" {
         },
         else => return error.UnexpectedResolution,
     }
+}
+
+test "string terminals participate in grammar symbol operations" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+
+    const uri = "file:///samples/string_terminals.zy";
+    const sample =
+        \\%token_type Token
+        \\%token "{" "}".
+        \\start ::= "{" "}". ["{"]
+    ;
+    try server.putDocument(uri, 1, sample);
+    const doc = server.getDocument(uri).?;
+    try expect(!doc.parsed.has_error);
+
+    const rule_start = try byteIndexOf(sample, "start ::=");
+    const rule_terminal = try positionOfTextAfter(sample, rule_start, "\"{\"");
+    switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, rule_terminal)) {
+        .symbol => |symbol| {
+            try expectEqual(Document.SemanticKind.terminal_reference, symbol.kind);
+            try expectEqualStrings("\"{\"", symbol.symbol_name);
+        },
+        else => return error.UnexpectedResolution,
+    }
+
+    try expectHoverContains(
+        &server,
+        arena_state.allocator(),
+        uri,
+        rule_terminal,
+        "```zitron\n%token_type Token\n```",
+    );
+
+    const references = (try server.@"textDocument/references"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = rule_terminal,
+        .context = .{ .includeDeclaration = false },
+    })) orelse return error.UnexpectedReferences;
+    try expectEqual(@as(usize, 3), references.len);
+    try expect(Server.hasLocationAt(references, uri, try positionOfTextAfter(sample, try byteIndexOf(sample, "%token"), "\"{\"")));
+    try expect(Server.hasLocationAt(references, uri, rule_terminal));
+    try expect(Server.hasLocationAt(references, uri, try positionOfTextAfter(sample, try byteIndexOf(sample, "[\"{\"]"), "\"{\"")));
+
+    const type_definition = (try server.@"textDocument/typeDefinition"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = rule_terminal,
+    })) orelse return error.UnexpectedDefinitionTarget;
+    switch (type_definition) {
+        .definition => |target| switch (target) {
+            .location => |location| try expectEqual(types.Position{ .line = 0, .character = 12 }, location.range.start),
+            else => return error.UnexpectedDefinitionTarget,
+        },
+        else => return error.UnexpectedDefinitionTarget,
+    }
+
+    const rename = (try server.@"textDocument/rename"(arena_state.allocator(), .{
+        .textDocument = .{ .uri = uri },
+        .position = rule_terminal,
+        .newName = "\"[\"",
+    })) orelse return error.UnexpectedRenameResult;
+    try expectRenameEdits(sample, rename, uri, "\"{\"", "\"[\"", 3);
 }
 
 test "query resolution returns no match on punctuation" {

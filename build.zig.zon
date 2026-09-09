@@ -22,8 +22,7 @@
             .hash = "zls-0.16.0-rmm5fs_JJgBG3dk5HwYK1FylE2_LMN0BYpX57tPzT-Xc",
         },
         .tree_sitter_zitron = .{
-            .url = "https://github.com/mnemnion/tree-sitter-zitron/archive/refs/tags/v0.1.8.tar.gz",
-            .hash = "tree_sitter_zitron-0.1.8-EA3PTIdCAwAQCeApomCzW0oHyIhmm1ZpF-VMm7wGtRoF",
+            .path = "../../g/tree-sitter-zitron",
         },
         .muad_diff = .{
             .url = "https://github.com/mnemnion/muad-diff/archive/refs/tags/v0.1.0.tar.gz",

@@ -13,6 +13,7 @@ pub const ForwardReferencesResult = struct {
 /// A named enum member and its resolved enum type from ZLS hover.
 pub const EnumMemberIdentity = struct {
     enum_name: []const u8,
+    /// Zitron spelling; string terminals retain their quotes but omit Zig's `@`.
     member_name: []const u8,
 };
 
@@ -2609,18 +2610,43 @@ fn nextZigMarkdownBlock(markdown: *[]const u8) ?[]const u8 {
 }
 
 fn enumMemberNameFromDefinition(definition: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, definition, "@\"")) {
+        const name_end = quotedIdentifierEnd(definition) orelse return null;
+        if (!enumMemberDefinitionSuffixValid(definition[name_end..])) return null;
+        return definition[1..name_end];
+    }
+
     var name_end: usize = 0;
     while (name_end < definition.len and
         (std.ascii.isAlphanumeric(definition[name_end]) or definition[name_end] == '_')) : (name_end += 1)
     {}
     if (name_end == 0) return null;
 
-    const remainder = definition[name_end..];
-    if (remainder.len != 0 and
-        !std.mem.eql(u8, remainder, ",") and
-        !std.mem.startsWith(u8, remainder, " = ")) return null;
+    if (!enumMemberDefinitionSuffixValid(definition[name_end..])) return null;
     const name = definition[0..name_end];
     return if (std.zig.isValidId(name)) name else null;
+}
+
+fn quotedIdentifierEnd(definition: []const u8) ?usize {
+    var index: usize = 2;
+    while (index < definition.len) : (index += 1) {
+        switch (definition[index]) {
+            '\\' => {
+                index += 1;
+                if (index == definition.len) return null;
+            },
+            '"' => return index + 1,
+            '\n', '\r' => return null,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn enumMemberDefinitionSuffixValid(suffix: []const u8) bool {
+    return suffix.len == 0 or
+        std.mem.eql(u8, suffix, ",") or
+        std.mem.startsWith(u8, suffix, " = ");
 }
 
 fn referencedTypeLine(markdown: []const u8, enum_name: []const u8, zig_uri: []const u8) ?u32 {
@@ -2668,6 +2694,9 @@ fn tokenEnumMemberPosition(
     enum_name: []const u8,
     terminal_name: []const u8,
 ) ?types.Position {
+    const quoted_terminal = terminal_name.len >= 2 and
+        terminal_name[0] == '"' and
+        terminal_name[terminal_name.len - 1] == '"';
     var in_token_enum = false;
     var line_number: u32 = 0;
     var lines = std.mem.splitScalar(u8, zig_text, '\n');
@@ -2685,8 +2714,13 @@ fn tokenEnumMemberPosition(
         }
 
         if (std.mem.eql(u8, trimmed, "};")) return null;
-        if (!std.mem.startsWith(u8, trimmed, terminal_name)) continue;
-        const suffix = trimmed[terminal_name.len..];
+        var candidate = trimmed;
+        if (quoted_terminal) {
+            if (!std.mem.startsWith(u8, candidate, "@")) continue;
+            candidate = candidate[1..];
+        }
+        if (!std.mem.startsWith(u8, candidate, terminal_name)) continue;
+        const suffix = candidate[terminal_name.len..];
         if (suffix.len == 0 or (suffix[0] != ',' and suffix[0] != ' ' and suffix[0] != '=')) continue;
         return .{
             .line = line_number,
@@ -7479,6 +7513,7 @@ test "finds members in default and custom generated token enums" {
         \\    end_of_input = 0,
         \\    FOO,
         \\    FOOBAR,
+        \\    @"{",
         \\};
         \\pub const MySpecialEnumType = enum(u2) {
         \\    BAR,
@@ -7486,7 +7521,8 @@ test "finds members in default and custom generated token enums" {
     ;
 
     try expectEqual(types.Position{ .line = 5, .character = 4 }, tokenEnumMemberPosition(zig, "TokenKind", "FOO").?);
-    try expectEqual(types.Position{ .line = 9, .character = 4 }, tokenEnumMemberPosition(zig, "MySpecialEnumType", "BAR").?);
+    try expectEqual(types.Position{ .line = 7, .character = 4 }, tokenEnumMemberPosition(zig, "TokenKind", "\"{\"").?);
+    try expectEqual(types.Position{ .line = 10, .character = 4 }, tokenEnumMemberPosition(zig, "MySpecialEnumType", "BAR").?);
     try expectEqual(@as(?types.Position, null), tokenEnumMemberPosition(zig, "TokenKind", "BAR"));
 }
 
@@ -7495,6 +7531,7 @@ test "classifies named enum members from ZLS hover" {
     const zig =
         \\pub const TokenKind = enum(u2) {
         \\    SLASH,
+        \\    @"{",
         \\};
     ;
     const member_hover = types.Hover{
@@ -7522,6 +7559,25 @@ test "classifies named enum members from ZLS hover" {
     try expectEqualStrings("TokenKind", identity.enum_name);
     try expectEqualStrings("SLASH", identity.member_name);
 
+    var quoted_member_hover = member_hover;
+    quoted_member_hover.contents.markup_content.value =
+        \\```zig
+        \\@"{"
+        \\```
+        \\```zig
+        \\(TokenKind)
+        \\```
+        \\
+        \\Go to [TokenKind](file:///generated.zig#L1)
+    ;
+    const quoted_identity = (enumMemberIdentityFromHover(
+        quoted_member_hover,
+        zig_uri,
+        zig,
+    )) orelse return error.UnexpectedHover;
+    try expectEqualStrings("TokenKind", quoted_identity.enum_name);
+    try expectEqualStrings("\"{\"", quoted_identity.member_name);
+
     var variable_hover = member_hover;
     variable_hover.contents.markup_content.value =
         \\```zig
@@ -7538,6 +7594,62 @@ test "classifies named enum members from ZLS hover" {
         zig_uri,
         zig,
     ));
+}
+
+test "string terminal references bridge Zitron and Zig spellings" {
+    const uri = "file:///private/tmp/zitron-ls-string-terminal.zy";
+    const zy =
+        \\%token "{".
+        \\%code {
+        \\fn braceToken() TokenKind {
+        \\    return .@"{";
+        \\}
+        \\}
+        \\start ::= "{".
+    ;
+    const tree = try parseZitronTreeForTest(zy);
+    defer tree.destroy();
+
+    var environ_map = std.process.Environ.Map.init(testing_allocator);
+    defer environ_map.deinit();
+    try environ_map.put("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+
+    var middleware_arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer middleware_arena_state.deinit();
+    var middleware = try initImpl(std.testing.io, middleware_arena_state.allocator(), &environ_map);
+    defer middleware.deinit();
+    try middleware.syncDocument(uri, 1, zy, tree.rootNode());
+    defer middleware.closeDocument(uri);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const enum_references = switch (try middleware.terminalEnumReferences(
+        arena,
+        uri,
+        "TokenKind",
+        "\"{\"",
+        false,
+    )) {
+        .references => |references| references orelse return error.UnexpectedReferences,
+        .unavailable, .enum_member_missing => return error.UnexpectedReferences,
+    };
+    const code_member_index = std.mem.indexOf(u8, zy, "@\"{\"") orelse return error.NeedleNotFound;
+    const code_member_position = lsp.offsets.indexToPosition(zy, code_member_index, .@"utf-8");
+    try expectEqual(@as(usize, 1), enum_references.len);
+    try expectEqualStrings(uri, enum_references[0].uri);
+    try expectEqual(code_member_position, enum_references[0].range.start);
+
+    const forwarded = try middleware.forwardReferences(arena, uri, .{
+        .textDocument = .{ .uri = uri },
+        .position = code_member_position,
+        .context = .{ .includeDeclaration = false },
+        .workDoneToken = null,
+        .partialResultToken = null,
+    });
+    const identity = forwarded.enum_member orelse return error.UnexpectedReferences;
+    try expectEqualStrings("TokenKind", identity.enum_name);
+    try expectEqualStrings("\"{\"", identity.member_name);
 }
 
 test "translates completion edits back to zy ranges" {
