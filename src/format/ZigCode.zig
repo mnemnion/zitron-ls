@@ -104,9 +104,9 @@ fn formatCode(allocator: Allocator, io: std.Io, executable: ?[]const u8, job: Jo
             continue;
         }
         var special_end: usize = offset;
-        if (std.mem.startsWith(u8, source[offset..], "$$")) {
+        if (job.context == .statements and std.mem.startsWith(u8, source[offset..], "$$")) {
             special_end = offset + 2;
-        } else if (source[offset] == '@') {
+        } else if (job.context == .statements and source[offset] == '@') {
             var name_end = offset + 1;
             while (name_end < source.len and identifierByte(source[name_end])) : (name_end += 1) {}
             if (aliases.contains(source[offset + 1 .. name_end])) special_end = name_end;
@@ -165,21 +165,20 @@ fn formatCode(allocator: Allocator, io: std.Io, executable: ?[]const u8, job: Jo
                 continue;
             }
         }
-        const unindented = if (job.context == .statements and std.mem.startsWith(u8, line, "    ")) line[4..] else line;
         var i: usize = 0;
-        while (i < unindented.len) {
-            const end = opaqueEnd(unindented, i);
+        while (i < line.len) {
+            const end = opaqueEnd(line, i);
             if (end != i) {
-                try restored.appendSlice(allocator, unindented[i..end]);
+                try restored.appendSlice(allocator, line[i..end]);
                 i = end;
-            } else if (identifierByte(unindented[i])) {
+            } else if (identifierByte(line[i])) {
                 const begin = i;
-                while (i < unindented.len and identifierByte(unindented[i])) : (i += 1) {}
-                const token = unindented[begin..i];
+                while (i < line.len and identifierByte(line[i])) : (i += 1) {}
+                const token = line[begin..i];
                 const spelling = reverse.get(token) orelse token;
                 try restored.appendSlice(allocator, spelling);
             } else {
-                try restored.append(allocator, unindented[i]);
+                try restored.append(allocator, line[i]);
                 i += 1;
             }
         }

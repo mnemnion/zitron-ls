@@ -1138,7 +1138,6 @@ fn emitBlock(allocator: Allocator, output: *std.ArrayList(u8), body: []const u8,
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len != 0) {
-            if (!std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "%")) try spaces(allocator, output, 4);
             try output.appendSlice(allocator, line);
         }
         try output.appendSlice(allocator, newline);

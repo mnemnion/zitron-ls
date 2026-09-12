@@ -66,7 +66,7 @@ test "format standalone comments restart ditto spelling as specified" {
 
 test "format Zig code line and declaration block" {
     try golden("foo(A) ::= B(B). {A=B+1;}\n", "foo(A) ::= B(B).   { A = B + 1; }\n");
-    try golden("%include {const x=1;}\n", "%include {\n    const x = 1;\n}\n");
+    try golden("%include {const x=1;}\n", "%include {\nconst x = 1;\n}\n");
 }
 
 test "format code lines retain multiple statements after Zig formatting" {
@@ -74,6 +74,27 @@ test "format code lines retain multiple statements after Zig formatting" {
     try golden("foo ::= A. {if(x){y=1;z=2;}}\n", "foo ::= A.   { if (x) { y = 1; z = 2; } }\n");
     try golden("foo ::= A. {const s=\"a  b\\n//\";_=s;}\n", "foo ::= A.   { const s = \"a  b\\n//\"; _ = s; }\n");
     try golden("%token_destructor { release($$); count+=1; }\n", "%token_destructor { release($$); count += 1; }\n");
+}
+
+test "format declaration blocks retain container scope and preprocessor directives" {
+    inline for (.{ "%include", "%code" }) |directive| {
+        try golden(
+            directive ++ " {\n%ifdef FOO\npub fn answer() u32 {return 42;}\n%endif\n}\n",
+            directive ++ " {\n%ifdef FOO\npub fn answer() u32 {\n    return 42;\n}\n%endif\n}\n",
+        );
+        try golden(directive ++ " {const x=$$;}\n", directive ++ " {const x=$$;}\n");
+    }
+}
+
+test "format statement blocks retain wrapper indentation" {
+    try golden(
+        "%token_destructor {\n%ifdef FOO\nif(ok){release($$);}\n%endif\n}\n",
+        "%token_destructor {\n%ifdef FOO\n    if (ok) {\n        release($$);\n    }\n%endif\n}\n",
+    );
+    try golden(
+        "%token_destructor {\n// zig fmt: off\n  release($$);\n// zig fmt: on\n}\n",
+        "%token_destructor {\n    // zig fmt: off\n  release($$);\n// zig fmt: on\n}\n",
+    );
 }
 
 test "format property code lines stay aligned while existing blocks stay blocks" {
@@ -222,7 +243,7 @@ test "format layout comments never cause pattern wrapping" {
 }
 
 test "format layout literal indentation respects zig fmt off" {
-    try golden("%include {\n// zig fmt: off\nconst x=  1;\n// zig fmt: on\n}\n", "%include {\n    // zig fmt: off\n    const x=  1;\n    // zig fmt: on\n}\n");
+    try golden("%include {\n// zig fmt: off\nconst x=  1;\n// zig fmt: on\n}\n", "%include {\n// zig fmt: off\nconst x=  1;\n// zig fmt: on\n}\n");
 }
 
 test "format layout comment slugs and parameters" {
