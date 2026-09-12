@@ -1,0 +1,5 @@
+case,mode,input_bytes,output_bytes,median_us,p90_us,min_us,allocs,resize_attempts,remap_attempts,granted_bytes,peak_live_bytes,output_hash
+edn,direct_smp,12242,12291,537.917,606.584,468.459,4,44,1,235468,235468,c6c8752315b848d6
+edn,warm_caller_arena,12242,12291,506.542,551.000,437.916,2,246,1,143363,143363,c6c8752315b848d6
+edn_formatted,direct_smp,12291,12291,533.916,601.250,463.042,4,46,1,235735,235735,c6c8752315b848d6
+edn_formatted,warm_caller_arena,12291,12291,562.584,1178.334,463.083,2,241,1,142260,142260,c6c8752315b848d6

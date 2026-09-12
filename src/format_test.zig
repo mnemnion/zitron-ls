@@ -1,5 +1,9 @@
 //! Contract tests for the reusable formatter, without an LSP server.
 
+comptime {
+    std.testing.refAllDecls(formatter);
+}
+
 fn formatted(source: []const u8, options: formatter.Options) ![]u8 {
     const parser = ts.Parser.create();
     defer parser.destroy();
@@ -521,6 +525,45 @@ test "format bumping requires adjacent runs with inline tails" {
         "rvalue(A) ::= PLACENAME(C). @color(A;C)\n\nprint ::= PRINT.\nprlist ::= pritem.\nprlist ::= prlist prsep pritem.\npritem ::= FILL(X). @fill( ; X)\npritem ::= THICKNESS(X). @thickness( ; X)\n",
         "rvalue(A) ::= PLACENAME(C).   @color(A;C)\n\nprint ::= PRINT.\nprlist ::= pritem.\nprlist ::= prlist prsep pritem.\npritem ::= FILL(X).        @fill(;X)\npritem ::= THICKNESS(X).   @thickness(;X)\n",
     );
+}
+
+test "format fitting preserves exhaustive choices in varied runs" {
+    var random_state = std.Random.DefaultPrng.init(0x53504c49545f5255);
+    const random = random_state.random();
+    for (0..96) |round| {
+        var source: std.ArrayList(u8) = .empty;
+        defer source.deinit(allocator);
+        const rules = 4 + round % 13;
+        for (0..rules) |index| {
+            if (index != 0 and random.uintLessThan(u8, 5) == 0) try source.appendSlice(allocator, "// boundary\n");
+            if (index != 0 and random.uintLessThan(u8, 6) == 0) try source.append(allocator, '\n');
+            try source.appendSlice(allocator, if (index != 0 and random.boolean()) " `` " else "expression ::= ");
+            const count = random.intRangeAtMost(usize, 0, 8);
+            for (0..count) |particle| {
+                if (particle != 0) try source.appendSlice(allocator, if (random.uintLessThan(u8, 5) == 0) "\n " else " ");
+                try source.appendNTimes(allocator, 'A' + @as(u8, @intCast(particle)), random.intRangeAtMost(usize, 1, 42));
+            }
+            try source.appendSlice(allocator, ".");
+            if (random.boolean()) try source.appendSlice(allocator, " [NOT]");
+            switch (random.uintLessThan(u8, 5)) {
+                0 => {},
+                1 => try source.appendSlice(allocator, " // a trailing comment"),
+                else => {
+                    try source.appendSlice(allocator, if (random.boolean()) "\n    @" else " @");
+                    try source.appendNTimes(allocator, 'a', random.intRangeAtMost(usize, 1, 130));
+                    try source.appendSlice(allocator, "()");
+                },
+            }
+            try source.append(allocator, '\n');
+        }
+        const output = try formatted(source.items, .{});
+        defer allocator.free(output);
+        const before = try semanticContent(source.items);
+        defer allocator.free(before);
+        const after = try semanticContent(output);
+        defer allocator.free(after);
+        try std.testing.expectEqualStrings(before, after);
+    }
 }
 
 test "format sample grammars are parseable and idempotent" {

@@ -38,8 +38,8 @@ pub fn main(init: std.process.Init) !void {
     for (kinds) |kind| {
         const sizes: []const usize = switch (kind) {
             .rules, .disabled, .code => &.{ 128, 512, 2048 },
-            .drops => &.{ 16, 32, 64, 128 },
-            .wide_rhs => &.{ 16, 32, 64, 128, 256 },
+            .drops => &.{ 16, 32, 64, 128, 256, 512 },
+            .wide_rhs => &.{ 16, 32, 64, 128, 256, 512, 1024 },
             .macros => &.{ 16, 64, 256 },
         };
         for (sizes) |size| {
