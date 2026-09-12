@@ -17,6 +17,8 @@ pub const Options = struct {
 pub fn format(io: std.Io, allocator: Allocator, source: []const u8, root: Node, options: Options) Error![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
+    const warm = try arena.allocator().alloc(u8, @min(source.len *| 4, 256 * 1024));
+    arena.allocator().free(warm);
     var queue: ZigCode.Queue = undefined;
     queue.init(io, options.zig_executable);
     defer queue.deinit();
@@ -25,8 +27,7 @@ pub fn format(io: std.Io, allocator: Allocator, source: []const u8, root: Node, 
     try queue.finish();
     try document.prepare();
     try document.layout();
-    const rendered = try document.render();
-    return allocator.dupe(u8, rendered);
+    return document.render(allocator);
 }
 
 const Kind = enum { rule, directive, comment, raw };
@@ -98,9 +99,11 @@ const Document = struct {
     items: std.ArrayList(Item) = .empty,
     disabled: std.ArrayList(Disabled) = .empty,
     runs: std.ArrayList(Run) = .empty,
+    crlf: bool = false,
 
     fn collect(document: *Document, root: Node) OOM!void {
         try document.findDisabled();
+        try document.items.ensureTotalCapacity(document.allocator, root.childCount());
         var cursor = root.walk();
         defer cursor.destroy();
         if (!cursor.gotoFirstChild()) return;
@@ -113,12 +116,13 @@ const Document = struct {
             const start = node.startByte();
             const end = node.endByte();
             const gap = document.source[previous_end..start];
+            const gap_lines = std.mem.count(u8, gap, "\n");
             var item = Item{
                 .kind = .raw,
                 .start = start,
                 .end = end,
                 .gap = gap,
-                .blanks = blankCount(gap),
+                .blanks = gap_lines -| 1,
                 .text = document.source[start..end],
             };
             const kind = node.kind();
@@ -127,7 +131,7 @@ const Document = struct {
                     item.kind = .comment;
                     item.text = try normalizeComment(document.allocator, item.text);
                     item.long_comment = hasNewline(item.text);
-                    if (!hasNewline(gap) and document.items.items.len != 0) {
+                    if (gap_lines == 0 and document.items.items.len != 0) {
                         const last = &document.items.items[document.items.items.len - 1];
                         if ((last.kind == .rule or last.kind == .directive) and !item.long_comment) {
                             last.comment = item.text;
@@ -138,17 +142,20 @@ const Document = struct {
                         }
                     }
                 } else if (eql(kind, "grammar_rule") or eql(kind, "ditto_rule")) {
-                    if (firstChild(node, "lhs")) |lhs_node| {
+                    const children = Children.init(node);
+                    if (children.lhs) |lhs_node| {
+                        const left = Children.init(lhs_node);
                         lhs = try normalize(document.allocator, slice(document.source, lhs_node), false);
-                        if (firstChild(lhs_node, "nonterminal")) |name| name_length = width(slice(document.source, name));
-                        lhs_alias = if (firstChild(lhs_node, "rule_alias")) |alias| slice(document.source, alias) else null;
+                        if (left.nonterminal) |name| name_length = width(slice(document.source, name));
+                        lhs_alias = if (left.rule_alias) |alias| slice(document.source, alias) else null;
                     }
-                    if (lhs.len != 0 and !hasSyntaxComment(node)) {
+                    if (lhs.len != 0 and !children.commented) {
                         item.kind = .rule;
-                        item.rule = try document.collectRule(node, lhs, name_length, lhs_alias);
+                        item.rule = try document.collectRule(node, children, lhs, name_length, lhs_alias);
                     }
                 } else if (eql(kind, "directive")) {
-                    if (!hasSyntaxComment(node)) try document.collectDirective(&item, node);
+                    const children = Children.init(node);
+                    if (!children.commented) try document.collectDirective(&item, node, children);
                 }
             }
             if (item.kind == .raw) lhs = "";
@@ -158,11 +165,11 @@ const Document = struct {
         }
     }
 
-    fn collectRule(document: *Document, node: Node, lhs: []const u8, name_length: usize, lhs_alias: ?[]const u8) OOM!Rule {
+    fn collectRule(document: *Document, node: Node, children: Children, lhs: []const u8, name_length: usize, lhs_alias: ?[]const u8) OOM!Rule {
         var particles: std.ArrayList(Particle) = .empty;
         var aliases: std.ArrayList([]const u8) = .empty;
         if (lhs_alias) |alias| try aliases.append(document.allocator, alias);
-        if (firstChild(node, "rhs")) |rhs| {
+        if (children.rhs) |rhs| {
             var cursor = rhs.walk();
             defer cursor.destroy();
             var begin: ?usize = null;
@@ -194,10 +201,10 @@ const Document = struct {
             .name_length = name_length,
             .input_ditto = eql(node.kind(), "ditto_rule"),
             .particles = particles.items,
-            .precedence = if (firstChild(node, "precedence_mark")) |mark| try normalize(document.allocator, slice(document.source, mark), false) else "",
+            .precedence = if (children.precedence_mark) |mark| try normalize(document.allocator, slice(document.source, mark), false) else "",
             .aliases = aliases.items,
         };
-        const tail = firstChild(node, "named_action") orelse firstChild(node, "code_block");
+        const tail = children.named_action orelse children.code_block;
         if (tail) |action| {
             const before = document.source[node.startByte()..action.startByte()];
             const trimmed = std.mem.trimEnd(u8, before, " \t\r\n");
@@ -218,17 +225,16 @@ const Document = struct {
         return rule;
     }
 
-    fn collectDirective(document: *Document, item: *Item, node: Node) OOM!void {
+    fn collectDirective(document: *Document, item: *Item, node: Node, children: Children) OOM!void {
         item.kind = .directive;
-        const name_node = directiveName(node) orelse return;
+        const name_node = children.directive_name orelse return;
         const name = slice(document.source, name_node);
-        const block = firstChild(node, "code_block");
+        const block = children.code_block;
         const prefix_end = if (block) |code| code.startByte() else node.endByte();
         const prefix = document.source[node.startByte()..prefix_end];
-        item.text = try normalize(document.allocator, prefix, eql(name, "token_class") and spacedPipes(prefix));
-        if (firstChild(node, "named_action")) |action| {
+        if (children.named_action) |action| {
             item.text = try std.fmt.allocPrint(document.allocator, "%impl {s}", .{try normalizeAction(document.allocator, slice(document.source, action))});
-        }
+        } else item.text = try normalize(document.allocator, prefix, eql(name, "token_class") and spacedPipes(prefix));
         if (block) |code| {
             const code_text = slice(document.source, code);
             item.opening_comment = openingComment(code_text);
@@ -243,7 +249,7 @@ const Document = struct {
             } else {
                 item.block = hasNewline(code_text) or eql(name, "include") or eql(name, "code");
                 var aliases: std.ArrayList([]const u8) = .empty;
-                if (firstChild(node, "named_action")) |action| {
+                if (children.named_action) |action| {
                     var cursor = action.walk();
                     defer cursor.destroy();
                     if (cursor.gotoFirstChild()) while (true) {
@@ -269,6 +275,9 @@ const Document = struct {
         var i: usize = 0;
         while (i < document.source.len) {
             const end = ZigCode.opaqueEnd(document.source, i);
+            if (!document.crlf) {
+                document.crlf = if (end != i) std.mem.indexOf(u8, document.source[i..@min(end + 1, document.source.len)], "\r\n") != null else std.mem.startsWith(u8, document.source[i..], "\r\n");
+            }
             if (end != i) {
                 if (std.mem.startsWith(u8, document.source[i..], "//") or std.mem.startsWith(u8, document.source[i..], "/*")) {
                     if (control(document.source[i..end])) |enabled| {
@@ -322,12 +331,6 @@ const Document = struct {
             }
         }
         try document.dittosAndBoundaries();
-        for (document.items.items) |*item| {
-            if (item.rule) |*rule| {
-                rule.pattern = try document.makePattern(rule.*, null, false);
-                if (rule.tail == .none and item.comment.len != 0) rule.tail = .comment;
-            }
-        }
     }
 
     fn dittosAndBoundaries(document: *Document) OOM!void {
@@ -386,6 +389,8 @@ const Document = struct {
                     r.rhs_column = document.items.items[head.?].rule.?.rhs_column;
                     if (item.blanks == 1 and !saw_comment and !(if (previous) |p| p.block else false)) item.blanks = 0;
                 }
+                r.pattern = try document.makePattern(r.*, null, false);
+                if (r.tail == .none and item.comment.len != 0) r.tail = .comment;
                 item.boundary = if (previous_rule == null) .hard else boundary;
                 item.connected = previous != null and !same and boundary == .soft and !previous.?.block;
                 previous_rule = index;
@@ -440,9 +445,9 @@ const Document = struct {
     fn layout(document: *Document) OOM!void {
         try document.collectRuns();
         while (true) {
-            const before = document.blockCount();
-            for (document.runs.items) |*run| try document.fit(run);
-            if (document.blockCount() == before) break;
+            var new_blocks = false;
+            for (document.runs.items) |*run| new_blocks = try document.fit(run) or new_blocks;
+            if (!new_blocks) break;
             try document.collectRuns();
         }
         var previous: ?usize = null;
@@ -515,14 +520,6 @@ const Document = struct {
         return null;
     }
 
-    fn blockCount(document: Document) usize {
-        var count: usize = 0;
-        for (document.items.items) |item| {
-            if (item.rule) |rule| count += @intFromBool(rule.block);
-        }
-        return count;
-    }
-
     fn collectRuns(document: *Document) OOM!void {
         document.runs.clearRetainingCapacity();
         var start: ?usize = null;
@@ -552,7 +549,8 @@ const Document = struct {
         return .{ .first = first, .end = end, .boundary = document.items.items[first].boundary, .connected = document.items.items[first].connected };
     }
 
-    fn fit(document: *Document, run: *Run) OOM!void {
+    fn fit(document: *Document, run: *Run) OOM!bool {
+        var new_blocks = false;
         document.pullComments(run.*);
         var attempts: usize = 0;
         while (attempts < (run.end - run.first) * 4) : (attempts += 1) {
@@ -584,6 +582,7 @@ const Document = struct {
                 }
             }
             if (best) |choice| {
+                new_blocks = new_blocks or (choice.rule.block and !document.items.items[choice.index].rule.?.block);
                 document.items.items[choice.index].rule = choice.rule;
                 document.pullComments(run.*);
                 if ((choice.rule.newly_dropped or choice.rule.block) and choice.index + 1 < document.items.items.len) {
@@ -601,6 +600,7 @@ const Document = struct {
             }
         }
         run.fitted = document.requiresFitting(run.*);
+        return new_blocks;
     }
 
     fn pullComments(document: *Document, run: Run) void {
@@ -778,32 +778,34 @@ const Document = struct {
         return minimum;
     }
 
-    fn render(document: Document) OOM![]const u8 {
+    fn render(document: Document, allocator: Allocator) OOM![]u8 {
         var output: std.ArrayList(u8) = .empty;
-        const newline: []const u8 = if (std.mem.indexOf(u8, document.source, "\r\n") != null) "\r\n" else "\n";
+        errdefer output.deinit(allocator);
+        try output.ensureTotalCapacity(allocator, document.source.len);
+        const newline: []const u8 = if (document.crlf) "\r\n" else "\n";
         var previous_raw = false;
         for (document.items.items, 0..) |item, index| {
             if (item.kind == .raw or previous_raw) {
-                try output.appendSlice(document.allocator, item.gap);
+                try output.appendSlice(allocator, item.gap);
             } else if (index == 0) {
-                for (0..std.mem.count(u8, item.gap, "\n")) |_| try output.appendSlice(document.allocator, newline);
+                for (0..std.mem.count(u8, item.gap, "\n")) |_| try output.appendSlice(allocator, newline);
             } else {
-                for (0..item.blanks + 1) |_| try output.appendSlice(document.allocator, newline);
+                for (0..item.blanks + 1) |_| try output.appendSlice(allocator, newline);
             }
             if (item.rule) |rule| {
                 for (rule.pattern.lines, 0..) |line, i| {
-                    if (i != 0) try output.appendSlice(document.allocator, newline);
-                    try output.appendSlice(document.allocator, line);
+                    if (i != 0) try output.appendSlice(allocator, newline);
+                    try output.appendSlice(allocator, line);
                 }
                 if (rule.tail == .code_block) {
-                    try output.appendSlice(document.allocator, "  ");
-                    if (rule.code_failed) try output.appendSlice(document.allocator, rule.action) else try emitBlock(document.allocator, &output, rule.action, newline, rule.opening_comment);
+                    try output.appendSlice(allocator, "  ");
+                    if (rule.code_failed) try output.appendSlice(allocator, rule.action) else try emitBlock(allocator, &output, rule.action, newline, rule.opening_comment);
                 } else if (rule.tail == .action or rule.tail == .code_line) {
                     if (rule.dropped) {
-                        try output.appendSlice(document.allocator, newline);
-                        try spaces(document.allocator, &output, rule.drop_column);
-                    } else try spaces(document.allocator, &output, @max(2, rule.tail_column -| rule.pattern.last_width));
-                    try output.appendSlice(document.allocator, rule.action);
+                        try output.appendSlice(allocator, newline);
+                        try spaces(allocator, &output, rule.drop_column);
+                    } else try spaces(allocator, &output, @max(2, rule.tail_column -| rule.pattern.last_width));
+                    try output.appendSlice(allocator, rule.action);
                 }
                 if (item.comment.len != 0) {
                     const action_end = (if (rule.dropped) rule.drop_column else rule.tail_column) + width(rule.action);
@@ -813,59 +815,65 @@ const Document = struct {
                         @max(2, rule.comment_column -| action_end)
                     else
                         2;
-                    try spaces(document.allocator, &output, padding);
-                    try output.appendSlice(document.allocator, item.comment);
+                    try spaces(allocator, &output, padding);
+                    try output.appendSlice(allocator, item.comment);
                 }
             } else if (item.kind == .directive) {
-                try output.appendSlice(document.allocator, item.text);
+                try output.appendSlice(allocator, item.text);
                 if (item.raw_code.len != 0) {
-                    try output.append(document.allocator, ' ');
+                    try output.append(allocator, ' ');
                     if (item.block and item.job != null and item.job.?.result != null) {
-                        try emitBlock(document.allocator, &output, item.raw_code, newline, item.opening_comment);
-                    } else try output.appendSlice(document.allocator, item.raw_code);
+                        try emitBlock(allocator, &output, item.raw_code, newline, item.opening_comment);
+                    } else try output.appendSlice(allocator, item.raw_code);
                 }
                 if (item.comment.len != 0) {
-                    try output.appendSlice(document.allocator, "  ");
-                    try output.appendSlice(document.allocator, item.comment);
+                    try output.appendSlice(allocator, "  ");
+                    try output.appendSlice(allocator, item.comment);
                 }
             } else if (item.kind == .raw) {
-                try output.appendSlice(document.allocator, item.text);
-            } else try appendNewlines(document.allocator, &output, item.text, newline);
+                try output.appendSlice(allocator, item.text);
+            } else try appendNewlines(allocator, &output, item.text, newline);
             previous_raw = item.kind == .raw;
         }
         const end = if (document.items.items.len != 0) document.items.items[document.items.items.len - 1].end else 0;
         const suffix = document.source[end..];
         if (previous_raw or document.protected(end, document.source.len)) {
-            try output.appendSlice(document.allocator, suffix);
+            try output.appendSlice(allocator, suffix);
         } else {
-            for (0..std.mem.count(u8, suffix, "\n")) |_| try output.appendSlice(document.allocator, newline);
+            for (0..std.mem.count(u8, suffix, "\n")) |_| try output.appendSlice(allocator, newline);
         }
-        return output.items;
+        return output.toOwnedSlice(allocator);
     }
 };
 
-fn firstChild(node: Node, kind: []const u8) ?Node {
-    var cursor = node.walk();
-    defer cursor.destroy();
-    if (!cursor.gotoFirstChild()) return null;
-    while (true) {
-        const child = cursor.node();
-        if (eql(child.kind(), kind)) return child;
-        if (!cursor.gotoNextSibling()) return null;
-    }
-}
+const Children = struct {
+    lhs: ?Node = null,
+    rhs: ?Node = null,
+    nonterminal: ?Node = null,
+    rule_alias: ?Node = null,
+    precedence_mark: ?Node = null,
+    named_action: ?Node = null,
+    code_block: ?Node = null,
+    directive_name: ?Node = null,
+    commented: bool = false,
 
-fn directiveName(node: Node) ?Node {
-    var cursor = node.walk();
-    defer cursor.destroy();
-    if (!cursor.gotoFirstChild()) return null;
-    while (true) {
-        const child = cursor.node();
-        const kind = child.kind();
-        if (std.mem.endsWith(u8, kind, "_name")) return child;
-        if (!cursor.gotoNextSibling()) return null;
+    fn init(node: Node) Children {
+        var children: Children = .{};
+        var cursor = node.walk();
+        defer cursor.destroy();
+        if (!cursor.gotoFirstChild()) return children;
+        while (true) {
+            const child = cursor.node();
+            const kind = child.kind();
+            inline for (.{ "lhs", "rhs", "nonterminal", "rule_alias", "precedence_mark", "named_action", "code_block" }) |name| {
+                if (@field(children, name) == null and eql(kind, name)) @field(children, name) = child;
+            }
+            if (children.directive_name == null and std.mem.endsWith(u8, kind, "_name")) children.directive_name = child;
+            children.commented = children.commented or hasSyntaxComment(child);
+            if (!cursor.gotoNextSibling()) return children;
+        }
     }
-}
+};
 
 fn hasSyntaxComment(node: Node) bool {
     if (eql(node.kind(), "code_block")) return false;
@@ -928,10 +936,6 @@ fn hasNewline(text: []const u8) bool {
     return std.mem.indexOfScalar(u8, text, '\n') != null;
 }
 
-fn blankCount(text: []const u8) usize {
-    return std.mem.count(u8, text, "\n") -| 1;
-}
-
 fn width(text: []const u8) usize {
     var count: usize = 0;
     for (text) |byte| {
@@ -975,13 +979,17 @@ fn spacedPipes(text: []const u8) bool {
 
 fn compactCode(allocator: Allocator, text: []const u8) OOM!?[]const u8 {
     if (!hasNewline(text)) return text;
-    var output: std.ArrayList(u8) = .empty;
+    var output = Normalized{ .source = text };
     var i: usize = 0;
     while (i < text.len) {
         const end = ZigCode.opaqueEnd(text, i);
         if (end != i) {
             if (std.mem.startsWith(u8, text[i..], "//") or
-                std.mem.startsWith(u8, text[i..], "\\\\") or hasNewline(text[i..end])) return null;
+                std.mem.startsWith(u8, text[i..], "\\\\") or hasNewline(text[i..end]))
+            {
+                output.output.deinit(allocator);
+                return null;
+            }
             try output.appendSlice(allocator, text[i..end]);
             i = end;
         } else if (text[i] == '\n' or text[i] == '\r') {
@@ -992,11 +1000,46 @@ fn compactCode(allocator: Allocator, text: []const u8) OOM!?[]const u8 {
             i += 1;
         }
     }
-    return output.items;
+    return output.text();
 }
 
+const Normalized = struct {
+    source: []const u8,
+    matched: usize = 0,
+    changed: bool = false,
+    output: std.ArrayList(u8) = .empty,
+
+    fn text(output: Normalized) []const u8 {
+        return if (output.changed) output.output.items else output.source[0..output.matched];
+    }
+
+    fn append(output: *Normalized, allocator: Allocator, byte: u8) OOM!void {
+        try output.appendSlice(allocator, &.{byte});
+    }
+
+    fn appendSlice(output: *Normalized, allocator: Allocator, bytes: []const u8) OOM!void {
+        if (!output.changed) {
+            if (std.mem.startsWith(u8, output.source[output.matched..], bytes)) {
+                output.matched += bytes.len;
+                return;
+            }
+            try output.output.ensureTotalCapacity(allocator, output.source.len);
+            try output.output.appendSlice(allocator, output.source[0..output.matched]);
+            output.changed = true;
+        }
+        try output.output.appendSlice(allocator, bytes);
+    }
+
+    fn pop(output: *Normalized) ?u8 {
+        if (output.changed) return output.output.pop();
+        if (output.matched == 0) return null;
+        output.matched -= 1;
+        return output.source[output.matched];
+    }
+};
+
 fn normalize(allocator: Allocator, text: []const u8, pipe_spaces: bool) OOM![]const u8 {
-    var output: std.ArrayList(u8) = .empty;
+    var output = Normalized{ .source = text };
     var i: usize = 0;
     var previous: u8 = 0;
     while (i < text.len) {
@@ -1017,11 +1060,11 @@ fn normalize(allocator: Allocator, text: []const u8, pipe_spaces: bool) OOM![]co
         const current = text[begin];
         const close_before = current == ')' or current == ']' or current == '(' or current == ',' or current == ';' or current == '.' or (current == '|' and !pipe_spaces);
         const close_after = previous == '%' or previous == '(' or previous == '[' or (previous == '|' and !pipe_spaces);
-        if (output.items.len != 0 and !close_before and !close_after) try output.append(allocator, ' ');
+        if (output.text().len != 0 and !close_before and !close_after) try output.append(allocator, ' ');
         try output.appendSlice(allocator, text[begin..i]);
         previous = text[i - 1];
     }
-    return output.items;
+    return output.text();
 }
 
 fn normalizeAction(allocator: Allocator, text: []const u8) OOM![]const u8 {
@@ -1030,40 +1073,40 @@ fn normalizeAction(allocator: Allocator, text: []const u8) OOM![]const u8 {
     const arguments = text[open + 1 .. close];
     const semicolon = std.mem.indexOfScalar(u8, arguments, ';');
     const lhs = std.mem.trim(u8, arguments[0 .. semicolon orelse arguments.len], " \t\r\n");
-    var rhs: std.ArrayList([]const u8) = .empty;
-    if (semicolon) |semi| {
-        var tokens = std.mem.tokenizeAny(u8, arguments[semi + 1 ..], " ,\t\r\n");
-        while (tokens.next()) |alias| try rhs.append(allocator, alias);
-    }
-    var output: std.ArrayList(u8) = .empty;
+    var tokens = std.mem.tokenizeAny(u8, if (semicolon) |semi| arguments[semi + 1 ..] else "", " ,\t\r\n");
+    const first = tokens.next();
+    const second = tokens.next();
+    var output = Normalized{ .source = text };
     try output.appendSlice(allocator, std.mem.trim(u8, text[0..open], " \t\r\n"));
     try output.append(allocator, '(');
     try output.appendSlice(allocator, lhs);
-    if (rhs.items.len != 0) {
-        if (lhs.len == 0 and rhs.items.len > 1) try output.append(allocator, ' ');
+    if (first) |alias| {
+        if (lhs.len == 0 and second != null) try output.append(allocator, ' ');
         try output.append(allocator, ';');
-        if (rhs.items.len > 1) try output.append(allocator, ' ');
-        for (rhs.items, 0..) |alias, index| {
-            if (index != 0) try output.appendSlice(allocator, ", ");
-            try output.appendSlice(allocator, alias);
+        if (second != null) try output.append(allocator, ' ');
+        try output.appendSlice(allocator, alias);
+        var next = second;
+        while (next) |more| : (next = tokens.next()) {
+            try output.appendSlice(allocator, ", ");
+            try output.appendSlice(allocator, more);
         }
     }
     try output.append(allocator, ')');
-    return output.items;
+    return output.text();
 }
 
 fn normalizeParameter(allocator: Allocator, text: []const u8) OOM![]const u8 {
-    var output: std.ArrayList(u8) = .empty;
+    var output = Normalized{ .source = text };
     var i: usize = 0;
     var pending = false;
     while (i < text.len) {
         if (std.ascii.isWhitespace(text[i])) {
-            pending = output.items.len != 0;
+            pending = output.text().len != 0;
             i += 1;
             continue;
         }
         if (text[i] == ':') {
-            while (output.items.len != 0 and output.items[output.items.len - 1] == ' ') _ = output.pop();
+            while (output.text().len != 0 and output.text()[output.text().len - 1] == ' ') _ = output.pop();
             try output.append(allocator, ':');
             pending = true;
             i += 1;
@@ -1080,11 +1123,11 @@ fn normalizeParameter(allocator: Allocator, text: []const u8) OOM![]const u8 {
             i += 1;
         }
     }
-    return output.items;
+    return output.text();
 }
 
 fn normalizeComment(allocator: Allocator, text: []const u8) OOM![]const u8 {
-    var output: std.ArrayList(u8) = .empty;
+    var output = Normalized{ .source = text };
     var lines = std.mem.splitScalar(u8, text, '\n');
     var first = true;
     const block = std.mem.startsWith(u8, text, "/*");
@@ -1116,7 +1159,7 @@ fn normalizeComment(allocator: Allocator, text: []const u8) OOM![]const u8 {
         } else try output.appendSlice(allocator, line);
         first = false;
     }
-    return output.items;
+    return output.text();
 }
 
 fn openingComment(code: []const u8) bool {

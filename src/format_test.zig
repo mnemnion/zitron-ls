@@ -194,6 +194,27 @@ fn matchesExternal(source: []const u8) !void {
     try std.testing.expectEqualStrings(external, linked);
 }
 
+test "format linked wrapper boundaries ignore lexical braces" {
+    try matchesExternal(
+        "foo(A) ::= B(B). {\nconst s = \"} {\";\nconst c = '}';\nconst @\"}\" = struct { x: u8 = '{' };\nconst text =\n\\\\} { trailing  \n;\n// } {\nif (true) { A = @B; }\n_ = .{s, c, @\"}\", text};\n}\n",
+    );
+    try matchesExternal(
+        "foo ::= B. {\n// zig fmt: off\nif (true) { x=  1; } // }\n// zig fmt: on\n}\n",
+    );
+}
+
+test "format substitutions avoid embedded substring and marker-prefix collisions" {
+    const source = "%include {\n%ifdef FOO\nconst text = \"prefixZITRON_FORMAT_0_012suffix\";\n%endif\n}\nfoo(A) ::= B(B). {\nconst s=\"prefixABsuffix prefixBBsuffix yY AA\";\nA=@B; _=$$; _=s;\n}\n";
+    try matchesExternal(source);
+    const output = try formatted(source, .{});
+    defer allocator.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "prefixZITRON_FORMAT_0_012suffix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "prefixABsuffix prefixBBsuffix yY AA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "A = @B;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "_ = $$;") != null);
+    try stable(output);
+}
+
 test "format controls preserve disabled bytes" {
     const source = "//|zitron fmt: off\n  foo ::=   A .\t\n/******* zitron fmt: on ******/\nbar::= B .\n";
     try golden(source, "//|zitron fmt: off\n  foo ::=   A .\t\n/******* zitron fmt: on ******/\nbar ::= B.\n");
@@ -256,6 +277,7 @@ test "format layout comment slugs and parameters" {
 }
 
 test "format layout preserves malformed declarations and CRLF" {
+    try golden("//comment\r\n", "// comment\r\n");
     const output = try formatted("foo ::= A.\n%type ???\n%name Parser\nbar ::= B .\n", .{});
     defer allocator.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "%type ???") != null);

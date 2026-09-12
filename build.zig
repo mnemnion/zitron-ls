@@ -196,6 +196,32 @@ pub fn build(b: *std.Build) void {
     const format_test_step = b.step("test-format", "Run standalone formatter tests");
     format_test_step.dependOn(&run_format_tests.step);
     test_step.dependOn(&run_format_tests.step);
+    const zig_code_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/format/ZigCode.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = test_filters,
+    });
+    const run_zig_code_tests = b.addRunArtifact(zig_code_tests);
+    format_test_step.dependOn(&run_zig_code_tests.step);
+    test_step.dependOn(&run_zig_code_tests.step);
+
+    const format_bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/format_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    format_bench_mod.addImport("tree-sitter", tree_sitter_mod);
+    format_bench_mod.addImport("tree_sitter_zitron", tree_sitter_zitron_dep.module("tree-sitter-zitron"));
+    format_bench_mod.linkLibrary(tree_sitter_zitron_dep.artifact("tree-sitter-zitron"));
+    const format_bench = b.addExecutable(.{ .name = "zitron-format-bench", .root_module = format_bench_mod });
+    const run_format_bench = b.addRunArtifact(format_bench);
+    run_format_bench.setCwd(b.path("."));
+    if (b.args) |args| run_format_bench.addArgs(args);
+    const format_bench_step = b.step("bench-format", "Benchmark formatter timing and allocation behavior (use -Doptimize=ReleaseFast)");
+    format_bench_step.dependOn(&run_format_bench.step);
 
     test_step.dependOn(&run_module_unit_tests.step);
 

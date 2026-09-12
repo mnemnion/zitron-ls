@@ -1,0 +1,5 @@
+case,mode,input_bytes,output_bytes,median_us,p90_us,min_us,allocs,resize_attempts,remap_attempts,granted_bytes,peak_live_bytes,output_hash
+aliases_sparse,direct_smp,131205,131234,682.958,831.208,622.750,2,0,1,590213,590213,9d9ba6c015a998f1
+aliases_sparse,warm_caller_arena,131205,131234,658.250,693.417,624.583,2,0,1,590213,590213,9d9ba6c015a998f1
+aliases_colliding,direct_smp,133337,133366,760.584,1395.541,654.000,2,0,1,593411,593411,e1516fb776772afe
+aliases_colliding,warm_caller_arena,133337,133366,703.209,729.959,641.458,2,0,1,593411,593411,e1516fb776772afe

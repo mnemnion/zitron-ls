@@ -408,7 +408,11 @@ pub const Server = struct {
         const io = server.io orelse return null;
         const start = server.logStart();
         const formatted = try formatter.format(io, arena, document.source, document.tree.rootNode(), .{});
-        if (std.mem.eql(u8, formatted, document.source)) return &.{};
+        const changed = !std.mem.eql(u8, formatted, document.source);
+        defer log.debug("LSP -> textDocument/formatting source_bytes={} formatted_bytes={} changed={} elapsed_ns={}", .{
+            document.source.len, formatted.len, changed, server.logElapsedNs(start),
+        });
+        if (!changed) return &.{};
         const edits = try arena.alloc(types.TextEdit, 1);
         edits[0] = .{
             .range = .{
@@ -417,9 +421,6 @@ pub const Server = struct {
             },
             .newText = formatted,
         };
-        log.debug("LSP -> textDocument/formatting source_bytes={} formatted_bytes={} elapsed_ns={}", .{
-            document.source.len, formatted.len, server.logElapsedNs(start),
-        });
         return edits;
     }
 

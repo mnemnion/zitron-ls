@@ -1,0 +1,7 @@
+case,mode,input_bytes,output_bytes,median_us,p90_us,min_us,allocs,resize_attempts,remap_attempts,granted_bytes,peak_live_bytes,output_hash
+macros_16,direct_smp,633,665,29.125,44.833,21.084,3,0,1,5602,5602,8acc6fe8b16b06cd
+macros_16,warm_caller_arena,633,665,29.875,66.458,21.542,2,0,1,4937,4937,8acc6fe8b16b06cd
+macros_64,direct_smp,2553,2681,93.209,105.042,83.416,2,0,1,19337,19337,f071df5ae3cfff09
+macros_64,warm_caller_arena,2553,2681,85.917,96.625,74.250,2,0,1,19337,19337,f071df5ae3cfff09
+macros_256,direct_smp,10545,11057,295.083,316.042,269.875,2,0,1,79277,79277,173563427757a00c
+macros_256,warm_caller_arena,10545,11057,281.000,295.500,267.625,2,0,1,79277,79277,173563427757a00c
