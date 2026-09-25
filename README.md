@@ -20,6 +20,7 @@ for in a sophisticated grammar DSL:
 - [⚡️] Inlay hints
 - [⚡️] Semantic Tokens
 - [⚡️] Diagnostics
+- [⚡️] Formatting
 
 Oh, and they work for the grammar, and the Zig code as well.
 `zitron-ls` embeds the entirety of ZLS, and does a lot of [diffing].
@@ -38,7 +39,7 @@ getting `zitron-ls` stood up.
 ### Prerequisites
 
 - Zig 0.16.x
-- `zitron` on the `$PATH`: `zitron -v` should say at least `0.2.4`.
+- `zitron` on the `$PATH`: `zitron -v` should say at least `0.3.0`.
 
 
 ### Build
@@ -106,7 +107,7 @@ Reminder: typing `zitron -h` should do useful things: `zitron-ls` is
 not expected to crash out if this doesn't work, but nor will it do many
 cool things it otherwise would.
 
-Make sure `zitron -v` is at least `v0.2.4` for best results.
+Make sure `zitron -v` is at least `v0.3.0` for best results.
 
 Syntax highlighting comes from the [tree-sitter][ts-zitron], not
 the LSP, so check out the instructions there to make things nice and
