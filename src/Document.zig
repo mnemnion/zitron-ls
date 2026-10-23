@@ -374,6 +374,129 @@ pub fn typeDefinitionAtPosition(
     };
 }
 
+/// Shows alias types and named-action signatures using Zig Markdown highlighting.
+pub fn typedHoverAtPosition(
+    document: Document,
+    arena: std.mem.Allocator,
+    offset_encoding: lsp.offsets.Encoding,
+    position: types.Position,
+) OOM!?types.Hover {
+    const source = document.source;
+    const source_index = lsp.offsets.positionToIndex(source, position, offset_encoding);
+    const point = tsPointFromIndex(source, source_index);
+    const root = document.tree.rootNode();
+    const node = root.namedDescendantForPointRange(point, point) orelse return null;
+    const code = if (std.mem.eql(u8, node.kind(), "zig_code")) node else ancestorOfKind(node, "zig_code");
+    if (code != null and containingRule(node) == null) {
+        const directive = ancestorOfKind(node, "directive") orelse return null;
+        if (!hasDirectChildOfKind(directive, "impl_name")) return null;
+    }
+    const code_alias = if (code) |body| try codeIdentifierAt(source, body, source_index, arena) else null;
+    const is_alias = std.mem.eql(u8, node.kind(), "rule_alias");
+    if (!is_alias and code_alias == null and !std.mem.eql(u8, node.kind(), "action_name")) return null;
+    if (!nodeContainsIndex(node, source_index)) return null;
+
+    var type_table: TypeTable = .empty;
+    defer type_table.deinit(arena);
+    try collectTypeFacts(source, root, arena, &type_table);
+    var aliases: std.ArrayList(AliasTypeFact) = .empty;
+    defer aliases.deinit(arena);
+    var signatures: ActionSignatureTable = .empty;
+    defer signatures.deinit(arena);
+    const rule = containingRule(node);
+    if (rule) |owner| {
+        try collectRuleAliasTypes(source, owner, arena, &type_table, &aliases);
+    } else {
+        try collectActionSignatures(source, root, arena, &type_table, &signatures);
+    }
+
+    if (code_alias) |loc| {
+        const name = source[loc.start..loc.end];
+        const maybe_type = if (rule != null) blk: {
+            for (aliases.items) |fact| {
+                if (std.mem.eql(u8, name, fact.alias_name)) break :blk fact.type_value;
+            }
+            break :blk null;
+        } else blk: {
+            const directive = ancestorOfKind(node, "directive") orelse return null;
+            if (!hasDirectChildOfKind(directive, "impl_name")) return null;
+            const action = firstNamedChildOfKind(directive, "named_action") orelse return null;
+            const action_name = actionNameForNamedAction(source, action) orelse return null;
+            var slot: usize = 0;
+            var index: u32 = 0;
+            while (index < action.namedChildCount()) : (index += 1) {
+                const child = action.namedChild(index).?;
+                if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
+                defer slot += 1;
+                if (!std.mem.eql(u8, name, sliceForNode(source, child))) continue;
+                const fact = signatures.get(action_name, slot) orelse return null;
+                break :blk if (std.mem.eql(u8, name, fact.alias_name)) fact.type_value else null;
+            }
+            break :blk null;
+        };
+        const type_value = maybe_type orelse return null;
+        return .{
+            .contents = .{ .markup_content = .{
+                .kind = .markdown,
+                .value = try std.fmt.allocPrint(arena, "```zig\n{s}: {s}\n```", .{ name, type_value }),
+            } },
+            .range = lsp.offsets.locToRange(source, loc, offset_encoding),
+        };
+    }
+
+    var text: std.Io.Writer.Allocating = .init(arena);
+    defer text.deinit();
+    text.writer.writeAll("```zig\n") catch return error.OutOfMemory;
+    if (ancestorOfKind(node, "named_action")) |action| {
+        const action_name = actionNameForNamedAction(source, action) orelse return null;
+        var slot: usize = 0;
+        var index: u32 = 0;
+        while (index < action.childCount()) : (index += 1) {
+            const child = action.child(index).?;
+            const kind = child.kind();
+            if (std.mem.eql(u8, kind, "rule_alias")) {
+                const name = sliceForNode(source, child);
+                const type_value = if (rule != null) blk: {
+                    if (slot >= aliases.items.len) break :blk null;
+                    const fact = aliases.items[slot];
+                    break :blk if (std.mem.eql(u8, name, fact.alias_name)) fact.type_value else null;
+                } else blk: {
+                    const fact = signatures.get(action_name, slot) orelse break :blk null;
+                    break :blk if (std.mem.eql(u8, name, fact.alias_name)) fact.type_value else null;
+                };
+                slot += 1;
+                if (is_alias and !sameNode(node, child)) continue;
+                if (is_alias and type_value == null) return null;
+                text.writer.print("{s}: {s}", .{ name, type_value orelse "?" }) catch return error.OutOfMemory;
+                if (is_alias) break;
+            } else if (!is_alias) {
+                if (std.mem.eql(u8, kind, "action_name") or
+                    std.mem.eql(u8, kind, "(") or std.mem.eql(u8, kind, ")"))
+                {
+                    text.writer.writeAll(sliceForNode(source, child)) catch return error.OutOfMemory;
+                } else if (std.mem.eql(u8, kind, ";") or std.mem.eql(u8, kind, ",")) {
+                    text.writer.print("{s} ", .{sliceForNode(source, child)}) catch return error.OutOfMemory;
+                }
+            }
+        }
+    } else {
+        var low: usize = 0;
+        var high = aliases.items.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (aliases.items[mid].alias_node.startByte() < node.startByte()) low = mid + 1 else high = mid;
+        }
+        if (low == aliases.items.len or !sameNode(aliases.items[low].alias_node, node)) return null;
+        const fact = aliases.items[low];
+        text.writer.print("{s}: {s}", .{ fact.alias_name, fact.type_value orelse return null }) catch return error.OutOfMemory;
+    }
+    text.writer.writeAll("\n```") catch return error.OutOfMemory;
+    return .{
+        .contents = .{ .markup_content = .{ .kind = .markdown, .value = try text.toOwnedSlice() } },
+        .range = lsp.offsets.locToRange(source, .{ .start = node.startByte(), .end = node.endByte() }, offset_encoding),
+    };
+}
+
 /// Builds grammar-side inlay hints for aliases with known Zitron value types.
 pub fn inlayHints(
     document: Document,
@@ -868,6 +991,21 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
     };
 }
 
+fn codeIdentifierAt(source: []const u8, code: ts.Node, index: usize, allocator: std.mem.Allocator) OOM!?lsp.offsets.Loc {
+    const text = try allocator.dupeZ(u8, sliceForNode(source, code));
+    defer allocator.free(text);
+    var tokenizer = std.zig.Tokenizer.init(text);
+    const offset = index - code.startByte();
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof or token.loc.start > offset) return null;
+        if (token.loc.start <= offset and offset < token.loc.end) {
+            if (token.tag != .identifier) return null;
+            return .{ .start = code.startByte() + token.loc.start, .end = code.startByte() + token.loc.end };
+        }
+    }
+}
+
 const TypeTable = struct {
     const empty: TypeTable = .{
         .symbol_types = .empty,
@@ -911,7 +1049,7 @@ const DirectiveTypeKind = enum {
 const AliasTypeFact = struct {
     alias_name: []const u8,
     alias_node: ts.Node,
-    type_value: []const u8,
+    type_value: ?[]const u8,
 };
 
 const ActionAliasType = struct {
@@ -924,9 +1062,11 @@ const ActionAliasType = struct {
 const ActionSignatureTable = struct {
     const empty: ActionSignatureTable = .{ .items = .empty };
 
-    items: std.ArrayList(ActionAliasType),
+    items: std.StringHashMapUnmanaged(std.ArrayList(?ActionAliasType)),
 
     fn deinit(table: *ActionSignatureTable, allocator: std.mem.Allocator) void {
+        var iterator = table.items.valueIterator();
+        while (iterator.next()) |slots| slots.deinit(allocator);
         table.items.deinit(allocator);
     }
 
@@ -938,29 +1078,25 @@ const ActionSignatureTable = struct {
         alias_name: []const u8,
         type_value: []const u8,
     ) OOM!void {
-        for (table.items.items) |*item| {
-            if (item.slot_index == slot_index and std.mem.eql(u8, item.action_name, action_name)) {
-                item.alias_name = alias_name;
-                item.type_value = type_value;
-                return;
-            }
+        const entry = try table.items.getOrPut(allocator, action_name);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        const slots = entry.value_ptr;
+        if (slots.items.len <= slot_index) {
+            const old_len = slots.items.len;
+            try slots.resize(allocator, slot_index + 1);
+            @memset(slots.items[old_len..], null);
         }
-
-        try table.items.append(allocator, .{
+        slots.items[slot_index] = .{
             .action_name = action_name,
             .slot_index = slot_index,
             .alias_name = alias_name,
             .type_value = type_value,
-        });
+        };
     }
 
     fn get(table: *const ActionSignatureTable, action_name: []const u8, slot_index: usize) ?ActionAliasType {
-        for (table.items.items) |item| {
-            if (item.slot_index == slot_index and std.mem.eql(u8, item.action_name, action_name)) {
-                return item;
-            }
-        }
-        return null;
+        const slots = table.items.get(action_name) orelse return null;
+        return if (slot_index < slots.items.len) slots.items[slot_index] else null;
     }
 };
 
@@ -1034,7 +1170,7 @@ fn collectActionSignatures(
                 action_name,
                 slot_index,
                 action_alias,
-                rule_alias.type_value,
+                rule_alias.type_value orelse continue,
             );
         }
     }
@@ -1076,7 +1212,8 @@ fn appendRuleInlayHints(
     try collectRuleAliasTypes(source, rule, allocator, type_table, &rule_alias_types);
 
     for (rule_alias_types.items) |alias_type| {
-        try appendInlayHint(source, alias_type.alias_node, alias_type.type_value, range, offset_encoding, allocator, hints);
+        if (alias_type.alias_node.startByte() < rule.startByte()) continue;
+        try appendInlayHint(source, alias_type.alias_node, alias_type.type_value orelse continue, range, offset_encoding, allocator, hints);
     }
 
     const action = firstNamedChildOfKind(rule, "named_action") orelse return;
@@ -1092,7 +1229,7 @@ fn appendRuleInlayHints(
         const rule_alias = rule_alias_types.items[slot_index];
         if (!std.mem.eql(u8, sliceForNode(source, child), rule_alias.alias_name)) continue;
 
-        try appendInlayHint(source, child, rule_alias.type_value, range, offset_encoding, allocator, hints);
+        try appendInlayHint(source, child, rule_alias.type_value orelse continue, range, offset_encoding, allocator, hints);
     }
 }
 
@@ -1131,6 +1268,13 @@ fn collectRuleAliasTypes(
     type_table: *const TypeTable,
     alias_types: *std.ArrayList(AliasTypeFact),
 ) OOM!void {
+    if (std.mem.eql(u8, rule.kind(), "ditto_rule")) {
+        if (masterRuleForDittoRun(rule)) |master| {
+            if (firstNamedChildOfKind(master, "lhs")) |lhs| {
+                try collectParticleAliasTypes(source, lhs, allocator, type_table, alias_types);
+            }
+        }
+    }
     const child_count = rule.namedChildCount();
     var index: u32 = 0;
     while (index < child_count) : (index += 1) {
@@ -1159,11 +1303,10 @@ fn collectParticleAliasTypes(
         }
 
         if (!std.mem.eql(u8, child.kind(), "rule_alias")) continue;
-        const type_value = pending_type orelse continue;
         try alias_types.append(allocator, .{
             .alias_name = sliceForNode(source, child),
             .alias_node = child,
-            .type_value = type_value,
+            .type_value = pending_type,
         });
         pending_type = null;
     }

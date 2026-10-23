@@ -164,7 +164,7 @@ pub const Server = struct {
 
     pub fn setClientTransport(server: *Server, transport: *lsp.Transport) void {
         server.client_transport = transport;
-        server.zig_middleware.setDiagnosticsPublisher(server, publishZlsDiagnostics);
+        server.zig_middleware.setDiagnosticsPublisher(server, publishMiddlewareDiagnostics);
         server.zig_middleware.setRefreshPublisher(server, publishZlsRefresh);
     }
 
@@ -193,20 +193,9 @@ pub const Server = struct {
         return started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
     }
 
-    fn publishMergedDiagnostics(server: *Server, uri: []const u8, version: i32) Error!void {
-        if (server.client_transport == null or server.io == null) return;
-        var arena_state = std.heap.ArenaAllocator.init(server.allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
-        try server.zig_middleware.appendDiagnostics(arena, &diagnostics, uri);
-        try server.publishDiagnostics(uri, version, diagnostics.items);
-    }
-
-    fn publishZlsDiagnostics(context: *anyopaque, source_uri: []const u8, version: i32) void {
+    fn publishMiddlewareDiagnostics(context: *anyopaque, source_uri: []const u8, version: ?i32, diagnostics: []const types.Diagnostic) void {
         const server: *Server = @ptrCast(@alignCast(context));
-        server.publishMergedDiagnostics(source_uri, version) catch |err| {
+        server.publishDiagnostics(source_uri, version, diagnostics) catch |err| {
             log.warn("LSP publish diagnostics failed for uri={s}: {}", .{ source_uri, err });
         };
     }
@@ -448,7 +437,6 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
-        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         try server.warmSemanticTokens(params.textDocument.uri);
         log.debug("LSP -> textDocument/didOpen uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
@@ -470,6 +458,7 @@ pub const Server = struct {
             params.contentChanges.len,
         });
         const doc = server.getDocument(params.textDocument.uri) orelse return error.InvalidParams;
+        server.zig_middleware.invalidateDiagnostics(params.textDocument.uri, params.textDocument.version);
         try doc.updateIncremental(
             server.allocator,
             params.textDocument.version,
@@ -482,7 +471,6 @@ pub const Server = struct {
             doc.source,
             doc.tree.rootNode(),
         );
-        try server.publishMergedDiagnostics(params.textDocument.uri, params.textDocument.version);
         log.debug("LSP -> textDocument/didChange uri={s} source_bytes={} elapsed_ns={}", .{
             params.textDocument.uri,
             doc.source.len,
@@ -498,9 +486,6 @@ pub const Server = struct {
     ) void {
         const start = server.logStart();
         log.debug("LSP <- textDocument/didClose uri={s}", .{params.textDocument.uri});
-        server.publishDiagnostics(params.textDocument.uri, null, &.{}) catch |err| {
-            log.warn("LSP publish diagnostics failed while closing uri={s}: {}", .{ params.textDocument.uri, err });
-        };
         server.zig_middleware.closeDocument(params.textDocument.uri);
         server.removeDocument(params.textDocument.uri);
         log.debug("LSP -> textDocument/didClose uri={s} elapsed_ns={}", .{
@@ -661,6 +646,7 @@ pub const Server = struct {
             });
             return null;
         };
+        if (try doc.typedHoverAtPosition(arena, server.offset_encoding, params.position)) |hover| return hover;
         const value = switch (doc.resolveAtPosition(server.tags_query, server.offset_encoding, params.position)) {
             .no_match => {
                 log.debug("LSP -> textDocument/hover uri={s} result=null reason=no_match elapsed_ns={}", .{
@@ -2131,6 +2117,116 @@ test "query resolution finds directive grammar symbols" {
             try expectEqualStrings("expr", symbol.symbol_name);
         },
         else => return error.UnexpectedResolution,
+    }
+}
+
+test "typed hover connects aliases and named action signatures" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///samples/typed_hover.zy";
+    const sample =
+        \\%token_type "Token"
+        \\%default_type {Bar}
+        \\%type expr {*Foo}
+        \\%token_class operators PLUS|MINUS.
+        \\expr(A) ::= fallback(B) NUMBER(C). @blah(A; B, C)
+        \\%impl @blah(A; B, C) { _ = .{ A, B, C }; }
+        \\other ::= operators(O) PLUS|MINUS(M) "!"(S). @tokens(; O, M, S)
+        \\%impl @tokens(; O, M, S) { _ = .{ O, M, S }; }
+        \\empty ::= . @empty()
+    ;
+    try server.putDocument(uri, 1, sample);
+    try expect(!server.getDocument(uri).?.parsed.has_error);
+    const cases = .{
+        .{ "expr(A)", "A", "A: *Foo" },
+        .{ "fallback(B)", "B", "B: Bar" },
+        .{ "NUMBER(C)", "C", "C: Token" },
+        .{ "@blah(A; B, C)", "A", "A: *Foo" },
+        .{ "@blah(A; B, C)", "B", "B: Bar" },
+        .{ "@blah(A; B, C)", "C", "C: Token" },
+        .{ "%impl @blah", "A", "A: *Foo" },
+        .{ "%impl @blah", "B", "B: Bar" },
+        .{ "%impl @blah", "C", "C: Token" },
+        .{ "_ = .{ A", "A", "A: *Foo" },
+        .{ "_ = .{ A", "B", "B: Bar" },
+        .{ "_ = .{ A", "C", "C: Token" },
+        .{ "@blah(A; B, C)", "@blah", "@blah(A: *Foo; B: Bar, C: Token)" },
+        .{ "%impl @blah", "@blah", "@blah(A: *Foo; B: Bar, C: Token)" },
+        .{ "operators(O)", "O", "O: Token" },
+        .{ "PLUS|MINUS(M)", "M)", "M: Token" },
+        .{ "\"!\"(S)", "S", "S: Token" },
+        .{ "@tokens(; O, M, S)", "@tokens", "@tokens(; O: Token, M: Token, S: Token)" },
+        .{ "%impl @tokens", "@tokens", "@tokens(; O: Token, M: Token, S: Token)" },
+        .{ "@empty()", "@empty", "@empty()" },
+    };
+    inline for (cases) |case| {
+        const position = try positionOfTextAfter(sample, try byteIndexOf(sample, case[0]), case[1]);
+        const hover = (try server.@"textDocument/hover"(arena, .{
+            .textDocument = .{ .uri = uri },
+            .position = position,
+        })) orelse return error.UnexpectedHoverContents;
+        try expectEqual(types.MarkupKind.markdown, hover.contents.markup_content.kind);
+        try expectEqualStrings("```zig\n" ++ case[2] ++ "\n```", hover.contents.markup_content.value);
+        try expectEqual(position, hover.range.?.start);
+    }
+
+    const changed =
+        \\%type expr u32
+        \\expr(A) ::= . @blah(A)
+        \\%impl @blah(A) { _ = A; }
+    ;
+    try server.putDocument(uri, 2, changed);
+    try expectHoverContains(&server, arena, uri, try positionOfTextAfter(changed, try byteIndexOf(changed, "%impl"), "@blah"), "```zig\n@blah(A: u32)\n```");
+}
+
+test "typed hover preserves unknown slots and inherited ditto aliases" {
+    var server = try Server.init(testing_allocator);
+    defer server.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const uri = "file:///samples/typed_hover_slots.zy";
+    const sample =
+        \\%type expr i64
+        \\expr(A) ::= NUMBER(N) fallback(F). @first(A; N, F)
+        \\         `` fallback(B). @second(A; B)
+        \\%impl @first(A; N, F) { _ = .{ A, N, F }; }
+        \\%impl @second(A; B) { _ = .{ A, B }; }
+        \\%impl @first(A; Bad, F) { _ = .{ A, Bad, F }; }
+        \\inline(R) ::= expr(E). { R = E; _ = "R E"; // R E
+        \\}
+    ;
+    try server.putDocument(uri, 1, sample);
+    try expect(!server.getDocument(uri).?.parsed.has_error);
+    const cases = .{
+        .{ "@first(A; N, F)", "@first", "@first(A: i64; N: ?, F: void)" },
+        .{ "%impl @first", "@first", "@first(A: i64; N: ?, F: void)" },
+        .{ "%impl @first", "F)", "F: void" },
+        .{ "@second(A; B)", "@second", "@second(A: i64; B: void)" },
+        .{ "@second(A; B)", "A;", "A: i64" },
+        .{ "%impl @second", "@second", "@second(A: i64; B: void)" },
+        .{ "{ R =", "R", "R: void" },
+        .{ "{ R =", "E;", "E: i64" },
+    };
+    inline for (cases) |case| {
+        try expectHoverContains(&server, arena, uri, try positionOfTextAfter(sample, try byteIndexOf(sample, case[0]), case[1]), "```zig\n" ++ case[2] ++ "\n```");
+    }
+    const missing = .{
+        .{ "%impl @first(A; N", "N," },
+        .{ "%impl @first(A; Bad", "Bad," },
+    };
+    inline for (missing) |case| {
+        try expectEqual(null, try server.@"textDocument/hover"(arena, .{
+            .textDocument = .{ .uri = uri },
+            .position = try positionOfTextAfter(sample, try byteIndexOf(sample, case[0]), case[1]),
+        }));
+    }
+    const doc = server.getDocument(uri).?;
+    for ([_][]const u8{ "\"R E\"", "// R E" }) |context| {
+        try expectEqual(null, try doc.typedHoverAtPosition(arena, server.offset_encoding, try positionOfTextAfter(sample, try byteIndexOf(sample, context), "R")));
     }
 }
 
