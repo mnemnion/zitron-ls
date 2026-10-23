@@ -173,7 +173,7 @@ pub fn main(init: std.process.Init) Error!void {
         },
         .{ .emit_null_optional_fields = false },
     );
-    try expectHoverResponse(init.io, allocator, &transport.transport);
+    try expectHoverResponse(init.io, allocator, &transport.transport, 3, "```zitron\n%type statement_list {?*PList}\n```");
 
     const document_rule_index = try byteIndexOf(fixture_text, "document ::= statement_list");
 
@@ -535,6 +535,7 @@ pub fn main(init: std.process.Init) Error!void {
     }
 
     try formattingRoundTrip(init.io, allocator, &transport.transport, fixture_uri, fixture_text);
+    try typedHoverRoundTrip(init.io, allocator, &transport.transport, fixture_uri);
 
     try transport.transport.writeNotification(
         init.io,
@@ -625,8 +626,10 @@ fn expectHoverResponse(
     io: std.Io,
     allocator: std.mem.Allocator,
     transport: *lsp.Transport,
+    id: i64,
+    expected: []const u8,
 ) Error!void {
-    const json_message = try readResponseJsonMessage(io, allocator, transport, 3);
+    const json_message = try readResponseJsonMessage(io, allocator, transport, id);
     defer allocator.free(json_message);
 
     const parsed = try std.json.parseFromSlice(lsp.JsonRPCMessage, allocator, json_message, .{
@@ -636,7 +639,7 @@ fn expectHoverResponse(
 
     const hover_value = switch (parsed.value) {
         .response => |response| blk: {
-            if (response.id == null or !response.id.?.eql(.{ .number = 3 })) {
+            if (response.id == null or !response.id.?.eql(.{ .number = id })) {
                 return error_set.UnexpectedResponse;
             }
             switch (response.result_or_error) {
@@ -654,10 +657,8 @@ fn expectHoverResponse(
 
     switch (hover.value.contents) {
         .markup_content => |content| {
-            try expectEqualStrings(
-                "```zitron\n%type statement_list {?*PList}\n```",
-                content.value,
-            );
+            try expectEqual(lsp.types.MarkupKind.markdown, content.kind);
+            try expectEqualStrings(expected, content.value);
         },
         else => return error_set.UnexpectedResponse,
     }
@@ -844,6 +845,48 @@ fn expectSuccessfulResponse(
         },
         else => return error_set.UnexpectedResponse,
     }
+}
+
+fn typedHoverRoundTrip(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    transport: *lsp.Transport,
+    fixture_uri: []const u8,
+) Error!void {
+    const uri = try std.fmt.allocPrint(allocator, "{s}.hover.zy", .{fixture_uri});
+    defer allocator.free(uri);
+    const source =
+        \\%token_type u8
+        \\%default_type i64
+        \\%type expr i32
+        \\start ::= expr.
+        \\expr(A) ::= NUMBER(N) fallback(F). @value(A; N, F)
+        \\fallback(F) ::= . { F = 1; }
+        \\%impl @value(A; N, F) { A = @intCast(N + F); }
+    ;
+    try transport.writeNotification(io, allocator, "textDocument/didOpen", lsp.ParamsType("textDocument/didOpen"), .{
+        .textDocument = .{ .uri = uri, .languageId = .{ .custom_value = "zitron" }, .version = 1, .text = source },
+    }, .{ .emit_null_optional_fields = false });
+    const cases = .{
+        .{ "expr(A)", "A", "A: i32" },
+        .{ "@value(A;", "@value", "@value(A: i32; N: u8, F: i64)" },
+        .{ "%impl", "@value", "@value(A: i32; N: u8, F: i64)" },
+        .{ "%impl", "N,", "N: u8" },
+        .{ "{ A =", "A", "A: i32" },
+        .{ "@intCast(N", "N", "N: u8" },
+        .{ "N + F", "F", "F: i64" },
+        .{ "{ F =", "F", "F: i64" },
+    };
+    inline for (cases, 26..) |case, id| {
+        try transport.writeRequest(io, allocator, .{ .number = id }, "textDocument/hover", lsp.ParamsType("textDocument/hover"), .{
+            .textDocument = .{ .uri = uri },
+            .position = try positionOfTextAfter(source, try byteIndexOf(source, case[0]), case[1]),
+        }, .{ .emit_null_optional_fields = false });
+        try expectHoverResponse(io, allocator, transport, id, "```zig\n" ++ case[2] ++ "\n```");
+    }
+    try transport.writeNotification(io, allocator, "textDocument/didClose", lsp.ParamsType("textDocument/didClose"), .{
+        .textDocument = .{ .uri = uri },
+    }, .{ .emit_null_optional_fields = false });
 }
 
 fn formattingRoundTrip(

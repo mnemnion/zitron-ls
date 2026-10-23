@@ -35,6 +35,8 @@
         "build.zig.zon",
         "samples",
         "src",
+        "tools/test_conflict_diagnostics.py",
+        "tools/replay_client.py",
         "LICENSE",
         "README.md",
     },

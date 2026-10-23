@@ -28,7 +28,7 @@ const Mode = union(enum) {
     enabled: *Middleware,
 };
 
-const DiagnosticsPublisher = *const fn (context: *anyopaque, zy_uri: []const u8, version: i32) void;
+const DiagnosticsPublisher = *const fn (context: *anyopaque, zy_uri: []const u8, version: ?i32, diagnostics: []const types.Diagnostic) void;
 
 pub const RefreshKind = enum {
     semantic_tokens,
@@ -65,8 +65,14 @@ const Middleware = struct {
     zls_library: ZlsAdapter,
     zls_completion_triggers: []const []const u8,
     next_generation_id: usize,
+    conflict_worker: ?std.Io.Future(void) = null,
+    conflict_queue: std.Deque([]u8) = .empty,
+    conflicts_changed: std.Io.Condition = .init,
 
     fn deinit(middleware: *Middleware) void {
+        if (middleware.conflict_worker) |*worker| worker.cancel(middleware.io);
+        while (middleware.conflict_queue.popFront()) |uri| middleware.allocator.free(uri);
+        middleware.conflict_queue.deinit(middleware.allocator);
         middleware.drainPendingZlsUpdates() catch |err| {
             log.warn("ZLS update drain failed during deinit: {}", .{err});
         };
@@ -103,6 +109,7 @@ const Middleware = struct {
             defer middleware.documents_mutex.unlock(middleware.io);
 
             const gop = try middleware.documents.getOrPut(middleware.allocator, uri);
+            const invalidated = gop.found_existing and gop.value_ptr.in_flight_version == version;
             if (!gop.found_existing) {
                 errdefer _ = middleware.documents.remove(uri);
                 gop.key_ptr.* = try middleware.allocator.dupe(u8, uri);
@@ -123,6 +130,7 @@ const Middleware = struct {
                 gop.value_ptr.latest_requested_version = version;
                 gop.value_ptr.in_flight_version = version;
             }
+            if (!invalidated) middleware.sendDiagnosticsLocked(uri, version, &.{});
 
             const id = middleware.next_generation_id;
             middleware.next_generation_id += 1;
@@ -295,7 +303,9 @@ const Middleware = struct {
         const removed = blk: {
             middleware.documents_mutex.lockUncancelable(middleware.io);
             defer middleware.documents_mutex.unlock(middleware.io);
-            break :blk middleware.documents.fetchRemove(uri) orelse return;
+            const removed = middleware.documents.fetchRemove(uri);
+            middleware.sendDiagnosticsLocked(uri, null, &.{});
+            break :blk removed orelse return;
         };
 
         middleware.allocator.free(removed.key);
@@ -379,6 +389,14 @@ const Middleware = struct {
             state.in_flight_version = null;
             generation.* = undefined;
             const doc = state.currentForVersion(state.latest_requested_version) orelse return error.MissingZigDocument;
+            middleware.publishDiagnosticsLocked(uri, doc.version) catch |err| {
+                log.warn("Diagnostic publication failed uri={s}: {}", .{ uri, err });
+            };
+            if (hasConflictSummary(doc.grammar_diagnostics)) {
+                middleware.queueConflictReportLocked(uri, state) catch |err| {
+                    log.warn("Conflict report queue failed uri={s}: {}", .{ uri, err });
+                };
+            }
             log_version = doc.version;
             log_opened = state.opened;
             log_zig_bytes = doc.zig_text.len;
@@ -421,6 +439,101 @@ const Middleware = struct {
             notify_ns,
             elapsedNs(middleware.io, start),
         });
+    }
+
+    fn sendDiagnosticsLocked(middleware: *Middleware, uri: []const u8, version: ?i32, diagnostics: []const types.Diagnostic) void {
+        const context = middleware.diagnostics_context orelse return;
+        const publisher = middleware.diagnostics_publisher orelse return;
+        publisher(context, uri, version, diagnostics);
+    }
+
+    fn publishDiagnosticsLocked(middleware: *Middleware, uri: []const u8, version: i32) OOM!void {
+        const state = middleware.documents.getPtr(uri) orelse return;
+        if (state.in_flight_version != null or state.latest_requested_version != version) return;
+        const doc = state.currentForVersion(version) orelse return;
+        var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+        defer diagnostics.deinit(middleware.allocator);
+        try diagnostics.appendSlice(middleware.allocator, doc.grammar_diagnostics);
+        try diagnostics.appendSlice(middleware.allocator, doc.conflict_diagnostics);
+        if (doc.zls_diagnostics_version == version) {
+            try diagnostics.appendSlice(middleware.allocator, doc.zls_diagnostics);
+        }
+        middleware.sendDiagnosticsLocked(uri, version, diagnostics.items);
+    }
+
+    fn queueConflictReportLocked(middleware: *Middleware, uri: []const u8, state: *DocumentState) OOM!void {
+        if (middleware.conflict_worker == null or state.conflict_queued) return;
+        const owned_uri = try middleware.allocator.dupe(u8, uri);
+        errdefer middleware.allocator.free(owned_uri);
+        try middleware.conflict_queue.pushBack(middleware.allocator, owned_uri);
+        state.conflict_queued = true;
+        middleware.conflicts_changed.signal(middleware.io);
+    }
+
+    fn takeConflictReport(middleware: *Middleware) (OOM || std.Io.Cancelable)!ConflictJob {
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        while (true) {
+            const uri = middleware.conflict_queue.popFront() orelse {
+                try middleware.conflicts_changed.wait(middleware.io, &middleware.documents_mutex);
+                continue;
+            };
+            defer middleware.allocator.free(uri);
+            const state = middleware.documents.getPtr(uri) orelse continue;
+            state.conflict_queued = false;
+            if (state.in_flight_version != null) continue;
+            const doc = state.currentForVersion(state.latest_requested_version) orelse continue;
+            if (!hasConflictSummary(doc.grammar_diagnostics) or doc.conflict_attempted) continue;
+            const job = try ConflictJob.init(middleware.allocator, doc);
+            doc.conflict_attempted = true;
+            return job;
+        }
+    }
+
+    fn finishConflictReport(middleware: *Middleware, job: ConflictJob, diagnostics: []types.Diagnostic) OOM!void {
+        var owned = diagnostics;
+        defer freeStoredDiagnostics(middleware.allocator, owned);
+        middleware.documents_mutex.lockUncancelable(middleware.io);
+        defer middleware.documents_mutex.unlock(middleware.io);
+        defer log.debug("Conflict report finished uri={s} generation={}", .{ job.uri, job.generation_id });
+        const state = middleware.documents.getPtr(job.uri) orelse return;
+        if (state.in_flight_version != null) return;
+        const doc = state.currentForVersion(state.latest_requested_version) orelse return;
+        if (doc.generation_id != job.generation_id) return;
+        freeStoredDiagnostics(middleware.allocator, doc.conflict_diagnostics);
+        doc.conflict_diagnostics = owned;
+        owned = &.{};
+        try middleware.publishDiagnosticsLocked(job.uri, doc.version);
+    }
+
+    fn runConflictWorker(middleware: *Middleware) void {
+        while (true) {
+            var job = middleware.takeConflictReport() catch |err| switch (err) {
+                error.Canceled => return,
+                else => {
+                    log.warn("Conflict report snapshot failed: {}", .{err});
+                    continue;
+                },
+            };
+            defer job.deinit(middleware.allocator);
+            log.debug("Conflict report started uri={s} generation={}", .{ job.uri, job.generation_id });
+            const output = runZitronMode(middleware.allocator, middleware.io, job.path, job.text, true) catch |err| switch (err) {
+                error.Canceled => return,
+                else => {
+                    log.warn("Conflict explanation failed uri={s}: {}", .{ job.uri, err });
+                    continue;
+                },
+            };
+            defer middleware.allocator.free(output.stdout);
+            defer middleware.allocator.free(output.stderr);
+            const diagnostics = parseConflictDiagnostics(middleware.allocator, output.stderr, job.path, job.text) catch |err| {
+                log.warn("Conflict report parsing failed uri={s}: {}", .{ job.uri, err });
+                continue;
+            };
+            middleware.finishConflictReport(job, diagnostics) catch |err| {
+                log.warn("Conflict report publication failed uri={s}: {}", .{ job.uri, err });
+            };
+        }
     }
 
     fn forwardHover(
@@ -1966,12 +2079,10 @@ const Middleware = struct {
             .notification => |notification| {
                 if (std.mem.eql(u8, notification.method, "textDocument/publishDiagnostics")) {
                     if (try middleware.handleZlsDiagnostics(notification.params)) |published| {
-                        if (middleware.diagnostics_context) |context| {
-                            if (middleware.diagnostics_publisher) |publisher| {
-                                publisher(context, published.zy_uri, published.version);
-                            }
-                        }
-                        middleware.allocator.free(published.zy_uri);
+                        defer middleware.allocator.free(published.zy_uri);
+                        middleware.documents_mutex.lockUncancelable(middleware.io);
+                        defer middleware.documents_mutex.unlock(middleware.io);
+                        try middleware.publishDiagnosticsLocked(published.zy_uri, published.version);
                     }
                 } else {
                     log.debug("ZLS ignored notification method={s}", .{notification.method});
@@ -2032,6 +2143,8 @@ const ZigDocument = struct {
     zls_diagnostics: []types.Diagnostic,
     zls_diagnostics_version: ?i32,
     version: i32,
+    conflict_diagnostics: []types.Diagnostic = &.{},
+    conflict_attempted: bool = false,
 
     fn deinit(doc: *ZigDocument, allocator: std.mem.Allocator) void {
         allocator.free(doc.zy_uri);
@@ -2042,11 +2155,13 @@ const ZigDocument = struct {
         doc.code_map.deinit(allocator);
         if (doc.generation_error) |message| allocator.free(message);
         freeStoredDiagnostics(allocator, doc.grammar_diagnostics);
+        freeStoredDiagnostics(allocator, doc.conflict_diagnostics);
         freeStoredDiagnostics(allocator, doc.zls_diagnostics);
     }
 };
 
 const DocumentState = struct {
+    conflict_queued: bool = false,
     current: ?ZigDocument,
     latest_requested_version: i32,
     in_flight_version: ?i32,
@@ -2078,6 +2193,32 @@ const DocumentState = struct {
         if (state.semantic_tokens_current) |*semantic_tokens_current| semantic_tokens_current.deinit(allocator);
         for (state.semantic_tokens.items) |*semantic_tokens| semantic_tokens.deinit(allocator);
         state.semantic_tokens.deinit(allocator);
+    }
+};
+
+const ConflictJob = struct {
+    uri: []u8,
+    path: []u8,
+    text: []u8,
+    generation_id: usize,
+
+    fn init(allocator: std.mem.Allocator, doc: *const ZigDocument) OOM!ConflictJob {
+        const uri = try allocator.dupe(u8, doc.zy_uri);
+        errdefer allocator.free(uri);
+        const path = try allocator.dupe(u8, doc.zy_path);
+        errdefer allocator.free(path);
+        return .{
+            .uri = uri,
+            .path = path,
+            .text = try allocator.dupe(u8, doc.zy_text),
+            .generation_id = doc.generation_id,
+        };
+    }
+
+    fn deinit(job: *ConflictJob, allocator: std.mem.Allocator) void {
+        allocator.free(job.uri);
+        allocator.free(job.path);
+        allocator.free(job.text);
     }
 };
 
@@ -2195,6 +2336,10 @@ fn initImpl(
         log.debug("ZLS update worker unavailable reason={}", .{err});
         break :blk null;
     };
+    mware.conflict_worker = std.Io.concurrent(io, Middleware.runConflictWorker, .{mware}) catch |err| blk: {
+        log.warn("Conflict explanation worker unavailable: {}", .{err});
+        break :blk null;
+    };
     log.info("ZLS middleware enabled", .{});
     return .{ .mode = .{ .enabled = mware } };
 }
@@ -2247,23 +2392,18 @@ pub fn didChangeWatchedFiles(
     }
 }
 
-pub fn appendDiagnostics(
-    middleware: *ZigMiddleware,
-    allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(types.Diagnostic),
-    uri: []const u8,
-) OOM!void {
+/// Invalidates reports before attempting to apply a client's document edits.
+pub fn invalidateDiagnostics(middleware: *ZigMiddleware, uri: []const u8, version: i32) void {
     switch (middleware.mode) {
         .disabled => {},
         .enabled => |mware| {
             mware.documents_mutex.lockUncancelable(mware.io);
             defer mware.documents_mutex.unlock(mware.io);
-            const state = mware.documents.getPtr(uri) orelse return;
-            const generation = state.current orelse return;
-            try diagnostics.appendSlice(allocator, generation.grammar_diagnostics);
-            if (generation.zls_diagnostics_version == generation.version) {
-                try diagnostics.appendSlice(allocator, generation.zls_diagnostics);
+            if (mware.documents.getPtr(uri)) |state| {
+                state.latest_requested_version = version;
+                state.in_flight_version = version;
             }
+            mware.sendDiagnosticsLocked(uri, version, &.{});
         },
     }
 }
@@ -2751,6 +2891,7 @@ fn parseZitronDiagnostics(allocator: std.mem.Allocator, stderr: []const u8) OOM!
 }
 
 fn parseZitronDiagnosticLine(allocator: std.mem.Allocator, line: []const u8) OOM!?types.Diagnostic {
+    if (conflictSummaryCount(line) != null) return try makeZitronDiagnostic(allocator, 0, line);
     const path_end = std.mem.indexOfScalar(u8, line, ':') orelse return null;
     const line_start = path_end + 1;
     const line_end = std.mem.indexOfScalarPos(u8, line, line_start, ':') orelse return null;
@@ -2762,17 +2903,80 @@ fn parseZitronDiagnosticLine(allocator: std.mem.Allocator, line: []const u8) OOM
     if (std.mem.startsWith(u8, message, " ")) message = message[1..];
     if (message.len == 0) return null;
 
+    return try makeZitronDiagnostic(allocator, zero_based_line, message);
+}
+
+fn makeZitronDiagnostic(allocator: std.mem.Allocator, line: u32, message: []const u8) OOM!types.Diagnostic {
     const zy = try allocator.dupe(u8, "zitron");
     errdefer allocator.free(zy);
     return .{
         .range = .{
-            .start = .{ .line = zero_based_line, .character = 0 },
-            .end = .{ .line = zero_based_line, .character = 0 },
+            .start = .{ .line = line, .character = 0 },
+            .end = .{ .line = line, .character = 0 },
         },
         .severity = .Error,
         .source = zy,
         .message = try allocator.dupe(u8, message),
     };
+}
+
+fn conflictSummaryCount(line: []const u8) ?u32 {
+    const suffix = " parsing conflicts";
+    if (!std.mem.endsWith(u8, line, suffix)) return null;
+    const count = std.fmt.parseUnsigned(u32, line[0 .. line.len - suffix.len], 10) catch return null;
+    return if (count > 0) count else null;
+}
+
+fn hasConflictSummary(diagnostics: []const types.Diagnostic) bool {
+    for (diagnostics) |diagnostic| {
+        if (conflictSummaryCount(diagnostic.message) != null) return true;
+    }
+    return false;
+}
+
+fn parseConflictDiagnostics(allocator: std.mem.Allocator, stderr: []const u8, path: []const u8, source: []const u8) OOM![]types.Diagnostic {
+    var diagnostics: std.ArrayList(types.Diagnostic) = .empty;
+    errdefer {
+        for (diagnostics.items) |diagnostic| freeStoredDiagnostic(allocator, diagnostic);
+        diagnostics.deinit(allocator);
+    }
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(allocator);
+    const line_count = std.mem.count(u8, source, "\n") + 1;
+    var lines = std.mem.splitScalar(u8, stderr, '\n');
+    while (lines.next()) |raw_header| {
+        const header = std.mem.trimEnd(u8, raw_header, "\r");
+        if (!std.mem.startsWith(u8, header, "Conflict ")) continue;
+        const colon = std.mem.indexOfScalar(u8, header, ':') orelse continue;
+        _ = std.fmt.parseUnsigned(u32, header["Conflict ".len..colon], 10) catch continue;
+        const start = @intFromPtr(header.ptr) - @intFromPtr(stderr.ptr);
+        var end = start + header.len;
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+            if (line.len == 0) break;
+            end = @intFromPtr(line.ptr) - @intFromPtr(stderr.ptr) + line.len;
+        }
+        const message = stderr[start..end];
+        seen.clearRetainingCapacity();
+        var rules = std.mem.splitScalar(u8, message, '\n');
+        while (rules.next()) |rule| {
+            if (!std.mem.startsWith(u8, rule, "  shift  (") and !std.mem.startsWith(u8, rule, "  reduce (")) continue;
+            const location_start = "  reduce (".len;
+            const location_end = std.mem.lastIndexOf(u8, rule, ", rule ") orelse continue;
+            if (location_end <= location_start) continue;
+            const location = rule[location_start..location_end];
+            const separator = std.mem.lastIndexOfScalar(u8, location, ':') orelse continue;
+            if (!std.mem.eql(u8, location[0..separator], path)) continue;
+            const one_based = std.fmt.parseUnsigned(u32, location[separator + 1 ..], 10) catch continue;
+            if (one_based == 0 or one_based > line_count) continue;
+            const entry = try seen.getOrPut(allocator, one_based);
+            if (entry.found_existing) continue;
+            const diagnostic = try makeZitronDiagnostic(allocator, one_based - 1, message);
+            errdefer freeStoredDiagnostic(allocator, diagnostic);
+            try diagnostics.append(allocator, diagnostic);
+        }
+    }
+    return diagnostics.toOwnedSlice(allocator);
 }
 
 fn freeStoredDiagnostics(allocator: std.mem.Allocator, diagnostics: []const types.Diagnostic) void {
@@ -6039,8 +6243,18 @@ fn runZitron(
     zy_path: []const u8,
     zy_text: []const u8,
 ) Error!ZitronResult {
+    return runZitronMode(allocator, io, zy_path, zy_text, false);
+}
+
+fn runZitronMode(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    zy_path: []const u8,
+    zy_text: []const u8,
+    explain_conflicts: bool,
+) Error!ZitronResult {
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "zitron", "-Ful", zy_path },
+        .argv = &.{ "zitron", if (explain_conflicts) "-FulX" else "-Ful", zy_path },
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -6797,6 +7011,117 @@ test "Zitron stderr diagnostics become line-start LSP diagnostics" {
 
     try expectEqual(@as(u32, 171), diagnostics[2].range.start.line);
     try expectEqualStrings("Alias P for \"pair(P)\" is never used.", diagnostics[2].message);
+}
+
+test "conflict counts become line one errors and reject non-summary text" {
+    const diagnostics = try parseZitronDiagnostics(
+        testing_allocator,
+        "9 parsing conflicts\r\n0 parsing conflicts\nnot parsing conflicts\n",
+    );
+    defer freeStoredDiagnostics(testing_allocator, diagnostics);
+    try expectEqual(@as(usize, 1), diagnostics.len);
+    try expectEqual(@as(u32, 0), diagnostics[0].range.start.line);
+    try expectEqual(types.Diagnostic.Severity.Error, diagnostics[0].severity.?);
+    try expectEqualStrings("9 parsing conflicts", diagnostics[0].message);
+    try std.testing.expect(hasConflictSummary(diagnostics));
+}
+
+const test_conflict_report =
+    \\Conflict 1: shift/reduce in state 3 on PLUS
+    \\  shift  (/tmp/a:b.zy:2, rule 1): expr ::= expr • PLUS expr
+    \\  reduce (/tmp/a:b.zy:2, rule 1): expr ::= expr PLUS expr •
+    \\  Unifying counterexample: expr PLUS expr • PLUS expr
+    \\
+    \\  Shift derivation:
+    \\    expr // L2
+    \\
+    \\Conflict 2: reduce/reduce in state 4 on $end
+    \\  reduce (/tmp/a:b.zy:2, rule 1): first ::= WORD •
+    \\  reduce (/tmp/a:b.zy:3, rule 2): second ::= WORD •
+    \\  reduce (/tmp/other.zy:1, rule 3): foreign ::= WORD •
+    \\  reduce (/tmp/a:b.zy:999, rule 4): invalid ::= WORD •
+    \\  reduce (/tmp/a:b.zy:0, rule 5): invalid ::= WORD •
+    \\  reduce (/tmp/a:b.zy:bad, rule 6): invalid ::= WORD •
+    \\  Search limit reached; showing lookahead-sensitive examples.
+    \\  Nonunifying counterexamples (common prefix):
+    \\    reduce: WORD • ONE
+    \\    reduce: WORD • TWO
+    \\
+    \\  First reduce derivation:
+    \\    first // L2
+    \\2 parsing conflicts
+;
+
+test "conflict explanations locate rules and omit derivation trees" {
+    const diagnostics = try parseConflictDiagnostics(testing_allocator, test_conflict_report, "/tmp/a:b.zy", "\n\n\n");
+    defer freeStoredDiagnostics(testing_allocator, diagnostics);
+    try expectEqual(@as(usize, 3), diagnostics.len);
+    try expectEqual(@as(u32, 1), diagnostics[0].range.start.line);
+    try expectEqual(@as(u32, 1), diagnostics[1].range.start.line);
+    try expectEqual(@as(u32, 2), diagnostics[2].range.start.line);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, "Unifying counterexample:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics[1].message, "Search limit reached") != null);
+    for (diagnostics) |diagnostic| {
+        try expectEqual(types.Diagnostic.Severity.Error, diagnostic.severity.?);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "derivation:") == null);
+    }
+    const crlf = try std.mem.replaceOwned(u8, testing_allocator, test_conflict_report, "\n", "\r\n");
+    defer testing_allocator.free(crlf);
+    const windows = try parseConflictDiagnostics(testing_allocator, crlf, "/tmp/a:b.zy", "\n\n\n");
+    defer freeStoredDiagnostics(testing_allocator, windows);
+    try expectEqual(diagnostics.len, windows.len);
+}
+
+fn testConflictAllocations(allocator: std.mem.Allocator) !void {
+    const diagnostics = try parseConflictDiagnostics(allocator, test_conflict_report, "/tmp/a:b.zy", "\n\n\n");
+    defer freeStoredDiagnostics(allocator, diagnostics);
+}
+
+test "conflict report allocation failures release partial diagnostics" {
+    try std.testing.checkAllAllocationFailures(testing_allocator, testConflictAllocations, .{});
+}
+
+test "conflict invalidation blocks old results if the document update never completes" {
+    const Capture = struct {
+        publications: usize = 0,
+        count: usize = 0,
+        version: ?i32 = null,
+
+        fn publish(context: *anyopaque, _: []const u8, version: ?i32, diagnostics: []const types.Diagnostic) void {
+            const capture: *@This() = @ptrCast(@alignCast(context));
+            capture.publications += 1;
+            capture.count = diagnostics.len;
+            capture.version = version;
+        }
+    };
+    var capture: Capture = .{};
+    var mware: Middleware = .{
+        .allocator = testing_allocator,
+        .io = std.Options.debug_io,
+        .diagnostics_context = &capture,
+        .diagnostics_publisher = Capture.publish,
+        .documents_mutex = .init,
+        .documents = .empty,
+        .zls_mutex = .init,
+        .zls_library = undefined,
+        .zls_completion_triggers = &.{},
+        .next_generation_id = 2,
+    };
+    const uri = "file:///zy.zy";
+    var state = try makeTestDocumentState(testing_allocator, uri, 1, "", "");
+    defer state.deinit(testing_allocator);
+    try mware.documents.put(testing_allocator, uri, state);
+    defer mware.documents.deinit(testing_allocator);
+    var job = try ConflictJob.init(testing_allocator, &state.current.?);
+    defer job.deinit(testing_allocator);
+    var middleware: ZigMiddleware = .{ .mode = .{ .enabled = &mware } };
+    middleware.invalidateDiagnostics(uri, 2);
+    try expectEqual(@as(usize, 1), capture.publications);
+    try expectEqual(@as(usize, 0), capture.count);
+    try expectEqual(@as(?i32, 2), capture.version);
+    try mware.finishConflictReport(job, try parseZitronDiagnostics(testing_allocator, "1 parsing conflicts"));
+    try mware.publishDiagnosticsLocked(uri, 1);
+    try expectEqual(@as(usize, 1), capture.publications);
 }
 
 test "ZLS diagnostics translate to zy ranges and default zy" {
