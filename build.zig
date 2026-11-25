@@ -122,7 +122,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "python",
         "Python interpreter for development tools",
-    ) orelse "/Users/atman/Dropbox/deck/m/skills/.venv/bin/python";
+    ) orelse "python3";
 
     const extract_replay_cmd = b.addSystemCommand(&.{
         python,
