@@ -2034,7 +2034,7 @@ const Middleware = struct {
                 index,
                 diagnostic.range,
                 diagnostic.severity,
-                diagnostic.message,
+                diagnosticMessage(diagnostic),
             });
         }
         return .{
@@ -2916,7 +2916,7 @@ fn makeZitronDiagnostic(allocator: std.mem.Allocator, line: u32, message: []cons
         },
         .severity = .Error,
         .source = zy,
-        .message = try allocator.dupe(u8, message),
+        .message = .{ .string = try allocator.dupe(u8, message) },
     };
 }
 
@@ -2929,7 +2929,7 @@ fn conflictSummaryCount(line: []const u8) ?u32 {
 
 fn hasConflictSummary(diagnostics: []const types.Diagnostic) bool {
     for (diagnostics) |diagnostic| {
-        if (conflictSummaryCount(diagnostic.message) != null) return true;
+        if (conflictSummaryCount(diagnosticMessage(diagnostic)) != null) return true;
     }
     return false;
 }
@@ -2985,8 +2985,15 @@ fn freeStoredDiagnostics(allocator: std.mem.Allocator, diagnostics: []const type
     allocator.free(diagnostics);
 }
 
+fn diagnosticMessage(diagnostic: types.Diagnostic) []const u8 {
+    return switch (diagnostic.message) {
+        .string => |message| message,
+        .markup_content => |message| message.value,
+    };
+}
+
 fn freeStoredDiagnostic(allocator: std.mem.Allocator, diagnostic: types.Diagnostic) void {
-    allocator.free(diagnostic.message);
+    allocator.free(diagnosticMessage(diagnostic));
     if (diagnostic.source) |zy| allocator.free(zy);
     if (diagnostic.code) |code| switch (code) {
         .number => {},
@@ -3037,7 +3044,10 @@ fn cloneStoredDiagnostic(
     var stored: types.Diagnostic = .{
         .range = range,
         .severity = diagnostic.severity,
-        .message = try allocator.dupe(u8, diagnostic.message),
+        .message = switch (diagnostic.message) {
+            .string => |message| .{ .string = try allocator.dupe(u8, message) },
+            .markup_content => |message| .{ .markup_content = .{ .kind = message.kind, .value = try allocator.dupe(u8, message.value) } },
+        },
         .source = null,
     };
     errdefer freeStoredDiagnostic(allocator, stored);
@@ -3059,6 +3069,28 @@ fn cloneDiagnosticCode(allocator: std.mem.Allocator, code: ?types.ID) OOM!?types
         .number => |number| .{ .number = number },
         .string => |string| .{ .string = try allocator.dupe(u8, string) },
     };
+}
+
+test "stored diagnostics own string and markup messages" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDiagnosticMessages, .{});
+}
+
+fn testDiagnosticMessages(allocator: std.mem.Allocator) !void {
+    const Message = @FieldType(types.Diagnostic, "message");
+    for ([_]Message{
+        .{ .string = "diagnostic" },
+        .{ .markup_content = .{ .kind = .markdown, .value = "**diagnostic**" } },
+    }) |message| {
+        const diagnostic: types.Diagnostic = .{
+            .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 1 } },
+            .message = message,
+        };
+        const stored = try cloneStoredDiagnostic(allocator, diagnostic, diagnostic.range, "zls");
+        defer freeStoredDiagnostic(allocator, stored);
+        try std.testing.expectEqual(std.meta.activeTag(message), std.meta.activeTag(stored.message));
+        try std.testing.expectEqualStrings(diagnosticMessage(diagnostic), diagnosticMessage(stored));
+        try std.testing.expect(diagnosticMessage(diagnostic).ptr != diagnosticMessage(stored).ptr);
+    }
 }
 
 /// Mapping between original Zitron code blocks and translated Zig code.
@@ -7004,13 +7036,13 @@ test "Zitron stderr diagnostics become line-start LSP diagnostics" {
     try expectEqual(diagnostics[0].range.start, diagnostics[0].range.end);
     try expectEqual(types.Diagnostic.Severity.Error, diagnostics[0].severity.?);
     try expectEqualStrings("zitron", diagnostics[0].source.?);
-    try expectEqualStrings("Rule RHS alias \"Mcdr\" does not match rule impl's \"P\".", diagnostics[0].message);
+    try expectEqualStrings("Rule RHS alias \"Mcdr\" does not match rule impl's \"P\".", diagnosticMessage(diagnostics[0]));
 
     try expectEqual(@as(u32, 348), diagnostics[1].range.start.line);
-    try expectEqualStrings("There is no prior rule upon which to attach the code fragment which begins on this line", diagnostics[1].message);
+    try expectEqualStrings("There is no prior rule upon which to attach the code fragment which begins on this line", diagnosticMessage(diagnostics[1]));
 
     try expectEqual(@as(u32, 171), diagnostics[2].range.start.line);
-    try expectEqualStrings("Alias P for \"pair(P)\" is never used.", diagnostics[2].message);
+    try expectEqualStrings("Alias P for \"pair(P)\" is never used.", diagnosticMessage(diagnostics[2]));
 }
 
 test "conflict counts become line one errors and reject non-summary text" {
@@ -7022,7 +7054,7 @@ test "conflict counts become line one errors and reject non-summary text" {
     try expectEqual(@as(usize, 1), diagnostics.len);
     try expectEqual(@as(u32, 0), diagnostics[0].range.start.line);
     try expectEqual(types.Diagnostic.Severity.Error, diagnostics[0].severity.?);
-    try expectEqualStrings("9 parsing conflicts", diagnostics[0].message);
+    try expectEqualStrings("9 parsing conflicts", diagnosticMessage(diagnostics[0]));
     try std.testing.expect(hasConflictSummary(diagnostics));
 }
 
@@ -7059,11 +7091,11 @@ test "conflict explanations locate rules and omit derivation trees" {
     try expectEqual(@as(u32, 1), diagnostics[0].range.start.line);
     try expectEqual(@as(u32, 1), diagnostics[1].range.start.line);
     try expectEqual(@as(u32, 2), diagnostics[2].range.start.line);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics[0].message, "Unifying counterexample:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, diagnostics[1].message, "Search limit reached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnosticMessage(diagnostics[0]), "Unifying counterexample:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnosticMessage(diagnostics[1]), "Search limit reached") != null);
     for (diagnostics) |diagnostic| {
         try expectEqual(types.Diagnostic.Severity.Error, diagnostic.severity.?);
-        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "derivation:") == null);
+        try std.testing.expect(std.mem.indexOf(u8, diagnosticMessage(diagnostic), "derivation:") == null);
     }
     const crlf = try std.mem.replaceOwned(u8, testing_allocator, test_conflict_report, "\n", "\r\n");
     defer testing_allocator.free(crlf);
@@ -7146,7 +7178,7 @@ test "ZLS diagnostics translate to zy ranges and default zy" {
             .severity = .Warning,
             .source = null,
             .code = .{ .string = "zls-code" },
-            .message = "use of undeclared identifier 'MissingType'",
+            .message = .{ .string = "use of undeclared identifier 'MissingType'" },
             .tags = &tags,
         },
         .{
@@ -7156,7 +7188,7 @@ test "ZLS diagnostics translate to zy ranges and default zy" {
             },
             .severity = .Error,
             .source = "zls",
-            .message = "zig-only diagnostic",
+            .message = .{ .string = "zig-only diagnostic" },
         },
     };
 
@@ -7185,7 +7217,7 @@ test "ZLS diagnostics translate to zy ranges and default zy" {
     try expectEqual(@as(u32, 1), translated[0].range.start.line);
     try expectEqual(types.Diagnostic.Severity.Warning, translated[0].severity.?);
     try expectEqualStrings("zls", translated[0].source.?);
-    try expectEqualStrings("use of undeclared identifier 'MissingType'", translated[0].message);
+    try expectEqualStrings("use of undeclared identifier 'MissingType'", diagnosticMessage(translated[0]));
     try expectEqualStrings("zls-code", translated[0].code.?.string);
     try expectEqual(@as(usize, 1), translated[0].tags.?.len);
     try expectEqual(types.Diagnostic.Tag.Unnecessary, translated[0].tags.?[0]);
@@ -7331,7 +7363,7 @@ test "ZLS diagnostics with null version publish after repeated current syncs" {
     const current = state.currentForVersion(2).?;
     try expectEqual(@as(usize, 1), current.zls_diagnostics.len);
     try expectEqual(@as(i32, 2), current.zls_diagnostics_version.?);
-    try expectEqualStrings("use of undeclared identifier 'MissingType'", current.zls_diagnostics[0].message);
+    try expectEqualStrings("use of undeclared identifier 'MissingType'", diagnosticMessage(current.zls_diagnostics[0]));
 }
 
 test "request span translator applies zy column offset" {

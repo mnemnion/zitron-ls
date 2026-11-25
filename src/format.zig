@@ -1219,7 +1219,7 @@ fn emitPattern(allocator: Allocator, output: *std.ArrayList(u8), rule: Rule, new
 }
 
 fn stronger(a: Break, b: Break) Break {
-    return @enumFromInt(@max(@intFromEnum(a), @intFromEnum(b)));
+    return @fromBackingInt(@intCast(@max(@backingInt(a), @backingInt(b))));
 }
 
 fn slice(source: []const u8, node: Node) []const u8 {

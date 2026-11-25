@@ -156,14 +156,14 @@ fn formatCode(allocator: Allocator, io: std.Io, executable: ?[]const u8, job: Jo
     const formatted = if (executable) |path|
         try runFmt(allocator, io, path, input)
     else
-        try renderCode(allocator, wrapper orelse if (modified) try prepared.toOwnedSliceSentinel(allocator, 0) else try allocator.dupeZ(u8, input));
+        try renderCode(allocator, wrapper orelse if (modified) try prepared.toOwnedSliceSentinel(allocator, 0) else try allocator.dupeSentinel(u8, input, 0));
     var body = formatted;
     if (job.context == .statements) {
         if (executable == null) {
             body = try statementBody(formatted);
         } else {
-            const terminated = try allocator.dupeZ(u8, formatted);
-            var ast = try std.zig.Ast.parse(allocator, terminated, .zig);
+            const terminated = try allocator.dupeSentinel(u8, formatted, 0);
+            var ast = try std.zig.Ast.parse(allocator, terminated, .{});
             defer ast.deinit(allocator);
             if (ast.errors.len != 0 or ast.rootDecls().len != 1) return error.InvalidOutput;
             const declaration = ast.rootDecls()[0];
@@ -263,7 +263,7 @@ const Collisions = struct {
             const name = try allocator.dupe(u8, spelling);
             name[0] = alphabet[0];
             if (std.mem.indexOf(u8, collisions.source, name) == null and !used.contains(name)) return name;
-            var prefixes = std.StaticBitSet(256).initEmpty();
+            var prefixes: std.StaticBitSet(256) = .empty;
             var offset: usize = 1;
             while (std.mem.indexOfPos(u8, collisions.source, offset, spelling[1..])) |start| {
                 prefixes.set(collisions.source[start - 1]);
@@ -395,7 +395,7 @@ fn isMacro(line: []const u8) bool {
 }
 
 fn renderCode(allocator: Allocator, input: [:0]const u8) ![]const u8 {
-    var ast = try std.zig.Ast.parse(allocator, input, .zig);
+    var ast = try std.zig.Ast.parse(allocator, input, .{});
     defer ast.deinit(allocator);
     if (ast.errors.len != 0) return error.InvalidCode;
     return ast.renderAlloc(allocator);

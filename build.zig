@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     });
     const muad_diff_dep = b.dependency("muad_diff", .{
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
 
     const lsp_zitron_mod = b.addModule("zitron-ls", .{
@@ -101,9 +101,7 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_lsp_zitron = b.step("run", "run the zitron-ls binary");
     run_lsp_zitron.dependOn(&run_cmd.step);
@@ -112,9 +110,7 @@ pub fn build(b: *std.Build) void {
 
     run_client_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_client_cmd.addArgs(args);
-    }
+    run_client_cmd.addPassthruArgs();
 
     const run_test_client = b.step("run-client", "run the zitron-ls test client");
     run_test_client.dependOn(&run_client_cmd.step);
@@ -132,7 +128,7 @@ pub fn build(b: *std.Build) void {
         python,
         "tools/extract_replay.py",
     });
-    if (b.args) |args| extract_replay_cmd.addArgs(args);
+    extract_replay_cmd.addPassthruArgs();
     const extract_replay_step = b.step("extract-replay", "extract a replay file from the latest runtime log session");
     extract_replay_step.dependOn(&extract_replay_cmd.step);
 
@@ -141,7 +137,7 @@ pub fn build(b: *std.Build) void {
         "tools/replay_client.py",
     });
     replay_client_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| replay_client_cmd.addArgs(args);
+    replay_client_cmd.addPassthruArgs();
     const replay_client_step = b.step("replay-client", "replay extracted client actions against zitron-ls");
     replay_client_step.dependOn(&replay_client_cmd.step);
 
@@ -149,7 +145,7 @@ pub fn build(b: *std.Build) void {
         python,
         "tools/timing_report.py",
     });
-    if (b.args) |args| timing_report_cmd.addArgs(args);
+    timing_report_cmd.addPassthruArgs();
     const timing_report_step = b.step("timing-report", "summarize timings from the latest runtime log session");
     timing_report_step.dependOn(&timing_report_cmd.step);
 
@@ -224,7 +220,7 @@ pub fn build(b: *std.Build) void {
     const format_bench = b.addExecutable(.{ .name = "zitron-format-bench", .root_module = format_bench_mod });
     const run_format_bench = b.addRunArtifact(format_bench);
     run_format_bench.setCwd(b.path("."));
-    if (b.args) |args| run_format_bench.addArgs(args);
+    run_format_bench.addPassthruArgs();
     const format_bench_step = b.step("bench-format", "Benchmark formatter timing and allocation behavior (use -Doptimize=ReleaseFast)");
     format_bench_step.dependOn(&run_format_bench.step);
 
@@ -239,9 +235,9 @@ pub fn build(b: *std.Build) void {
     const run_kcov = b.addSystemCommand(&.{
         "kcov",
         "--clean",
-        "--exclude-line=unreachable,expect(false),@panic",
+        "--exclude-line=unreachable,expect(false),@panic,kcov-defer-error,kcov-test-cleanup,kcov-miss",
     });
-    run_kcov.addPrefixedDirectoryArg("--include-pattern=", b.path("src"));
+    run_kcov.addDirectoryArg2(b.path("src"), .{ .prefix = "--include-pattern=", .make_absolute = true });
     const coverage_output = run_kcov.addOutputDirectoryArg(".");
 
     // Pick your coverage entry point here:

@@ -4,29 +4,32 @@
 
     .version = "0.2.0",
 
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.1",
 
     .fingerprint = 0xb5d2b38b08ab804a,
 
     .dependencies = .{
         .lsp_kit = .{
-            .url = "git+https://github.com/zigtools/lsp-kit.git#b886a2b0d5cee85ecbcc3089b863f7517cc9ff7f",
-            .hash = "lsp_kit-0.1.0-bi_PL3IyDACfp1xdTnkiOHEok2YpPCCCJHuuOcNzjl1D",
+            .url = "https://github.com/zigtools/lsp-kit/archive/3e1058db66079911fdde82f833fdce6856e0a706.tar.gz",
+            .hash = "lsp_kit-0.1.0-bi_PL9o2DADHS1PDra3MGz1MXnsboN_ewNvrc419z7Fb",
+        },
+
+        .zls = .{
+            .url = "https://github.com/zigtools/zls/archive/refs/tags/0.17.0.tar.gz",
+            .hash = "zls-0.17.0-rmm5fjYwHAAfoBoodSZ8k3NYPa8ZZG60JPlOTGFrAhTw",
+        },
+
+        .muad_diff = .{
+            .url = "https://github.com/mnemnion/muad-diff/archive/refs/tags/v0.1.1.tar.gz",
+            .hash = "muad_diff-0.1.1-p0-XoaquUwJuLSWQzWXuAYUHBPoYaKln5FK_SVjK9bgP",
         },
         .@"tree-sitter" = .{
-            .url = "https://github.com/neurocyte/tree-sitter/releases/download/master-70dbb6fa9d998bcf599c3aaeecac7479e9ee3f0c/source.tar.gz",
-            .hash = "tree_sitter-0.26.7-z0LhyGSQZzENNbCzqsMPu63xwpZI1WTHcf62imt-H6YL",
-        },
-        .zls = .{
-            .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",
-            .hash = "zls-0.16.0-rmm5fs_JJgBG3dk5HwYK1FylE2_LMN0BYpX57tPzT-Xc",
+            .url = "https://github.com/zinecooties/tree-sitter/releases/download/v0.26.8/source.tar.gz",
+            .hash = "tree_sitter-0.26.8-z0LhyOt2JDYkbDlUeZu_1vl7OINCeeXQQPusBnoQ2FWC",
         },
         .tree_sitter_zitron = .{
-            .path = "../../g/tree-sitter-zitron",
-        },
-        .muad_diff = .{
-            .url = "https://github.com/mnemnion/muad-diff/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "muad_diff-0.1.0-p0-Xof2CUwKRE7QBSJk82_QOnbu-Q1Kv59I2e4Es4l_e",
+            .url = "https://github.com/mnemnion/tree-sitter-zitron/archive/refs/tags/v0.2.2.tar.gz",
+            .hash = "tree_sitter_zitron-0.2.2-EA3PTN1mAwAWl4kN25lMDa-fccoXfPpW5nNmZUYepmG8",
         },
     },
 

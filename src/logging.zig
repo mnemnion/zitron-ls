@@ -31,7 +31,7 @@ pub const State = struct {
 };
 
 var log_file: ?std.Io.File = null;
-var runtime_log_level: std.log.Level = if (builtin.mode == .Debug) .debug else .info;
+var runtime_log_level: std.log.Level = if (builtin.mode == .debug) .debug else .info;
 var log_stderr: bool = true;
 var log_mutex: std.Io.Mutex = .init;
 
@@ -59,7 +59,7 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
+    if (@backingInt(level) > @backingInt(runtime_log_level)) return;
     if (!log_stderr and log_file == null) return;
 
     const io = std.Options.debug_io;

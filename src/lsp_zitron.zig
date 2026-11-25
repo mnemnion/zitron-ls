@@ -1373,7 +1373,7 @@ pub const Server = struct {
         };
         const watchers = [_]Watcher{.{
             .globPattern = "**/build.zig",
-            .kind = @intFromEnum(types.WatchKind.Change),
+            .kind = @backingInt(types.WatchKind.Change),
         }};
         const registrations = [_]Registration{.{
             .id = "zitron-ls-build-zig-change",

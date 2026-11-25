@@ -992,7 +992,7 @@ fn documentSymbolDetail(kind: SemanticKind) []const u8 {
 }
 
 fn codeIdentifierAt(source: []const u8, code: ts.Node, index: usize, allocator: std.mem.Allocator) OOM!?lsp.offsets.Loc {
-    const text = try allocator.dupeZ(u8, sliceForNode(source, code));
+    const text = try allocator.dupeSentinel(u8, sliceForNode(source, code), 0);
     defer allocator.free(text);
     var tokenizer = std.zig.Tokenizer.init(text);
     const offset = index - code.startByte();

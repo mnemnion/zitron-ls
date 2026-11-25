@@ -416,7 +416,7 @@ test "format dropped tails do not force pattern splitting or inline tail columns
         "                      { A = pik_elist_append(p, B, X); }\n";
     try golden(source, "statement_list(A) ::= statement(X).   { A = pik_elist_append(p, null, X); }\n" ++
         "statement_list(A) ::= statement_list(B) EOL statement(X).\n" ++
-        " " ** 38 ++ "{ A = pik_elist_append(p, B, X); }\n");
+        @as([38]u8, @splat(' ')) ++ "{ A = pik_elist_append(p, B, X); }\n");
     try golden(
         "foo ::= A. @a()\nfoo ::= AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.\n",
         "foo ::= A.   @a()\nfoo ::= AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.\n",
@@ -443,38 +443,38 @@ test "format dropped tails opportunistically join established alignment" {
 }
 
 test "format dropped tails align closing delimiters when opening alignment is marginal" {
-    const pattern = "foo ::= " ++ "A" ** 36 ++ ".";
-    const action = "@" ++ "x" ** 41 ++ "()";
-    const code = "{ p(" ++ "a" ** 36 ++ "); }";
-    const comfortable = "{ p(" ++ "a" ** 35 ++ "); }";
-    const long_pattern = "foo ::= " ++ "B" ** 45 ++ ".";
+    const pattern = "foo ::= " ++ @as([36]u8, @splat('A')) ++ ".";
+    const action = "@" ++ @as([41]u8, @splat('x')) ++ "()";
+    const code = "{ p(" ++ @as([36]u8, @splat('a')) ++ "); }";
+    const comfortable = "{ p(" ++ @as([35]u8, @splat('a')) ++ "); }";
+    const long_pattern = "foo ::= " ++ @as([45]u8, @splat('B')) ++ ".";
     try golden(
         pattern ++ " @short()\n" ++ long_pattern ++ "\n " ++ comfortable ++ "\n",
-        pattern ++ "  @short()\n" ++ long_pattern ++ "\n" ++ " " ** 47 ++ comfortable ++ "\n",
+        pattern ++ "  @short()\n" ++ long_pattern ++ "\n" ++ @as([47]u8, @splat(' ')) ++ comfortable ++ "\n",
     );
     try golden(
         pattern ++ " @short()\nfoo ::= B.\n " ++ code ++ "\n",
-        pattern ++ "  @short()\nfoo ::= B.\n" ++ " " ** 11 ++ code ++ "\n",
+        pattern ++ "  @short()\nfoo ::= B.\n" ++ @as([11]u8, @splat(' ')) ++ code ++ "\n",
     );
     try golden(
         pattern ++ " { x = 1; }\nfoo ::= B.\n " ++ action ++ "\n",
-        pattern ++ "  { x = 1; }\nfoo ::= B.\n" ++ " " ** 13 ++ action ++ "\n",
+        pattern ++ "  { x = 1; }\nfoo ::= B.\n" ++ @as([13]u8, @splat(' ')) ++ action ++ "\n",
     );
     try golden(
         pattern ++ " @short()\n// note\nfoo ::= B.\n " ++ code ++ "\n",
-        pattern ++ "  @short()\n// note\nfoo ::= B.\n" ++ " " ** 11 ++ code ++ "\n",
+        pattern ++ "  @short()\n// note\nfoo ::= B.\n" ++ @as([11]u8, @splat(' ')) ++ code ++ "\n",
     );
     try golden(
         pattern ++ " @short()\nfoo ::= X.\nfoo ::= B.\n " ++ code ++ "\n",
-        pattern ++ "  @short()\nfoo ::= X.\nfoo ::= B.\n" ++ " " ** 8 ++ code ++ "\n",
+        pattern ++ "  @short()\nfoo ::= X.\nfoo ::= B.\n" ++ @as([8]u8, @splat(' ')) ++ code ++ "\n",
     );
     try golden(
         pattern ++ " @short()\nbar ::= B.\n " ++ code ++ "\n",
-        pattern ++ "  @short()\nbar ::= B.\n" ++ " " ** 8 ++ code ++ "\n",
+        pattern ++ "  @short()\nbar ::= B.\n" ++ @as([8]u8, @splat(' ')) ++ code ++ "\n",
     );
     try golden(
         pattern ++ " @short()\n\n\nfoo ::= B.\n " ++ code ++ "\n",
-        pattern ++ "  @short()\n\n\nfoo ::= B.\n" ++ " " ** 8 ++ code ++ "\n",
+        pattern ++ "  @short()\n\n\nfoo ::= B.\n" ++ @as([8]u8, @splat(' ')) ++ code ++ "\n",
     );
 }
 
@@ -630,7 +630,7 @@ fn semanticContent(source: []const u8) ![]u8 {
 fn semanticNode(output: *std.ArrayList(u8), source: []const u8, node: ts.Node) !void {
     if (std.mem.eql(u8, node.kind(), "comment")) return;
     if (std.mem.eql(u8, node.kind(), "code_block")) {
-        const code = try allocator.dupeZ(u8, source[node.startByte() + 1 .. node.endByte() - 1]);
+        const code = try allocator.dupeSentinel(u8, source[node.startByte() + 1 .. node.endByte() - 1], 0);
         defer allocator.free(code);
         var tokenizer = std.zig.Tokenizer.init(code);
         while (true) {
